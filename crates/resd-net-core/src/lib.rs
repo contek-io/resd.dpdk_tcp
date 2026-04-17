@@ -6,6 +6,7 @@ pub mod counters;
 pub mod engine;
 pub mod error;
 pub mod l2;
+pub mod l3_ip;
 pub mod mempool;
 
 pub use error::Error;
