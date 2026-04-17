@@ -19,3 +19,9 @@ cmake --build examples/cpp-consumer/build
 ```sh
 cargo test
 ```
+
+## Integration tests (require DPDK TAP and root)
+
+```sh
+sudo -E RESD_NET_TEST_TAP=1 cargo test -p resd-net-core --test engine_smoke -- --nocapture
+```
