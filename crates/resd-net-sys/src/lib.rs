@@ -34,4 +34,16 @@ mod tests {
         // is typically 0 but could be any int; we only care that linking works.
         let _ = unsafe { resd_rte_errno() };
     }
+
+    #[test]
+    fn resd_mbuf_shim_symbols_linkable() {
+        // Just prove the symbols link — actually calling them needs EAL.
+        let _a: unsafe extern "C" fn(*mut rte_mempool) -> *mut rte_mbuf = resd_rte_pktmbuf_alloc;
+        let _b: unsafe extern "C" fn(*mut rte_mbuf, u16) -> *mut std::os::raw::c_char =
+            resd_rte_pktmbuf_append;
+        let _c: unsafe extern "C" fn(u16, *mut rte_ether_addr) -> i32 = resd_rte_eth_macaddr_get;
+        let _d: unsafe extern "C" fn(*const rte_mbuf) -> *mut std::os::raw::c_void =
+            resd_rte_pktmbuf_data;
+        let _e: unsafe extern "C" fn(*const rte_mbuf) -> u16 = resd_rte_pktmbuf_data_len;
+    }
 }
