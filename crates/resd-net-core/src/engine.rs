@@ -17,6 +17,12 @@ pub struct EngineConfig {
     pub tx_ring_size: u16,     // default 1024
     pub rx_mempool_elems: u32, // default 8192
     pub mbuf_data_room: u16,   // default 2048
+
+    // Phase A2 additions (host byte order for IPs; raw bytes for MAC)
+    pub local_ip: u32,         // our IPv4 on this lcore's port; 0 = "accept any" in tests
+    pub gateway_ip: u32,       // next-hop IPv4
+    pub gateway_mac: [u8; 6],  // MAC to target for TX; [0;6] = "resolve at create"
+    pub garp_interval_sec: u32,// 0 = disabled; else emit gratuitous ARP every N seconds
 }
 
 impl Default for EngineConfig {
@@ -30,6 +36,10 @@ impl Default for EngineConfig {
             tx_ring_size: 1024,
             rx_mempool_elems: 8192,
             mbuf_data_room: 2048,
+            local_ip: 0,
+            gateway_ip: 0,
+            gateway_mac: [0u8; 6],
+            garp_interval_sec: 0,
         }
     }
 }
@@ -207,5 +217,21 @@ impl Drop for Engine {
             sys::rte_eth_dev_close(self.cfg.port_id);
         }
         // Mempools drop via their own Drop impl.
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_engine_config_has_a2_fields() {
+        let cfg = EngineConfig::default();
+        // Unset (caller must supply for real use).
+        assert_eq!(cfg.local_ip, 0);
+        assert_eq!(cfg.gateway_ip, 0);
+        assert_eq!(cfg.gateway_mac, [0u8; 6]);
+        // 0 = disabled (no gratuitous ARP emitted).
+        assert_eq!(cfg.garp_interval_sec, 0);
     }
 }
