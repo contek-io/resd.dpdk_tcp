@@ -64,6 +64,10 @@ struct resd_net_engine_config_t {
   uint32_t tcp_msl_ms;
   bool tcp_per_packet_events;
   uint8_t preset;
+  uint32_t local_ip;
+  uint32_t gateway_ip;
+  uint8_t gateway_mac[6];
+  uint32_t garp_interval_sec;
 };
 
 typedef uint64_t resd_net_conn_t;
@@ -139,7 +143,11 @@ struct RESD_NET_ALIGNED(64) resd_net_eth_counters_t {
   uint64_t tx_bytes;
   uint64_t tx_drop_full_ring;
   uint64_t tx_drop_nomem;
-  uint64_t _pad[8];
+  uint64_t rx_drop_short;
+  uint64_t rx_drop_unknown_ethertype;
+  uint64_t rx_arp;
+  uint64_t tx_arp;
+  uint64_t _pad[4];
 };
 
 struct RESD_NET_ALIGNED(64) resd_net_ip_counters_t {
@@ -148,7 +156,14 @@ struct RESD_NET_ALIGNED(64) resd_net_ip_counters_t {
   uint64_t rx_frag;
   uint64_t rx_icmp_frag_needed;
   uint64_t pmtud_updates;
-  uint64_t _pad[11];
+  uint64_t rx_drop_short;
+  uint64_t rx_drop_bad_version;
+  uint64_t rx_drop_bad_hl;
+  uint64_t rx_drop_not_ours;
+  uint64_t rx_drop_unsupported_proto;
+  uint64_t rx_tcp;
+  uint64_t rx_icmp;
+  uint64_t _pad[4];
 };
 
 struct RESD_NET_ALIGNED(64) resd_net_tcp_counters_t {
@@ -220,6 +235,14 @@ void resd_net_flush(struct resd_net_engine *_p);
 uint64_t resd_net_now_ns(struct resd_net_engine *_p);
 
 const struct resd_net_counters_t *resd_net_counters(struct resd_net_engine *p);
+
+/**
+ * Resolve the MAC address for `gateway_ip_host_order` by reading
+ * `/proc/net/arp`. Writes 6 bytes into `out_mac`.
+ * Returns 0 on success, -ENOENT if no entry, -EIO on /proc/net/arp read error,
+ * -EINVAL on null out_mac.
+ */
+int32_t resd_net_resolve_gateway_mac(uint32_t gateway_ip_host_order, uint8_t *out_mac);
 
 #ifdef __cplusplus
 } // extern "C"
