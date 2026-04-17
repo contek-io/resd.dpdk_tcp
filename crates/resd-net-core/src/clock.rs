@@ -60,8 +60,10 @@ fn calibrate() -> TscEpoch {
 
 #[cfg(target_arch = "x86_64")]
 fn check_invariant_tsc() -> Result<(), crate::Error> {
-    // CPUID.80000007H:EDX[8] = InvariantTSC
-    let r = unsafe { std::arch::x86_64::__cpuid(0x8000_0007) };
+    // CPUID.80000007H:EDX[8] = InvariantTSC.
+    // `__cpuid` is safe on any x86_64 target (no target_feature gate) so
+    // rustc 1.95 flags a wrapping `unsafe { }` as unused_unsafe.
+    let r = std::arch::x86_64::__cpuid(0x8000_0007);
     if (r.edx & (1 << 8)) != 0 {
         Ok(())
     } else {
@@ -82,6 +84,9 @@ mod tests {
 
     #[test]
     fn now_ns_within_one_percent_of_wall_clock() {
+        // Force calibration before capturing wall_start so the 50ms calibration
+        // sleep doesn't land inside the measurement window under parallel tests.
+        let _ = now_ns();
         let wall_start = std::time::Instant::now();
         let tsc_start = now_ns();
         std::thread::sleep(std::time::Duration::from_millis(100));
