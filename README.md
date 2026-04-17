@@ -25,3 +25,9 @@ cargo test
 ```sh
 sudo -E RESD_NET_TEST_TAP=1 cargo test -p resd-net-core --test engine_smoke -- --nocapture
 ```
+
+## L2/L3 integration tests (require DPDK TAP and root)
+
+```sh
+sudo -E RESD_NET_TEST_TAP=1 cargo test -p resd-net-core --test l2_l3_tap -- --nocapture
+```
