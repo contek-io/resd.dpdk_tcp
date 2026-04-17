@@ -22,7 +22,11 @@
  */
 #define RESD_NET_CLOSE_FORCE_TW_SKIP (1 << 0)
 
-enum resd_net_event_kind_t {
+enum resd_net_event_kind_t
+#ifdef __cplusplus
+  : uint32_t
+#endif // __cplusplus
+ {
   RESD_NET_EVT_CONNECTED = 1,
   RESD_NET_EVT_READABLE = 2,
   RESD_NET_EVT_WRITABLE = 3,
@@ -33,7 +37,9 @@ enum resd_net_event_kind_t {
   RESD_NET_EVT_TCP_LOSS_DETECTED = 8,
   RESD_NET_EVT_TCP_STATE_CHANGE = 9,
 };
+#ifndef __cplusplus
 typedef uint32_t resd_net_event_kind_t;
+#endif // __cplusplus
 
 struct resd_net_engine {
   uint8_t _opaque[0];
@@ -186,6 +192,10 @@ struct resd_net_connect_opts_t {
   uint32_t idle_keepalive_sec;
 };
 
+#ifdef __cplusplus
+extern "C" {
+#endif // __cplusplus
+
 /**
  * Initialize DPDK EAL. Must be called before resd_net_engine_create.
  * `argv` is a C-style argv array; the function does NOT take ownership
@@ -210,5 +220,9 @@ void resd_net_flush(struct resd_net_engine *_p);
 uint64_t resd_net_now_ns(struct resd_net_engine *_p);
 
 const struct resd_net_counters_t *resd_net_counters(struct resd_net_engine *p);
+
+#ifdef __cplusplus
+} // extern "C"
+#endif // __cplusplus
 
 #endif /* RESD_NET_H */

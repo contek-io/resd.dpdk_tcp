@@ -7,6 +7,10 @@ sys_includes = ["stdint.h", "stdbool.h", "stddef.h", "arpa/inet.h"]
 # Macro used to express `#[repr(C, align(N))]` in C. Defined in after_includes.
 after_includes = "\n#define RESD_NET_ALIGNED(N) __attribute__((aligned(N)))\n"
 style = "tag"
+# Emit the header so it can also be `#include`d from C++. Wraps the
+# sized-enum typedef in `#ifndef __cplusplus` and uses `enum X : uintN_t`
+# in C++ mode so the enum tag name doesn't clash with the typedef.
+cpp_compat = true
 
 [layout]
 aligned_n = "RESD_NET_ALIGNED"
