@@ -24,6 +24,13 @@ int main() {
     cfg.tcp_per_packet_events = false;
     cfg.preset = 0;
 
+    // Phase A2 addressing (left at zero — the TAP sample isn't doing real
+    // traffic). Real deployments supply local_ip, gateway_ip, gateway_mac.
+    cfg.local_ip = 0;
+    cfg.gateway_ip = 0;
+    memset(cfg.gateway_mac, 0, sizeof(cfg.gateway_mac));
+    cfg.garp_interval_sec = 0;
+
     // Initialize EAL first. Uses DPDK TAP vdev so no real NIC is required.
     const char* eal_args[] = {
         "resd-net-cpp-consumer",
@@ -59,6 +66,18 @@ int main() {
     std::printf("poll iters: %llu\n", (unsigned long long)iters);
     std::printf("now_ns: %llu\n",
         (unsigned long long)resd_net_now_ns(eng));
+
+    // Phase A2: print IP counters to confirm they are accessible from C++.
+    std::printf("ip.rx_drop_bad_version: %llu\n",
+        (unsigned long long)__atomic_load_n(&c->ip.rx_drop_bad_version, __ATOMIC_RELAXED));
+    std::printf("ip.rx_tcp: %llu\n",
+        (unsigned long long)__atomic_load_n(&c->ip.rx_tcp, __ATOMIC_RELAXED));
+    std::printf("ip.rx_icmp: %llu\n",
+        (unsigned long long)__atomic_load_n(&c->ip.rx_icmp, __ATOMIC_RELAXED));
+    std::printf("ip.pmtud_updates: %llu\n",
+        (unsigned long long)__atomic_load_n(&c->ip.pmtud_updates, __ATOMIC_RELAXED));
+    std::printf("eth.rx_arp: %llu\n",
+        (unsigned long long)__atomic_load_n(&c->eth.rx_arp, __ATOMIC_RELAXED));
 
     resd_net_engine_destroy(eng);
     return 0;
