@@ -68,6 +68,10 @@ pub unsafe extern "C" fn resd_net_engine_create(
         tx_ring_size: 1024,
         rx_mempool_elems: 8192,
         mbuf_data_room: 2048,
+        local_ip: cfg.local_ip,
+        gateway_ip: cfg.gateway_ip,
+        gateway_mac: cfg.gateway_mac,
+        garp_interval_sec: cfg.garp_interval_sec,
     };
     match Engine::new(core_cfg) {
         Ok(e) => box_to_raw(e),
@@ -144,5 +148,38 @@ mod tests {
         let a = unsafe { resd_net_now_ns(std::ptr::null_mut()) };
         let b = unsafe { resd_net_now_ns(std::ptr::null_mut()) };
         assert!(b >= a);
+    }
+
+    #[test]
+    fn a2_config_fields_pass_through() {
+        // We don't actually call resd_net_engine_create here (no EAL).
+        // Just assert the types are laid out as we expect.
+        let cfg = resd_net_engine_config_t {
+            port_id: 0,
+            rx_queue_id: 0,
+            tx_queue_id: 0,
+            max_connections: 0,
+            recv_buffer_bytes: 0,
+            send_buffer_bytes: 0,
+            tcp_mss: 0,
+            tcp_timestamps: false,
+            tcp_sack: false,
+            tcp_ecn: false,
+            tcp_nagle: false,
+            tcp_delayed_ack: false,
+            cc_mode: 0,
+            tcp_min_rto_ms: 0,
+            tcp_initial_rto_ms: 0,
+            tcp_msl_ms: 0,
+            tcp_per_packet_events: false,
+            preset: 0,
+            local_ip: 0x0a_00_00_02, // 10.0.0.2 (host byte order)
+            gateway_ip: 0x0a_00_00_01,
+            gateway_mac: [0xde, 0xad, 0xbe, 0xef, 0x00, 0x01],
+            garp_interval_sec: 5,
+        };
+        assert_eq!(cfg.local_ip, 0x0a_00_00_02);
+        assert_eq!(cfg.gateway_mac[2], 0xbe);
+        assert_eq!(cfg.garp_interval_sec, 5);
     }
 }

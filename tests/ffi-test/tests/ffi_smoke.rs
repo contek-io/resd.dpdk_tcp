@@ -85,6 +85,12 @@ fn ffi_eal_init_and_engine_lifecycle() {
         tcp_per_packet_events: bool,
         preset: u8,
         _pad3: [u8; 2],
+        // Phase A2 additions
+        local_ip: u32,
+        gateway_ip: u32,
+        gateway_mac: [u8; 6],
+        _pad4: [u8; 2],
+        garp_interval_sec: u32,
     }
     let cfg = Cfg {
         port_id: 0,
@@ -108,6 +114,11 @@ fn ffi_eal_init_and_engine_lifecycle() {
         tcp_per_packet_events: false,
         preset: 0,
         _pad3: [0; 2],
+        local_ip: 0,
+        gateway_ip: 0,
+        gateway_mac: [0u8; 6],
+        _pad4: [0; 2],
+        garp_interval_sec: 0,
     };
 
     let eng = unsafe { resd_net_engine_create(0, &cfg as *const Cfg as *const core::ffi::c_void) };

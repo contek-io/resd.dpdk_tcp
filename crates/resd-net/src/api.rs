@@ -36,6 +36,11 @@ pub struct resd_net_engine_config_t {
     pub tcp_msl_ms: u32,
     pub tcp_per_packet_events: bool,
     pub preset: u8,
+    // Phase A2 additions (host byte order for ints, raw bytes for MAC)
+    pub local_ip: u32,
+    pub gateway_ip: u32,
+    pub gateway_mac: [u8; 6],
+    pub garp_interval_sec: u32,
 }
 
 #[repr(C)]
