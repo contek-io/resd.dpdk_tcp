@@ -6,7 +6,7 @@
 
 **Architecture:** Rust cargo workspace with three crates: `resd-net-sys` (DPDK FFI via bindgen), `resd-net-core` (pure-Rust stack internals), `resd-net` (public API crate exposing `extern "C"` functions; header auto-generated via cbindgen). A C++ consumer sample under `examples/cpp-consumer/` verifies the FFI boundary end-to-end.
 
-**Tech Stack:** Rust stable (1.75+), cargo workspace, DPDK 23.11 LTS, `bindgen` for DPDK FFI, `cbindgen` for generating `include/resd_net.h`, `pkg-config` to locate libdpdk, CMake for the C++ consumer.
+**Tech Stack:** Rust (latest stable), cargo workspace, DPDK 23.11 LTS, `bindgen` for DPDK FFI, `cbindgen` for generating `include/resd_net.h`, `pkg-config` to locate libdpdk, CMake for the C++ consumer.
 
 **Prerequisites on the build host (install before starting):**
 - DPDK 23.11 built and installed (libdpdk.pc discoverable via `pkg-config --cflags --libs libdpdk`).
@@ -86,7 +86,6 @@ members = [
 version = "0.1.0"
 edition = "2021"
 license = "Apache-2.0"
-rust-version = "1.75"
 
 [workspace.dependencies]
 # pinned once, used by all crates
@@ -104,7 +103,7 @@ debug = 1  # line tables for perf/flame graphs
 
 ```toml
 [toolchain]
-channel = "1.75.0"
+channel = "stable"
 components = ["rustfmt", "clippy"]
 ```
 
@@ -169,7 +168,6 @@ name = "resd-net-sys"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-rust-version.workspace = true
 links = "dpdk"  # declares we link libdpdk; prevents duplicate link instructions
 
 [dependencies]
@@ -309,7 +307,6 @@ name = "resd-net-core"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-rust-version.workspace = true
 
 [dependencies]
 resd-net-sys = { path = "../resd-net-sys" }
@@ -1089,7 +1086,6 @@ name = "resd-net"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-rust-version.workspace = true
 
 [lib]
 name = "resd_net"

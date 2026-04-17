@@ -716,8 +716,8 @@ Pass criteria: within 20% of Linux single-connection goodput (Linux has years of
 
 ## 13. Open Questions to Resolve Before Stage 1 Starts
 
-**[BLOCKER]** — must be answered before implementation begins:
-- **Rust nightly in CI, or stable-only.** Some DPDK-adjacent and low-latency crates require nightly features (`core::intrinsics::unlikely`, specific atomic intrinsics, certain allocator APIs). If stable-only, architectural choices need re-evaluation (manual `#[cold]` vs. intrinsic `unlikely`, workarounds for allocator hooks).
+**[RESOLVED]**:
+- **Rust toolchain.** Latest stable, no nightly. Manual `#[cold]` annotations replace `core::intrinsics::unlikely`; allocator hooks use the stable `GlobalAlloc` trait.
 
 **[NICE-TO-HAVE]** — can be resolved during implementation:
 - Specific NIC model and firmware version for the initial target hardware. Mitigable if the design stays PMD-agnostic, but HW-timestamp dyn-field behavior varies across mlx5 vs. ice; §7.5 already handles the unsupported case.

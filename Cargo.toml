@@ -10,21 +10,11 @@ members = [
 version = "0.1.0"
 edition = "2021"
 license = "Apache-2.0"
-rust-version = "1.75"
 
 [workspace.dependencies]
 # pinned once, used by all crates
 libc = "0.2"
 thiserror = "1"
-# Pinned because home >= 0.5.10 and the windows-sys versions it pulls in
-# require edition2024, which is unstable on our Cargo 1.75 toolchain.
-# `home` is a transitive dep of bindgen/which; we anchor it in
-# `crates/resd-net-sys/build.rs` via a `home::home_dir` reference so the
-# resolver honours this exact-match pin. If you see
-# `feature edition2024 is required` after `cargo update`, re-apply
-# `cargo update -p home --precise 0.5.9`. Remove this pin when the
-# toolchain bumps past Rust 1.77.
-home = "=0.5.9"
 
 [profile.release]
 lto = "fat"

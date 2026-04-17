@@ -6,12 +6,6 @@ fn main() {
     println!("cargo:rerun-if-changed=shim.c");
     println!("cargo:rerun-if-changed=build.rs");
 
-    // Anchor `home` in the build-dep graph. We don't actually need the
-    // returned value — this reference forces the resolver to materialize
-    // the `=0.5.9` pin declared in the workspace-root Cargo.toml even
-    // though `home` is otherwise only a transitive dep of bindgen.
-    let _ = home::home_dir;
-
     let lib = pkg_config::Config::new()
         .atleast_version("23.11")
         .probe("libdpdk")
