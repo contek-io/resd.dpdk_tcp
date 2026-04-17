@@ -202,6 +202,12 @@ pkg-config = "0.3"
 #include <rte_ip_frag.h>
 #include <rte_icmp.h>
 #include <rte_mbuf_dyn.h>
+
+/* `rte_errno` is a macro expanding to a thread-local int; bindgen
+ * cannot reliably expose it. Wrap it in a trivial C shim that bindgen
+ * does expose. All Rust callers use `resd_rte_errno()`.
+ */
+static inline int resd_rte_errno(void) { return rte_errno; }
 ```
 
 - [ ] **Step 3: Write `crates/resd-net-sys/build.rs`**
@@ -409,11 +415,14 @@ fn calibrate() -> TscEpoch {
 
     let elapsed_ns = (end_instant - start_instant).as_nanos() as u64;
     let tsc_delta = end_tsc.wrapping_sub(start_tsc);
-    let ns_per_tsc_scaled: u64 = ((elapsed_ns as u128) << 32 / tsc_delta as u128) as u64;
+    // NOTE: the parens are load-bearing — Rust's `/` binds tighter than `<<`,
+    // so `(x as u128) << 32 / y as u128` would shift by 0 for any y > 32.
+    let ns_per_tsc_scaled: u64 = (((elapsed_ns as u128) << 32) / (tsc_delta as u128)) as u64;
 
     TscEpoch {
         tsc0: start_tsc,
-        t0_ns: elapsed_ns,  // use elapsed from start_instant as the reference
+        // now_ns() returns "ns since calibration start" — tsc0 maps to 0.
+        t0_ns: 0,
         ns_per_tsc_scaled,
     }
 }
@@ -591,16 +600,18 @@ impl Default for PollCounters {
     fn default() -> Self { unsafe { std::mem::zeroed() } }
 }
 
-/// Hot-path increment: always Relaxed.
+/// Hot-path increment: atomic RMW with Relaxed ordering.
+/// On x86_64 this is `lock xadd` — a few cycles slower than a plain store,
+/// but sound under any producer layout and prevents lost-update races
+/// if a counter is ever written from a non-owning thread by mistake.
 #[inline(always)]
 pub fn inc(a: &AtomicU64) {
-    a.store(a.load(Ordering::Relaxed).wrapping_add(1), Ordering::Relaxed);
+    a.fetch_add(1, Ordering::Relaxed);
 }
 
-/// Hot-path add.
 #[inline(always)]
 pub fn add(a: &AtomicU64, n: u64) {
-    a.store(a.load(Ordering::Relaxed).wrapping_add(n), Ordering::Relaxed);
+    a.fetch_add(n, Ordering::Relaxed);
 }
 
 #[cfg(test)]
@@ -623,24 +634,24 @@ mod tests {
     }
 
     #[test]
-    fn cross_thread_read_is_race_free() {
+    fn cross_thread_inc_correct_under_contention() {
         use std::sync::Arc;
         use std::thread;
         let c = Arc::new(Counters::new());
-        let c2 = Arc::clone(&c);
-        let producer = thread::spawn(move || {
-            for _ in 0..100_000 {
-                inc(&c2.eth.rx_pkts);
-            }
-        });
-        // Reader loads while producer is incrementing; no torn reads.
-        let mut last = 0;
-        for _ in 0..1000 {
-            let v = c.eth.rx_pkts.load(Ordering::Relaxed);
-            assert!(v >= last);
-            last = v;
+        let producers: Vec<_> = (0..4)
+            .map(|_| {
+                let c = Arc::clone(&c);
+                thread::spawn(move || {
+                    for _ in 0..25_000 {
+                        inc(&c.eth.rx_pkts);
+                    }
+                })
+            })
+            .collect();
+        for p in producers {
+            p.join().unwrap();
         }
-        producer.join().unwrap();
+        // Would fail if inc() were load-modify-store (lost increments).
         assert_eq!(c.eth.rx_pkts.load(Ordering::Relaxed), 100_000);
     }
 
@@ -833,8 +844,7 @@ pub fn eal_init(args: &[&str]) -> Result<(), Error> {
     // Safety: rte_eal_init mutates argv internally; we pass the constructed array.
     let rc = unsafe { sys::rte_eal_init(argv.len() as i32, argv.as_mut_ptr()) };
     if rc < 0 {
-        let errno = unsafe { sys::rte_errno_ref() };
-        return Err(Error::EalInit(unsafe { *errno }));
+        return Err(Error::EalInit(unsafe { sys::resd_rte_errno() }));
     }
     *guard = true;
     Ok(())
@@ -842,6 +852,9 @@ pub fn eal_init(args: &[&str]) -> Result<(), Error> {
 
 impl Engine {
     pub fn new(cfg: EngineConfig) -> Result<Self, Error> {
+        // socket_id may be -1 (cast to 0xFFFFFFFF == SOCKET_ID_ANY) when the
+        // port isn't bound to a NUMA node (common in VMs / TAP devices).
+        // That's the DPDK sentinel and is valid for mempool/queue setup.
         let socket_id = unsafe { sys::rte_eth_dev_socket_id(cfg.port_id) };
 
         // Allocate three mempools per spec §7.1.
@@ -876,8 +889,7 @@ impl Engine {
             sys::rte_eth_dev_configure(cfg.port_id, 1, 1, &eth_conf as *const _)
         };
         if rc != 0 {
-            let errno = unsafe { *sys::rte_errno_ref() };
-            return Err(Error::PortConfigure(cfg.port_id, errno));
+            return Err(Error::PortConfigure(cfg.port_id, unsafe { sys::resd_rte_errno() }));
         }
 
         let rc = unsafe {
@@ -891,8 +903,7 @@ impl Engine {
             )
         };
         if rc < 0 {
-            let errno = unsafe { *sys::rte_errno_ref() };
-            return Err(Error::RxQueueSetup(cfg.port_id, errno));
+            return Err(Error::RxQueueSetup(cfg.port_id, unsafe { sys::resd_rte_errno() }));
         }
 
         let rc = unsafe {
@@ -905,14 +916,12 @@ impl Engine {
             )
         };
         if rc < 0 {
-            let errno = unsafe { *sys::rte_errno_ref() };
-            return Err(Error::TxQueueSetup(cfg.port_id, errno));
+            return Err(Error::TxQueueSetup(cfg.port_id, unsafe { sys::resd_rte_errno() }));
         }
 
         let rc = unsafe { sys::rte_eth_dev_start(cfg.port_id) };
         if rc < 0 {
-            let errno = unsafe { *sys::rte_errno_ref() };
-            return Err(Error::PortStart(cfg.port_id, errno));
+            return Err(Error::PortStart(cfg.port_id, unsafe { sys::resd_rte_errno() }));
         }
 
         let counters = Box::new(Counters::new());
@@ -973,12 +982,10 @@ impl Drop for Engine {
 }
 ```
 
-Note: `rte_errno_ref` is the DPDK macro-defined accessor; if bindgen doesn't expose it directly, use the thread-local `*rte_errno()` helper — adjust the symbol name during integration if it fails to resolve.
-
 - [ ] **Step 2: Build the crate**
 
 Run: `cargo build -p resd-net-core`
-Expected: compiles. If `rte_errno_ref` or `rte_errno()` symbol doesn't resolve, consult DPDK's `rte_errno.h` and use the correct accessor — the symbol is a TLS variable typically accessed via `rte_errno` macro; wrap in a small C shim in `wrapper.h` if necessary.
+Expected: compiles. `sys::resd_rte_errno()` comes from the C shim added in Task 2's `wrapper.h`.
 
 - [ ] **Step 3: No unit test for this task — integration test comes in Task 7 (needs a real NIC or TAP)**
 
@@ -1124,8 +1131,11 @@ parse_deps = false
 //!
 //! These are all `#[repr(C)]` structs / `#[repr(u32)]` enums so cbindgen
 //! lays them out identically in C. Keep in sync with spec §4.
-
-use std::sync::atomic::AtomicU64;
+//!
+//! Counters are emitted as plain `u64` fields on the C ABI even though the
+//! stack writes them via `AtomicU64` internally — `AtomicU64` has identical
+//! size and alignment as `u64` on x86_64, and cbindgen cannot emit an
+//! atomic C type. See the layout assertion at the bottom of the file.
 
 #[repr(C)]
 pub struct resd_net_engine {
@@ -1242,51 +1252,57 @@ pub struct resd_net_event_t {
 pub const RESD_NET_CLOSE_FORCE_TW_SKIP: u32 = 1 << 0;
 
 /// Counters struct — exposed to application via resd_net_counters().
-/// Lays out the same as resd_net_core::Counters but with C-visible types.
+/// Fields are plain u64 on the C ABI for clean cbindgen emission, but
+/// internally the stack writes them as AtomicU64 (Relaxed). AtomicU64
+/// has identical size and alignment as u64 on x86_64 so pointer-casting
+/// between resd_net_core::Counters and resd_net_counters_t is sound.
+/// C/C++ readers should use `__atomic_load_n(&field, __ATOMIC_RELAXED)`
+/// (or `std::atomic_ref<uint64_t>`) for strictly correct reads; on x86_64
+/// this compiles to a plain `mov` so there's no runtime cost.
 #[repr(C, align(64))]
 pub struct resd_net_eth_counters_t {
-    pub rx_pkts: AtomicU64,
-    pub rx_bytes: AtomicU64,
-    pub rx_drop_miss_mac: AtomicU64,
-    pub rx_drop_nomem: AtomicU64,
-    pub tx_pkts: AtomicU64,
-    pub tx_bytes: AtomicU64,
-    pub tx_drop_full_ring: AtomicU64,
-    pub tx_drop_nomem: AtomicU64,
+    pub rx_pkts: u64,
+    pub rx_bytes: u64,
+    pub rx_drop_miss_mac: u64,
+    pub rx_drop_nomem: u64,
+    pub tx_pkts: u64,
+    pub tx_bytes: u64,
+    pub tx_drop_full_ring: u64,
+    pub tx_drop_nomem: u64,
     pub _pad: [u64; 8],
 }
 #[repr(C, align(64))]
 pub struct resd_net_ip_counters_t {
-    pub rx_csum_bad: AtomicU64,
-    pub rx_ttl_zero: AtomicU64,
-    pub rx_frag: AtomicU64,
-    pub rx_icmp_frag_needed: AtomicU64,
-    pub pmtud_updates: AtomicU64,
+    pub rx_csum_bad: u64,
+    pub rx_ttl_zero: u64,
+    pub rx_frag: u64,
+    pub rx_icmp_frag_needed: u64,
+    pub pmtud_updates: u64,
     pub _pad: [u64; 11],
 }
 #[repr(C, align(64))]
 pub struct resd_net_tcp_counters_t {
-    pub rx_syn_ack: AtomicU64,
-    pub rx_data: AtomicU64,
-    pub rx_ack: AtomicU64,
-    pub rx_rst: AtomicU64,
-    pub rx_out_of_order: AtomicU64,
-    pub tx_retrans: AtomicU64,
-    pub tx_rto: AtomicU64,
-    pub tx_tlp: AtomicU64,
-    pub conn_open: AtomicU64,
-    pub conn_close: AtomicU64,
-    pub conn_rst: AtomicU64,
-    pub send_buf_full: AtomicU64,
-    pub recv_buf_delivered: AtomicU64,
+    pub rx_syn_ack: u64,
+    pub rx_data: u64,
+    pub rx_ack: u64,
+    pub rx_rst: u64,
+    pub rx_out_of_order: u64,
+    pub tx_retrans: u64,
+    pub tx_rto: u64,
+    pub tx_tlp: u64,
+    pub conn_open: u64,
+    pub conn_close: u64,
+    pub conn_rst: u64,
+    pub send_buf_full: u64,
+    pub recv_buf_delivered: u64,
     pub _pad: [u64; 3],
 }
 #[repr(C, align(64))]
 pub struct resd_net_poll_counters_t {
-    pub iters: AtomicU64,
-    pub iters_with_rx: AtomicU64,
-    pub iters_with_tx: AtomicU64,
-    pub iters_idle: AtomicU64,
+    pub iters: u64,
+    pub iters_with_rx: u64,
+    pub iters_with_tx: u64,
+    pub iters_idle: u64,
     pub _pad: [u64; 12],
 }
 #[repr(C)]
@@ -1297,12 +1313,25 @@ pub struct resd_net_counters_t {
     pub poll: resd_net_poll_counters_t,
 }
 
-// Compile-time checks: the public counters struct must have the same size
-// and layout as resd_net_core::Counters. If this ever diverges, it's a bug.
+// Compile-time checks: the public counters struct must have the same
+// size AND alignment as resd_net_core::Counters (AtomicU64 has the same
+// layout as u64 on targets we support). If either diverges, the
+// pointer-cast in resd_net_counters() is unsound and this is a bug.
 const _: () = {
-    use resd_net_core::counters::Counters as CoreCounters;
-    use std::mem::size_of;
+    use resd_net_core::counters::{
+        Counters as CoreCounters, EthCounters as CoreEth, IpCounters as CoreIp,
+        PollCounters as CorePoll, TcpCounters as CoreTcp,
+    };
+    use std::mem::{align_of, size_of};
     assert!(size_of::<resd_net_counters_t>() == size_of::<CoreCounters>());
+    assert!(align_of::<resd_net_eth_counters_t>() == align_of::<CoreEth>());
+    assert!(align_of::<resd_net_ip_counters_t>() == align_of::<CoreIp>());
+    assert!(align_of::<resd_net_tcp_counters_t>() == align_of::<CoreTcp>());
+    assert!(align_of::<resd_net_poll_counters_t>() == align_of::<CorePoll>());
+    assert!(size_of::<resd_net_eth_counters_t>() == size_of::<CoreEth>());
+    assert!(size_of::<resd_net_ip_counters_t>() == size_of::<CoreIp>());
+    assert!(size_of::<resd_net_tcp_counters_t>() == size_of::<CoreTcp>());
+    assert!(size_of::<resd_net_poll_counters_t>() == size_of::<CorePoll>());
 };
 ```
 
@@ -1378,7 +1407,8 @@ pub mod api;
 use api::*;
 use resd_net_core::clock;
 use resd_net_core::counters::Counters;
-use resd_net_core::engine::{Engine, EngineConfig};
+use resd_net_core::engine::{self, Engine, EngineConfig};
+use std::ffi::CStr;
 use std::ptr;
 
 /// Opaque handle — actually a Box<Engine> reinterpreted as *mut resd_net_engine.
@@ -1393,6 +1423,36 @@ unsafe fn engine_from_raw<'a>(p: *mut resd_net_engine) -> Option<&'a Engine> {
         return None;
     }
     Some(&(&*(p as *const OpaqueEngine)).0)
+}
+
+/// Initialize DPDK EAL. Must be called before resd_net_engine_create.
+/// `argv` is a C-style argv array; the function does NOT take ownership
+/// (copies each argument into Rust-owned CStrings internally).
+/// Safe to call multiple times; subsequent calls after the first return 0.
+/// Returns 0 on success, negative errno on failure.
+#[no_mangle]
+pub unsafe extern "C" fn resd_net_eal_init(
+    argc: i32,
+    argv: *const *const libc::c_char,
+) -> i32 {
+    if argc < 0 || argv.is_null() {
+        return -libc::EINVAL;
+    }
+    let args: Vec<String> = (0..argc as isize)
+        .map(|i| {
+            let p = *argv.offset(i);
+            if p.is_null() {
+                String::new()
+            } else {
+                CStr::from_ptr(p).to_string_lossy().into_owned()
+            }
+        })
+        .collect();
+    let refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+    match engine::eal_init(&refs) {
+        Ok(()) => 0,
+        Err(_) => -libc::EAGAIN,
+    }
 }
 
 #[no_mangle]
@@ -1636,8 +1696,24 @@ int main() {
     cfg.tcp_per_packet_events = false;
     cfg.preset = 0;
 
-    // Note: EAL init happens inside Engine::new on first call.
-    // In Phase A1 we rely on the Rust side to init EAL with default args.
+    // Initialize EAL first — required before engine_create.
+    // The default args below work on any host with hugepages; use the TAP
+    // vdev so no real NIC is required for local smoke testing.
+    const char* eal_args[] = {
+        "resd-net-cpp-consumer",
+        "--in-memory",
+        "--no-pci",
+        "--vdev=net_tap0,iface=resdtap0",
+        "-l", "0-1",
+        "--log-level=3",
+    };
+    int eal_argc = (int)(sizeof(eal_args) / sizeof(eal_args[0]));
+    int eal_rc = resd_net_eal_init(eal_argc, eal_args);
+    if (eal_rc != 0) {
+        std::fprintf(stderr, "resd_net_eal_init failed: %d\n", eal_rc);
+        return 1;
+    }
+
     resd_net_engine* eng = resd_net_engine_create(0, &cfg);
     if (!eng) {
         std::fprintf(stderr, "engine create failed\n");
@@ -1652,8 +1728,12 @@ int main() {
     }
 
     const resd_net_counters_t* c = resd_net_counters(eng);
-    std::printf("poll iters: %llu\n",
-        (unsigned long long)c->poll.iters.__val);
+    // Counter fields are plain uint64_t on the C ABI but written atomically
+    // by the stack. For strictly correct cross-thread reads, use
+    // __atomic_load_n(..., __ATOMIC_RELAXED); on x86_64 this compiles to a
+    // plain mov so there's no runtime cost.
+    uint64_t iters = __atomic_load_n(&c->poll.iters, __ATOMIC_RELAXED);
+    std::printf("poll iters: %llu\n", (unsigned long long)iters);
     std::printf("now_ns: %llu\n",
         (unsigned long long)resd_net_now_ns(eng));
 
@@ -1661,8 +1741,6 @@ int main() {
     return 0;
 }
 ```
-
-(Note: `c->poll.iters.__val` works only if cbindgen exposes the atomic as a plain u64. If it emits something like `struct { uint64_t __inner; }`, adjust the accessor. During integration, iterate until the printed value compiles cleanly against the emitted header.)
 
 - [ ] **Step 3: Try to build**
 
@@ -1688,19 +1766,53 @@ git commit -m "add C++ consumer sample that creates engine and reads counters"
 ## Task 12: Integration test — Rust test linking via C ABI
 
 **Files:**
-- Create: `tests/ffi_smoke.rs`
+- Create: `tests/ffi-test/Cargo.toml`
+- Create: `tests/ffi-test/tests/ffi_smoke.rs`
+- Modify: workspace root `Cargo.toml` (add `tests/ffi-test` to members)
 
-- [ ] **Step 1: Write the test**
+- [ ] **Step 1: Add the test crate to the workspace**
+
+Edit root `Cargo.toml` — update the `members` array:
+
+```toml
+members = [
+    "crates/resd-net-sys",
+    "crates/resd-net-core",
+    "crates/resd-net",
+    "tests/ffi-test",
+]
+```
+
+- [ ] **Step 2: Create `tests/ffi-test/Cargo.toml`**
+
+```toml
+[package]
+name = "ffi-test"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[dependencies]
+resd-net = { path = "../../crates/resd-net" }
+libc.workspace = true
+```
+
+- [ ] **Step 3: Create `tests/ffi-test/tests/ffi_smoke.rs`**
 
 ```rust
 //! End-to-end FFI smoke test: uses the public C ABI from Rust to prove the
 //! extern "C" surface is usable, not just the Rust-native one.
-//! Runs only when RESD_NET_TEST_TAP=1 (because it actually initializes EAL).
+//!
+//! - `ffi_handles_null_safely` runs always (doesn't touch EAL/DPDK).
+//! - `ffi_eal_init_and_engine_lifecycle` runs only when RESD_NET_TEST_TAP=1
+//!   because it actually initializes EAL against a DPDK TAP vdev.
 
+use std::ffi::CString;
 use std::ptr;
 
 #[link(name = "resd_net", kind = "static")]
 extern "C" {
+    fn resd_net_eal_init(argc: i32, argv: *const *const libc::c_char) -> i32;
     fn resd_net_engine_create(
         lcore_id: u16,
         cfg: *const core::ffi::c_void,
@@ -1717,7 +1829,6 @@ extern "C" {
 
 #[test]
 fn ffi_handles_null_safely() {
-    // These calls must be safe on null pointers per API contract.
     unsafe {
         resd_net_engine_destroy(ptr::null_mut());
         let rc = resd_net_poll(ptr::null_mut(), ptr::null_mut(), 0, 0);
@@ -1726,49 +1837,87 @@ fn ffi_handles_null_safely() {
         assert!(ts > 0);
     }
 }
+
+#[test]
+fn ffi_eal_init_and_engine_lifecycle() {
+    if std::env::var("RESD_NET_TEST_TAP").ok().as_deref() != Some("1") {
+        eprintln!("skipping; set RESD_NET_TEST_TAP=1 to run");
+        return;
+    }
+
+    let args: Vec<CString> = [
+        "resd-net-ffi-test",
+        "--in-memory",
+        "--no-pci",
+        "--vdev=net_tap0,iface=resdtap0",
+        "-l", "0-1",
+        "--log-level=3",
+    ]
+    .iter()
+    .map(|s| CString::new(*s).unwrap())
+    .collect();
+    let argv: Vec<*const libc::c_char> = args.iter().map(|c| c.as_ptr()).collect();
+
+    let rc = unsafe { resd_net_eal_init(argv.len() as i32, argv.as_ptr()) };
+    assert_eq!(rc, 0, "resd_net_eal_init failed: {rc}");
+
+    // Minimum viable engine_config — matches the resd_net_engine_config_t layout
+    // from api.rs. Kept as a byte array here to avoid duplicating the struct
+    // definition; real consumers include resd_net.h and use the typed struct.
+    #[repr(C)]
+    struct Cfg {
+        port_id: u16, rx_queue_id: u16, tx_queue_id: u16,
+        _pad1: u16,
+        max_connections: u32,
+        recv_buffer_bytes: u32, send_buffer_bytes: u32,
+        tcp_mss: u32,
+        tcp_timestamps: bool, tcp_sack: bool, tcp_ecn: bool, tcp_nagle: bool,
+        tcp_delayed_ack: bool, cc_mode: u8, _pad2: [u8; 2],
+        tcp_min_rto_ms: u32, tcp_initial_rto_ms: u32, tcp_msl_ms: u32,
+        tcp_per_packet_events: bool, preset: u8, _pad3: [u8; 2],
+    }
+    let cfg = Cfg {
+        port_id: 0, rx_queue_id: 0, tx_queue_id: 0, _pad1: 0,
+        max_connections: 16,
+        recv_buffer_bytes: 256 * 1024, send_buffer_bytes: 256 * 1024,
+        tcp_mss: 0,
+        tcp_timestamps: true, tcp_sack: true, tcp_ecn: false, tcp_nagle: false,
+        tcp_delayed_ack: false, cc_mode: 0, _pad2: [0; 2],
+        tcp_min_rto_ms: 20, tcp_initial_rto_ms: 50, tcp_msl_ms: 30000,
+        tcp_per_packet_events: false, preset: 0, _pad3: [0; 2],
+    };
+
+    let eng = unsafe {
+        resd_net_engine_create(0, &cfg as *const Cfg as *const core::ffi::c_void)
+    };
+    assert!(!eng.is_null(), "resd_net_engine_create returned null");
+
+    for _ in 0..10 {
+        let rc = unsafe { resd_net_poll(eng, ptr::null_mut(), 0, 0) };
+        assert_eq!(rc, 0);
+    }
+
+    unsafe { resd_net_engine_destroy(eng) };
+}
 ```
 
-- [ ] **Step 2: Configure the test**
+Note: if cbindgen lays `resd_net_engine_config_t` out differently than the `Cfg` shim here (for example if Rust's field reordering happens despite `#[repr(C)]`), the test will detect it immediately — the engine_create call will mis-read the fields. The typed struct from `include/resd_net.h` is the source of truth; this shim must match it. Adjust field order to mirror `api.rs` exactly if the test fails.
 
-Create `tests/Cargo.toml` isn't needed because this is an integration test at workspace root. Instead, add the test to a test-only crate.
+- [ ] **Step 4: Run the non-TAP test**
 
-Add to workspace `Cargo.toml`:
+Run: `cargo test -p ffi-test ffi_handles_null_safely`
+Expected: PASS.
 
-```toml
-members = [
-    "crates/resd-net-sys",
-    "crates/resd-net-core",
-    "crates/resd-net",
-    "tests/ffi-test",
-]
-```
+- [ ] **Step 5: Run the TAP test (requires sudo + DPDK)**
 
-Create `tests/ffi-test/Cargo.toml`:
+Run: `sudo -E RESD_NET_TEST_TAP=1 $(command -v cargo) test -p ffi-test ffi_eal_init_and_engine_lifecycle -- --nocapture`
+Expected: PASS; poll returns 0 ten times.
 
-```toml
-[package]
-name = "ffi-test"
-version.workspace = true
-edition.workspace = true
-publish = false
-
-[dependencies]
-resd-net = { path = "../../crates/resd-net" }
-libc.workspace = true
-```
-
-Move `tests/ffi_smoke.rs` to `tests/ffi-test/tests/ffi_smoke.rs`.
-
-- [ ] **Step 3: Run**
-
-Run: `cargo test -p ffi-test`
-Expected: `ffi_handles_null_safely` PASS.
-
-- [ ] **Step 4: Commit**
+- [ ] **Step 6: Commit**
 
 ```sh
-git add tests/ Cargo.toml
-git commit -m "add FFI smoke test exercising public C ABI from Rust"
+git add Cargo.toml tests/ffi-test/
+git commit -m "add FFI smoke test exercising public C ABI from Rust (null-safety + TAP lifecycle)"
 ```
 
 ---
