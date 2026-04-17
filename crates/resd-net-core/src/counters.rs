@@ -13,7 +13,12 @@ pub struct EthCounters {
     pub tx_bytes: AtomicU64,
     pub tx_drop_full_ring: AtomicU64,
     pub tx_drop_nomem: AtomicU64,
-    _pad: [u64; 8], // keep struct size aligned
+    // Phase A2 additions
+    pub rx_drop_short: AtomicU64,
+    pub rx_drop_unknown_ethertype: AtomicU64,
+    pub rx_arp: AtomicU64,
+    pub tx_arp: AtomicU64,
+    _pad: [u64; 4],
 }
 
 #[repr(C, align(64))]
@@ -23,7 +28,15 @@ pub struct IpCounters {
     pub rx_frag: AtomicU64,
     pub rx_icmp_frag_needed: AtomicU64,
     pub pmtud_updates: AtomicU64,
-    _pad: [u64; 11],
+    // Phase A2 additions
+    pub rx_drop_short: AtomicU64,
+    pub rx_drop_bad_version: AtomicU64,
+    pub rx_drop_bad_hl: AtomicU64,
+    pub rx_drop_not_ours: AtomicU64,
+    pub rx_drop_unsupported_proto: AtomicU64,
+    pub rx_tcp: AtomicU64,
+    pub rx_icmp: AtomicU64,
+    _pad: [u64; 4],
 }
 
 #[repr(C, align(64))]
@@ -162,5 +175,23 @@ mod tests {
         assert_eq!(std::mem::align_of::<IpCounters>(), 64);
         assert_eq!(std::mem::align_of::<TcpCounters>(), 64);
         assert_eq!(std::mem::align_of::<PollCounters>(), 64);
+    }
+
+    #[test]
+    fn a2_new_counters_exist_and_zero() {
+        let c = Counters::new();
+        // eth additions
+        assert_eq!(c.eth.rx_drop_short.load(Ordering::Relaxed), 0);
+        assert_eq!(c.eth.rx_drop_unknown_ethertype.load(Ordering::Relaxed), 0);
+        assert_eq!(c.eth.rx_arp.load(Ordering::Relaxed), 0);
+        assert_eq!(c.eth.tx_arp.load(Ordering::Relaxed), 0);
+        // ip additions
+        assert_eq!(c.ip.rx_drop_short.load(Ordering::Relaxed), 0);
+        assert_eq!(c.ip.rx_drop_bad_version.load(Ordering::Relaxed), 0);
+        assert_eq!(c.ip.rx_drop_bad_hl.load(Ordering::Relaxed), 0);
+        assert_eq!(c.ip.rx_drop_not_ours.load(Ordering::Relaxed), 0);
+        assert_eq!(c.ip.rx_drop_unsupported_proto.load(Ordering::Relaxed), 0);
+        assert_eq!(c.ip.rx_tcp.load(Ordering::Relaxed), 0);
+        assert_eq!(c.ip.rx_icmp.load(Ordering::Relaxed), 0);
     }
 }

@@ -146,7 +146,12 @@ pub struct resd_net_eth_counters_t {
     pub tx_bytes: u64,
     pub tx_drop_full_ring: u64,
     pub tx_drop_nomem: u64,
-    pub _pad: [u64; 8],
+    // Phase A2 additions
+    pub rx_drop_short: u64,
+    pub rx_drop_unknown_ethertype: u64,
+    pub rx_arp: u64,
+    pub tx_arp: u64,
+    pub _pad: [u64; 4],
 }
 #[repr(C, align(64))]
 pub struct resd_net_ip_counters_t {
@@ -155,7 +160,15 @@ pub struct resd_net_ip_counters_t {
     pub rx_frag: u64,
     pub rx_icmp_frag_needed: u64,
     pub pmtud_updates: u64,
-    pub _pad: [u64; 11],
+    // Phase A2 additions
+    pub rx_drop_short: u64,
+    pub rx_drop_bad_version: u64,
+    pub rx_drop_bad_hl: u64,
+    pub rx_drop_not_ours: u64,
+    pub rx_drop_unsupported_proto: u64,
+    pub rx_tcp: u64,
+    pub rx_icmp: u64,
+    pub _pad: [u64; 4],
 }
 #[repr(C, align(64))]
 pub struct resd_net_tcp_counters_t {
