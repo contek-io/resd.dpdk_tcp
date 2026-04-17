@@ -20,7 +20,12 @@ fn main() {
         .env_metadata(false)
         .probe("libdpdk")
         .ok()
-        .map(|_| std::process::Command::new("pkg-config").args(["--cflags", "libdpdk"]).output().ok())
+        .map(|_| {
+            std::process::Command::new("pkg-config")
+                .args(["--cflags", "libdpdk"])
+                .output()
+                .ok()
+        })
         .flatten();
 
     let mut clang_args: Vec<String> = Vec::new();
@@ -133,8 +138,8 @@ fn detect_clang_resource_dir() -> Option<String> {
     // clang-sys picks (typically the highest version on the dynamic-loader
     // search path), so we want the matching resource directory.
     for candidate in [
-        "clang-22", "clang-21", "clang-20", "clang-19", "clang-18",
-        "clang-17", "clang-16", "clang-15", "clang-14", "clang",
+        "clang-22", "clang-21", "clang-20", "clang-19", "clang-18", "clang-17", "clang-16",
+        "clang-15", "clang-14", "clang",
     ] {
         if let Ok(out) = std::process::Command::new(candidate)
             .arg("-print-resource-dir")

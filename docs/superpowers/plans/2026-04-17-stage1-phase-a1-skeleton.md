@@ -289,6 +289,22 @@ git add Cargo.toml rust-toolchain.toml .gitignore README.md crates/resd-net-sys/
 git commit -m "bootstrap workspace and resd-net-sys DPDK bindings"
 ```
 
+#### Task 2 post-implementation deltas (shipped across commits d738799 / d3665db)
+
+The shipped code differs from the Task 2 snippets above. If you are re-implementing, follow the shipped code (not the snippets) because bindgen + DPDK + the LLVM 22 install need workarounds the original snippets lacked:
+
+- `wrapper.h`: `resd_rte_errno` is declared `int resd_rte_errno(void);` (a real extern, not `static inline`) — bindgen cannot emit FFI stubs for static-inline C functions without `--wrap-static-fns` + a `cc` compile step.
+- New file `crates/resd-net-sys/shim.c`: `int resd_rte_errno(void) { return rte_errno; }` — the extern declaration binds to this.
+- `crates/resd-net-sys/Cargo.toml` adds `cc = "1"` to `[build-dependencies]`.
+- `build.rs` adds `.allowlist_function("resd_.*")` so the symbol is emitted.
+- `build.rs` adds a `cc::Build::new().file("shim.c")` compile step that shares pkg-config include paths + cflags with bindgen (so `-include rte_config.h` and `-march=...` reach both).
+- `build.rs` adds `detect_clang_resource_dir()` (three-step fallback: `BINDGEN_RESOURCE_DIR` env → `$LIBCLANG_PATH/clang/*` → `clang-NN -print-resource-dir` for NN 22..14) to paper over mismatched libclang resource dirs on hosts with multiple LLVM installs. Emits `cargo:warning=...` with `BINDGEN_RESOURCE_DIR` hint when detection returns None.
+- `build.rs` shells out to `pkg-config --cflags libdpdk` in addition to using `lib.include_paths`, so DPDK's `-march=corei7 -mrtm -include rte_config.h` reach bindgen.
+- `build.rs` adds `.opaque_type("rte_arp_.*")`, `.opaque_type("rte_l2tpv2_.*")`, `.opaque_type("rte_gtp_.*")` to work around packed-with-inner-align E0588 errors. None of those DPDK types are used by Stage 1.
+- `src/lib.rs` adds `println!("{s}")` in `dpdk_version_string_nonempty` so `--nocapture` surfaces the DPDK version.
+- `src/lib.rs` adds a `resd_rte_errno_linkable` test proving the shim symbol links.
+- Workspace `Cargo.toml` narrows `members` to just `resd-net-sys` at the end of T2; Task 3 uncomments `"crates/resd-net-core"` and Task 8 uncomments `"crates/resd-net"`.
+
 ---
 
 ## Task 3: `resd-net-core` — crate skeleton + clock
