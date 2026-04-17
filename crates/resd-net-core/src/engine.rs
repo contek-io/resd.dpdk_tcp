@@ -199,14 +199,23 @@ impl Engine {
     pub fn gateway_ip(&self) -> u32 { self.cfg.gateway_ip }
     pub fn pmtu_for(&self, ip: u32) -> Option<u16> { self.pmtu.borrow().get(ip) }
 
-    /// TX a self-contained ≤256-byte frame (ARP in Phase A2). Allocates one
-    /// mbuf from tx_hdr_mempool, copies `bytes` into its data room via the
-    /// `rte_pktmbuf_append` shim, then submits via a single-packet burst.
+    /// TX a self-contained ≤128-byte frame (ARP reply / gratuitous ARP is 42
+    /// bytes). Allocates one mbuf from tx_hdr_mempool, copies `bytes` into its
+    /// data room via the `rte_pktmbuf_append` shim, then submits via a
+    /// single-packet burst.
     /// Bumps `eth.tx_pkts` / `eth.tx_bytes` / `eth.tx_drop_nomem` /
     /// `eth.tx_drop_full_ring` as appropriate. Returns true if the packet
     /// was accepted by the driver.
     pub(crate) fn tx_frame(&self, bytes: &[u8]) -> bool {
         use crate::counters::{add, inc};
+        // Guard against bytes.len() > u16::MAX silently truncating on the
+        // u16 cast below. Also reject anything larger than the mempool's
+        // data room. tx_hdr_mempool is sized for small control frames
+        // (ARP, future RST/ACK); oversized callers are a programming error.
+        if bytes.len() > u16::MAX as usize {
+            inc(&self.counters.eth.tx_drop_nomem);
+            return false;
+        }
         // Safety: tx_hdr_mempool was created in Engine::new and is alive.
         let m = unsafe { sys::resd_rte_pktmbuf_alloc(self.tx_hdr_mempool.as_ptr()) };
         if m.is_null() {
