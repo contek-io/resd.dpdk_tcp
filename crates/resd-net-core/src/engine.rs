@@ -1,8 +1,10 @@
 use resd_net_sys as sys;
+use std::cell::RefCell;
 use std::ffi::CString;
 use std::sync::Mutex;
 
 use crate::counters::Counters;
+use crate::icmp::PmtuTable;
 use crate::mempool::Mempool;
 use crate::Error;
 
@@ -44,13 +46,17 @@ impl Default for EngineConfig {
     }
 }
 
-/// A resd-net engine. One per lcore; owns the NIC queues and mempools for that lcore.
+/// A resd-net engine. One per lcore; owns the NIC queues, mempools, and
+/// L2/L3 state for that lcore.
 pub struct Engine {
     cfg: EngineConfig,
     counters: Box<Counters>,
     _rx_mempool: Mempool,
-    _tx_hdr_mempool: Mempool,
+    tx_hdr_mempool: Mempool,
     _tx_data_mempool: Mempool,
+    our_mac: [u8; 6],
+    pmtu: RefCell<PmtuTable>,
+    last_garp_ns: RefCell<u64>,
 }
 
 /// EAL is process-global; only initialize once.
@@ -160,19 +166,84 @@ impl Engine {
             }));
         }
 
+        // Read NIC MAC via the shim. `rte_ether_addr` is a 6-byte packed struct.
+        let mut mac_addr: sys::rte_ether_addr = unsafe { std::mem::zeroed() };
+        let rc = unsafe { sys::resd_rte_eth_macaddr_get(cfg.port_id, &mut mac_addr) };
+        if rc != 0 {
+            return Err(Error::MacAddrLookup(cfg.port_id, unsafe { sys::resd_rte_errno() }));
+        }
+        // bindgen names the field `addr_bytes` on rte_ether_addr.
+        let our_mac = mac_addr.addr_bytes;
+
         let counters = Box::new(Counters::new());
 
         Ok(Self {
             cfg,
             counters,
             _rx_mempool: rx_mempool,
-            _tx_hdr_mempool: tx_hdr_mempool,
+            tx_hdr_mempool,
             _tx_data_mempool: tx_data_mempool,
+            our_mac,
+            pmtu: RefCell::new(PmtuTable::new()),
+            last_garp_ns: RefCell::new(0),
         })
     }
 
     pub fn counters(&self) -> &Counters {
         &self.counters
+    }
+
+    pub fn our_mac(&self) -> [u8; 6] { self.our_mac }
+    pub fn our_ip(&self) -> u32 { self.cfg.local_ip }
+    pub fn gateway_mac(&self) -> [u8; 6] { self.cfg.gateway_mac }
+    pub fn gateway_ip(&self) -> u32 { self.cfg.gateway_ip }
+    pub fn pmtu_for(&self, ip: u32) -> Option<u16> { self.pmtu.borrow().get(ip) }
+
+    /// TX a self-contained ≤256-byte frame (ARP in Phase A2). Allocates one
+    /// mbuf from tx_hdr_mempool, copies `bytes` into its data room via the
+    /// `rte_pktmbuf_append` shim, then submits via a single-packet burst.
+    /// Bumps `eth.tx_pkts` / `eth.tx_bytes` / `eth.tx_drop_nomem` /
+    /// `eth.tx_drop_full_ring` as appropriate. Returns true if the packet
+    /// was accepted by the driver.
+    pub(crate) fn tx_frame(&self, bytes: &[u8]) -> bool {
+        use crate::counters::{add, inc};
+        // Safety: tx_hdr_mempool was created in Engine::new and is alive.
+        let m = unsafe { sys::resd_rte_pktmbuf_alloc(self.tx_hdr_mempool.as_ptr()) };
+        if m.is_null() {
+            inc(&self.counters.eth.tx_drop_nomem);
+            return false;
+        }
+        // Safety: append writes into the mbuf's data room. Returns NULL if
+        // the mbuf's tailroom is < len.
+        let dst = unsafe { sys::resd_rte_pktmbuf_append(m, bytes.len() as u16) };
+        if dst.is_null() {
+            unsafe { sys::resd_rte_pktmbuf_free(m) };
+            inc(&self.counters.eth.tx_drop_nomem);
+            return false;
+        }
+        // Safety: dst points to `bytes.len()` writable bytes inside the mbuf.
+        unsafe {
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), dst as *mut u8, bytes.len());
+        }
+        let mut pkts = [m];
+        let sent = unsafe {
+            sys::resd_rte_eth_tx_burst(
+                self.cfg.port_id,
+                self.cfg.tx_queue_id,
+                pkts.as_mut_ptr(),
+                1,
+            )
+        } as usize;
+        if sent == 1 {
+            add(&self.counters.eth.tx_bytes, bytes.len() as u64);
+            inc(&self.counters.eth.tx_pkts);
+            true
+        } else {
+            // TX ring full; driver did not take the mbuf. Free it ourselves.
+            unsafe { sys::resd_rte_pktmbuf_free(m) };
+            inc(&self.counters.eth.tx_drop_full_ring);
+            false
+        }
     }
 
     /// One iteration of the run-to-completion loop.
@@ -233,5 +304,19 @@ mod tests {
         assert_eq!(cfg.gateway_mac, [0u8; 6]);
         // 0 = disabled (no gratuitous ARP emitted).
         assert_eq!(cfg.garp_interval_sec, 0);
+    }
+
+    #[test]
+    fn engine_exposes_addressing_and_pmtu() {
+        // Unit-test smoke: engine struct has the new accessors. We can't
+        // actually construct an Engine without EAL, so test the types.
+        fn _check(_e: &Engine) {
+            let _: [u8; 6] = _e.our_mac();
+            let _: u32 = _e.our_ip();
+            let _: [u8; 6] = _e.gateway_mac();
+            // PmtuTable read: exposed via counters-style getter for observability.
+            let _: Option<u16> = _e.pmtu_for(0);
+        }
+        // If this compiles, the methods exist.
     }
 }
