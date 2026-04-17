@@ -55,11 +55,10 @@ resd.dpdk_tcp/
 │   └── cpp-consumer/
 │       ├── CMakeLists.txt
 │       └── main.cpp
-├── tests/
-│   └── ffi_smoke.rs                # integration test linking to C ABI
-└── .github/
-    └── workflows/
-        └── ci.yml                  # cargo test + cbindgen check + C++ build
+└── tests/
+    └── ffi-test/
+        ├── Cargo.toml
+        └── tests/ffi_smoke.rs      # integration test linking to C ABI
 ```
 
 ---
@@ -1922,78 +1921,9 @@ git commit -m "add FFI smoke test exercising public C ABI from Rust (null-safety
 
 ---
 
-## Task 13: CI pipeline
+## Task 13: _(removed)_
 
-**Files:**
-- Create: `.github/workflows/ci.yml`
-
-- [ ] **Step 1: Write CI**
-
-```yaml
-name: CI
-
-on:
-  push: { branches: [ main ] }
-  pull_request:
-
-env:
-  CARGO_TERM_COLOR: always
-
-jobs:
-  build-and-test:
-    runs-on: ubuntu-22.04
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install DPDK 23.11 + deps
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y build-essential libnuma-dev pkg-config \
-               libelf-dev meson ninja-build python3-pyelftools \
-               cmake clang llvm libclang-dev
-          # Build DPDK 23.11 from source; cache in a step-ideally step below.
-          git clone --branch v23.11 --depth 1 https://dpdk.org/git/dpdk dpdk
-          cd dpdk
-          meson setup build --prefix=/usr/local
-          ninja -C build
-          sudo ninja -C build install
-          sudo ldconfig
-
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: 1.75.0
-          components: clippy, rustfmt
-
-      - name: Build workspace
-        run: cargo build --workspace --all-targets
-
-      - name: Run unit tests
-        run: cargo test --workspace --no-fail-fast
-
-      - name: Check cbindgen-generated header is up to date
-        run: ./scripts/check-header.sh
-
-      - name: Build C++ consumer
-        run: |
-          cargo build -p resd-net --release
-          cmake -S examples/cpp-consumer -B examples/cpp-consumer/build -DRESD_NET_PROFILE=release
-          cmake --build examples/cpp-consumer/build
-
-      - name: Clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
-
-      - name: Rustfmt
-        run: cargo fmt --all -- --check
-```
-
-- [ ] **Step 2: Commit**
-
-```sh
-git add .github/workflows/ci.yml
-git commit -m "add CI pipeline: build, test, cbindgen drift, C++ consumer, lints"
-```
-
-- [ ] **Step 3: Push and observe** — the first CI run will fail if local env differs from Ubuntu 22.04; iterate on the workflow until it passes.
+GitHub Actions CI is out of scope for Phase A1 per user decision — verification runs locally on the build host instead (see Task 14). The `scripts/check-header.sh` guard from Task 10 still exists and can be wired to a future CI system if desired, but no workflow file is produced in this phase.
 
 ---
 
