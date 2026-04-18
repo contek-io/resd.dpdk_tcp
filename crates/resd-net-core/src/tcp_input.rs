@@ -9,7 +9,7 @@
 
 use crate::flow_table::FourTuple;
 use crate::tcp_conn::TcpConn;
-use crate::tcp_output::{TCP_ACK, TCP_FIN, TCP_RST, TCP_SYN};
+use crate::tcp_output::{TCP_ACK, TCP_FIN, TCP_RST, TCP_SYN, TCP_URG};
 use crate::tcp_state::TcpState;
 
 #[derive(Debug, Clone, Copy)]
@@ -149,6 +149,23 @@ pub struct Outcome {
     /// A4: number of peer SACK blocks decoded from this segment's ACK.
     /// Engine bumps `tcp.rx_sack_blocks` by this count.
     pub sack_blocks_decoded: u32,
+    /// A4 backfill: true iff the incoming segment's seq was outside
+    /// `rcv_wnd` and we dropped + challenge-ACKed it. Engine bumps
+    /// `tcp.rx_bad_seq`.
+    pub bad_seq: bool,
+    /// A4 backfill: true iff the ACK field was outside `(snd_una, snd_nxt]`
+    /// (acking nothing new or acking future data). Engine bumps
+    /// `tcp.rx_bad_ack`.
+    pub bad_ack: bool,
+    /// A4 backfill: true iff the segment was a duplicate ACK (ack_seq
+    /// <= snd_una with no new data). Engine bumps `tcp.rx_dup_ack`.
+    pub dup_ack: bool,
+    /// A4 backfill: true iff the URG flag was set and we dropped the
+    /// segment. Engine bumps `tcp.rx_urgent_dropped`.
+    pub urgent_dropped: bool,
+    /// A4 backfill: true iff the peer's advertised window is zero.
+    /// Engine bumps `tcp.rx_zero_window`.
+    pub rx_zero_window: bool,
     pub connected: bool,
     pub closed: bool,
 }
@@ -166,6 +183,11 @@ impl Outcome {
             paws_rejected: false,
             bad_option: false,
             sack_blocks_decoded: 0,
+            bad_seq: false,
+            bad_ack: false,
+            dup_ack: false,
+            urgent_dropped: false,
+            rx_zero_window: false,
             connected: false,
             closed: false,
         }
@@ -290,19 +312,31 @@ fn handle_syn_sent(conn: &mut TcpConn, seg: &ParsedSegment) -> Outcome {
 fn handle_established(conn: &mut TcpConn, seg: &ParsedSegment) -> Outcome {
     use crate::tcp_seq::{in_window, seq_le, seq_lt};
 
+    // Stage 1 does not support URG. Drop silently and account via
+    // `tcp.rx_urgent_dropped` (A4 cross-phase backfill — spec §9.1.1).
+    if (seg.flags & TCP_URG) != 0 {
+        return Outcome { tx: TxAction::None, urgent_dropped: true, ..Outcome::base() };
+    }
+
+    // Observe a zero-window advertisement from the peer before any
+    // drop-path below can early-return. Critical trading signal (A4
+    // cross-phase backfill — "exchange is slow").
+    let rx_zero_window = seg.window == 0;
+
     // RST → close per RFC 9293 §3.10.7.4.
     if (seg.flags & TCP_RST) != 0 {
         return Outcome {
             tx: TxAction::None,
             new_state: Some(TcpState::Closed),
             closed: true,
+            rx_zero_window,
             ..Outcome::base()
         };
     }
 
     // Segment must carry ACK in ESTABLISHED.
     if (seg.flags & TCP_ACK) == 0 {
-        return Outcome::none();
+        return Outcome { rx_zero_window, ..Outcome::base() };
     }
 
     // Sequence-window check — RFC 9293 §3.10.7.4. Accept iff either
@@ -319,8 +353,14 @@ fn handle_established(conn: &mut TcpConn, seg: &ParsedSegment) -> Outcome {
             && in_window(conn.rcv_nxt, last, conn.rcv_wnd)
     };
     if !in_win {
-        // Out-of-window: challenge ACK and drop.
-        return Outcome { tx: TxAction::Ack, ..Outcome::base() };
+        // Out-of-window: challenge ACK and drop. Account via
+        // `tcp.rx_bad_seq` (A4 cross-phase backfill).
+        return Outcome {
+            tx: TxAction::Ack,
+            bad_seq: true,
+            rx_zero_window,
+            ..Outcome::base()
+        };
     }
 
     // A4: parse options (TS + SACK blocks). Malformed → bad_option drop.
@@ -331,7 +371,12 @@ fn handle_established(conn: &mut TcpConn, seg: &ParsedSegment) -> Outcome {
         match crate::tcp_options::parse_options(seg.options) {
             Ok(o) => o,
             Err(_) => {
-                return Outcome { tx: TxAction::None, bad_option: true, ..Outcome::base() };
+                return Outcome {
+                    tx: TxAction::None,
+                    bad_option: true,
+                    rx_zero_window,
+                    ..Outcome::base()
+                };
             }
         }
     };
@@ -341,11 +386,21 @@ fn handle_established(conn: &mut TcpConn, seg: &ParsedSegment) -> Outcome {
     if conn.ts_enabled {
         match parsed_opts.timestamps {
             None => {
-                return Outcome { tx: TxAction::None, bad_option: true, ..Outcome::base() };
+                return Outcome {
+                    tx: TxAction::None,
+                    bad_option: true,
+                    rx_zero_window,
+                    ..Outcome::base()
+                };
             }
             Some((ts_val, _ts_ecr)) => {
                 if crate::tcp_seq::seq_lt(ts_val, conn.ts_recent) {
-                    return Outcome { tx: TxAction::Ack, paws_rejected: true, ..Outcome::base() };
+                    return Outcome {
+                        tx: TxAction::Ack,
+                        paws_rejected: true,
+                        rx_zero_window,
+                        ..Outcome::base()
+                    };
                 }
                 // RFC 7323 §4.3 MUST-25: only update ts_recent on a
                 // segment whose seq is at or before rcv_nxt.
@@ -369,6 +424,7 @@ fn handle_established(conn: &mut TcpConn, seg: &ParsedSegment) -> Outcome {
     }
 
     // ACK processing — RFC 9293 §3.10.7.4, "ESTABLISHED STATE" ACK handling.
+    let mut dup_ack = false;
     if seq_lt(conn.snd_una, seg.ack) && seq_le(seg.ack, conn.snd_nxt) {
         let acked = seg.ack.wrapping_sub(conn.snd_una) as usize;
         for _ in 0..acked.min(conn.snd.pending.len()) {
@@ -389,9 +445,19 @@ fn handle_established(conn: &mut TcpConn, seg: &ParsedSegment) -> Outcome {
         }
     } else if seq_lt(conn.snd_nxt, seg.ack) {
         // ACK ahead of snd_nxt → we never sent that much; challenge ACK.
-        return Outcome { tx: TxAction::Ack, ..Outcome::base() };
+        // Account via `tcp.rx_bad_ack` (A4 cross-phase backfill).
+        return Outcome {
+            tx: TxAction::Ack,
+            bad_ack: true,
+            rx_zero_window,
+            sack_blocks_decoded,
+            ..Outcome::base()
+        };
+    } else {
+        // Duplicate ACK (ack <= snd_una) — no-op for A3 (A5 uses for fast
+        // retx). Account via `tcp.rx_dup_ack` (A4 cross-phase backfill).
+        dup_ack = true;
     }
-    // Else: duplicate ACK (ack <= snd_una) — no-op for A3 (A5 uses it for fast retx).
 
     // Data delivery — A4: in-order append + OOO reassembly enqueue +
     // drain-on-gap-close per spec §7.2.
@@ -464,6 +530,8 @@ fn handle_established(conn: &mut TcpConn, seg: &ParsedSegment) -> Outcome {
         reassembly_queued_bytes,
         reassembly_hole_filled,
         sack_blocks_decoded,
+        dup_ack,
+        rx_zero_window,
         ..Outcome::base()
     }
 }
@@ -502,7 +570,7 @@ fn handle_close_path(conn: &mut TcpConn, seg: &ParsedSegment) -> Outcome {
             && in_window(conn.rcv_nxt, last, conn.rcv_wnd)
     };
     if !in_win {
-        return Outcome { tx: TxAction::Ack, ..Outcome::base() };
+        return Outcome { tx: TxAction::Ack, bad_seq: true, ..Outcome::base() };
     }
 
     // Advance snd_una if ack covers more of our stream.
@@ -1224,5 +1292,133 @@ mod tests {
         let out = dispatch(&mut c, &seg);
         assert_eq!(out.tx, TxAction::Ack);
         assert_eq!(out.new_state, None); // stay in TIME_WAIT until reaper
+    }
+
+    // A4 Task 19: cross-phase backfill flags on `Outcome`.
+
+    #[test]
+    fn established_urg_flag_drops_and_sets_urgent_dropped() {
+        use crate::tcp_output::TCP_URG;
+        let mut c = est_conn(1000, 5000, 1024);
+        let seg = ParsedSegment {
+            src_port: 5000, dst_port: 40000,
+            seq: 5001, ack: 1001,
+            flags: TCP_ACK | TCP_URG, window: 65535,
+            header_len: 20, payload: b"x", options: &[],
+        };
+        let out = dispatch(&mut c, &seg);
+        assert!(out.urgent_dropped);
+        assert_eq!(out.tx, TxAction::None);
+        assert_eq!(out.delivered, 0);
+        // Segment should NOT have been delivered.
+        assert_eq!(c.rcv_nxt, 5001);
+    }
+
+    #[test]
+    fn established_out_of_window_sets_bad_seq_and_challenge_acks() {
+        let mut c = est_conn(1000, 5000, 1024);
+        // rcv_nxt=5001, rcv_wnd=1024. seq way past window.
+        let seg = ParsedSegment {
+            src_port: 5000, dst_port: 40000,
+            seq: 9999, ack: 1001,
+            flags: TCP_ACK, window: 65535,
+            header_len: 20, payload: b"xxx", options: &[],
+        };
+        let out = dispatch(&mut c, &seg);
+        assert!(out.bad_seq);
+        assert_eq!(out.tx, TxAction::Ack); // challenge ACK
+        assert_eq!(out.delivered, 0);
+    }
+
+    #[test]
+    fn established_ack_ahead_of_snd_nxt_sets_bad_ack() {
+        let mut c = est_conn(1000, 5000, 1024);
+        // snd_nxt=1001 (1000+1 for SYN). Ack a future byte.
+        let seg = ParsedSegment {
+            src_port: 5000, dst_port: 40000,
+            seq: 5001, ack: 9999,
+            flags: TCP_ACK, window: 65535,
+            header_len: 20, payload: &[], options: &[],
+        };
+        let out = dispatch(&mut c, &seg);
+        assert!(out.bad_ack);
+        assert_eq!(out.tx, TxAction::Ack); // challenge ACK
+    }
+
+    #[test]
+    fn established_duplicate_ack_sets_dup_ack() {
+        let mut c = est_conn(1000, 5000, 1024);
+        // ack == snd_una == 1001 ⇒ duplicate ACK.
+        let seg = ParsedSegment {
+            src_port: 5000, dst_port: 40000,
+            seq: 5001, ack: 1001,
+            flags: TCP_ACK, window: 65535,
+            header_len: 20, payload: &[], options: &[],
+        };
+        let out = dispatch(&mut c, &seg);
+        assert!(out.dup_ack);
+    }
+
+    #[test]
+    fn established_zero_window_segment_sets_rx_zero_window() {
+        let mut c = est_conn(1000, 5000, 1024);
+        let seg = ParsedSegment {
+            src_port: 5000, dst_port: 40000,
+            seq: 5001, ack: 1001,
+            flags: TCP_ACK, window: 0,
+            header_len: 20, payload: &[], options: &[],
+        };
+        let out = dispatch(&mut c, &seg);
+        assert!(out.rx_zero_window);
+    }
+
+    #[test]
+    fn established_nonzero_window_does_not_set_rx_zero_window() {
+        let mut c = est_conn(1000, 5000, 1024);
+        let seg = ParsedSegment {
+            src_port: 5000, dst_port: 40000,
+            seq: 5001, ack: 1001,
+            flags: TCP_ACK, window: 1,
+            header_len: 20, payload: &[], options: &[],
+        };
+        let out = dispatch(&mut c, &seg);
+        assert!(!out.rx_zero_window);
+    }
+
+    #[test]
+    fn close_path_out_of_window_sets_bad_seq() {
+        use crate::flow_table::FourTuple;
+        use crate::tcp_conn::TcpConn;
+        let t = FourTuple { local_ip: 0x0a_00_00_02, local_port: 40000,
+                            peer_ip: 0x0a_00_00_01, peer_port: 5000 };
+        let mut c = TcpConn::new_client(t, 1000, 1460, 1024, 2048);
+        c.state = TcpState::FinWait2;
+        c.snd_una = 1001;
+        c.snd_nxt = 1002;
+        c.our_fin_seq = Some(1001);
+        c.irs = 5000;
+        c.rcv_nxt = 5001;
+        c.rcv_wnd = 1024;
+        c.snd_wnd = 1024;
+        // seq well outside window.
+        let seg = ParsedSegment {
+            src_port: 5000, dst_port: 40000,
+            seq: 99999, ack: 1002,
+            flags: TCP_ACK, window: 65535,
+            header_len: 20, payload: b"x", options: &[],
+        };
+        let out = dispatch(&mut c, &seg);
+        assert!(out.bad_seq);
+        assert_eq!(out.tx, TxAction::Ack);
+    }
+
+    #[test]
+    fn established_base_outcome_flags_default_false() {
+        let out = Outcome::base();
+        assert!(!out.bad_seq);
+        assert!(!out.bad_ack);
+        assert!(!out.dup_ack);
+        assert!(!out.urgent_dropped);
+        assert!(!out.rx_zero_window);
     }
 }

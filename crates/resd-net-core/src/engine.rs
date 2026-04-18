@@ -203,6 +203,31 @@ pub struct Engine {
     last_ephemeral_port: Cell<u16>,
 }
 
+/// A4: map an `Outcome` to per-segment `TcpCounters` bumps. Pure slow-path
+/// routing — each branch bumps a different counter, no mutation of conn
+/// state. Extracted from `Engine::tcp_input` so the dispatch hot-path
+/// stays straight-line and the counter wiring is independently testable.
+fn apply_tcp_input_counters(
+    outcome: &crate::tcp_input::Outcome,
+    counters: &crate::counters::TcpCounters,
+) {
+    use crate::counters::{add, inc};
+    if outcome.paws_rejected { inc(&counters.rx_paws_rejected); }
+    if outcome.bad_option { inc(&counters.rx_bad_option); }
+    if outcome.reassembly_queued_bytes > 0 { inc(&counters.rx_reassembly_queued); }
+    if outcome.reassembly_hole_filled > 0 {
+        add(&counters.rx_reassembly_hole_filled, outcome.reassembly_hole_filled as u64);
+    }
+    if outcome.sack_blocks_decoded > 0 {
+        add(&counters.rx_sack_blocks, outcome.sack_blocks_decoded as u64);
+    }
+    if outcome.bad_seq { inc(&counters.rx_bad_seq); }
+    if outcome.bad_ack { inc(&counters.rx_bad_ack); }
+    if outcome.dup_ack { inc(&counters.rx_dup_ack); }
+    if outcome.urgent_dropped { inc(&counters.rx_urgent_dropped); }
+    if outcome.rx_zero_window { inc(&counters.rx_zero_window); }
+}
+
 /// EAL is process-global; only initialize once.
 static EAL_INIT: Mutex<bool> = Mutex::new(false);
 
@@ -543,6 +568,8 @@ impl Engine {
             self.transition_conn(h, TcpState::Closed);
             self.events.borrow_mut().push(InternalEvent::Closed { conn: h, err: 0 });
             crate::counters::inc(&self.counters.tcp.conn_close);
+            // A4 cross-phase backfill: TIME_WAIT deadline expired.
+            crate::counters::inc(&self.counters.tcp.conn_time_wait_reaped);
             self.flow_table.borrow_mut().remove(h);
         }
     }
@@ -690,6 +717,11 @@ impl Engine {
             dispatch(conn, &parsed)
         };
 
+        // A4: map Outcome fields → TcpCounters slow-path bumps. Groups
+        // all per-segment counter wiring in one place so the dispatch
+        // hot-path stays straight-line.
+        apply_tcp_input_counters(&outcome, &self.counters.tcp);
+
         // RFC 9293 §3.10.7.8: restart the 2×MSL timer on any in-window
         // segment received in TIME_WAIT.
         {
@@ -822,6 +854,7 @@ impl Engine {
         let free_space = conn.recv.free_space_total();
         let seq = conn.snd_nxt;
         let ack = conn.rcv_nxt;
+        let last_advertised_wnd = conn.last_advertised_wnd;
         // Snapshot reorder ranges as (seq, end_seq) pairs so the pure
         // helper doesn't need to know about `OooSegment`.
         let reorder_snapshot: Vec<(u32, u32)> = conn
@@ -867,6 +900,21 @@ impl Engine {
             inc(&self.counters.tcp.tx_ack);
             if outcome.zero_window {
                 inc(&self.counters.tcp.tx_zero_window);
+            }
+            // A4 cross-phase backfill: if the previously advertised window
+            // was 0 and this one reopens, bump `tcp.tx_window_update`.
+            // Recorded on TX success so we don't count segments the driver
+            // rejected.
+            if last_advertised_wnd == Some(0) && outcome.window > 0 {
+                inc(&self.counters.tcp.tx_window_update);
+            }
+            // Record what we advertised so the next emit_ack can detect a
+            // 0 → nonzero transition.
+            {
+                let mut ft = self.flow_table.borrow_mut();
+                if let Some(c) = ft.get_mut(handle) {
+                    c.last_advertised_wnd = Some(outcome.window);
+                }
             }
             if outcome.sack_blocks_emitted > 0 {
                 add(
@@ -1047,11 +1095,14 @@ impl Engine {
             self.cfg.recv_buffer_bytes,
             self.cfg.send_buffer_bytes,
         );
-        let handle = self
-            .flow_table
-            .borrow_mut()
-            .insert(conn)
-            .ok_or(Error::TooManyConns)?;
+        let handle = match self.flow_table.borrow_mut().insert(conn) {
+            Some(h) => h,
+            None => {
+                // A4 cross-phase backfill: flow table at `max_connections`.
+                inc(&self.counters.tcp.conn_table_full);
+                return Err(Error::TooManyConns);
+            }
+        };
 
         // Build and transmit SYN with the full Stage-1 option set: MSS
         // (already clamped to MTU-40 above) + Window Scale + SACK-permitted
@@ -1556,5 +1607,98 @@ mod tests {
             out.opts.sack_blocks[0],
             crate::tcp_options::SackBlock { left: 2_000, right: 2_100 }
         );
+    }
+
+    // Task 19: counter wiring via `apply_tcp_input_counters`. The helper
+    // is pure (no Engine, no EAL) so we can exercise every Outcome-flag
+    // → counter mapping via direct assertion. Engine-level counters
+    // (`conn_table_full`, `conn_time_wait_reaped`, `tx_window_update`)
+    // are integration-test reachable once TAP-mode tests land in Task 20+.
+
+    #[test]
+    fn apply_tcp_input_counters_maps_paws_rejected() {
+        let c = crate::counters::TcpCounters::default();
+        let mut o = crate::tcp_input::Outcome::base();
+        o.paws_rejected = true;
+        super::apply_tcp_input_counters(&o, &c);
+        use std::sync::atomic::Ordering;
+        assert_eq!(c.rx_paws_rejected.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn apply_tcp_input_counters_maps_bad_option() {
+        let c = crate::counters::TcpCounters::default();
+        let mut o = crate::tcp_input::Outcome::base();
+        o.bad_option = true;
+        super::apply_tcp_input_counters(&o, &c);
+        use std::sync::atomic::Ordering;
+        assert_eq!(c.rx_bad_option.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn apply_tcp_input_counters_reassembly_queued_increments_once() {
+        let c = crate::counters::TcpCounters::default();
+        let mut o = crate::tcp_input::Outcome::base();
+        o.reassembly_queued_bytes = 42; // any nonzero
+        super::apply_tcp_input_counters(&o, &c);
+        use std::sync::atomic::Ordering;
+        assert_eq!(c.rx_reassembly_queued.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn apply_tcp_input_counters_reassembly_hole_filled_adds_count() {
+        let c = crate::counters::TcpCounters::default();
+        let mut o = crate::tcp_input::Outcome::base();
+        o.reassembly_hole_filled = 3;
+        super::apply_tcp_input_counters(&o, &c);
+        use std::sync::atomic::Ordering;
+        assert_eq!(c.rx_reassembly_hole_filled.load(Ordering::Relaxed), 3);
+    }
+
+    #[test]
+    fn apply_tcp_input_counters_sack_blocks_decoded_adds_count() {
+        let c = crate::counters::TcpCounters::default();
+        let mut o = crate::tcp_input::Outcome::base();
+        o.sack_blocks_decoded = 2;
+        super::apply_tcp_input_counters(&o, &c);
+        use std::sync::atomic::Ordering;
+        assert_eq!(c.rx_sack_blocks.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn apply_tcp_input_counters_backfill_flags_each_bump_once() {
+        let c = crate::counters::TcpCounters::default();
+        let mut o = crate::tcp_input::Outcome::base();
+        o.bad_seq = true;
+        o.bad_ack = true;
+        o.dup_ack = true;
+        o.urgent_dropped = true;
+        o.rx_zero_window = true;
+        super::apply_tcp_input_counters(&o, &c);
+        use std::sync::atomic::Ordering;
+        assert_eq!(c.rx_bad_seq.load(Ordering::Relaxed), 1);
+        assert_eq!(c.rx_bad_ack.load(Ordering::Relaxed), 1);
+        assert_eq!(c.rx_dup_ack.load(Ordering::Relaxed), 1);
+        assert_eq!(c.rx_urgent_dropped.load(Ordering::Relaxed), 1);
+        assert_eq!(c.rx_zero_window.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn apply_tcp_input_counters_base_outcome_no_bumps() {
+        let c = crate::counters::TcpCounters::default();
+        let o = crate::tcp_input::Outcome::base();
+        super::apply_tcp_input_counters(&o, &c);
+        use std::sync::atomic::Ordering;
+        // Every field we touch stays at zero.
+        assert_eq!(c.rx_paws_rejected.load(Ordering::Relaxed), 0);
+        assert_eq!(c.rx_bad_option.load(Ordering::Relaxed), 0);
+        assert_eq!(c.rx_reassembly_queued.load(Ordering::Relaxed), 0);
+        assert_eq!(c.rx_reassembly_hole_filled.load(Ordering::Relaxed), 0);
+        assert_eq!(c.rx_sack_blocks.load(Ordering::Relaxed), 0);
+        assert_eq!(c.rx_bad_seq.load(Ordering::Relaxed), 0);
+        assert_eq!(c.rx_bad_ack.load(Ordering::Relaxed), 0);
+        assert_eq!(c.rx_dup_ack.load(Ordering::Relaxed), 0);
+        assert_eq!(c.rx_urgent_dropped.load(Ordering::Relaxed), 0);
+        assert_eq!(c.rx_zero_window.load(Ordering::Relaxed), 0);
     }
 }

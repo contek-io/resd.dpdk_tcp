@@ -19,6 +19,10 @@ pub const TCP_SYN: u8 = 0x02;
 pub const TCP_RST: u8 = 0x04;
 pub const TCP_PSH: u8 = 0x08;
 pub const TCP_ACK: u8 = 0x10;
+/// URG (urgent pointer) flag. Stage 1 does not support URG; inbound URG
+/// segments are dropped and counted via `tcp.rx_urgent_dropped` (A4
+/// cross-phase backfill — spec §9.1.1 / plan task 19).
+pub const TCP_URG: u8 = 0x20;
 
 pub struct SegmentTx<'a> {
     pub src_mac: [u8; 6],

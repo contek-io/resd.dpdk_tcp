@@ -151,6 +151,12 @@ pub struct TcpConn {
     /// TIME_WAIT. `None` in all other states. Engine's tick reaps the
     /// connection once `clock::now_ns() >= time_wait_deadline_ns`.
     pub time_wait_deadline_ns: Option<u64>,
+
+    /// A4: window value (raw 16-bit field, post-WS-scale) last advertised
+    /// in an outbound ACK. Used to detect the `0 → nonzero` transition
+    /// that bumps `tcp.tx_window_update` (A4 cross-phase backfill). `None`
+    /// means no ACK has been emitted yet on this conn.
+    pub last_advertised_wnd: Option<u16>,
 }
 
 impl TcpConn {
@@ -191,6 +197,7 @@ impl TcpConn {
             recv: RecvQueue::new(recv_buf_bytes),
             our_fin_seq: None,
             time_wait_deadline_ns: None,
+            last_advertised_wnd: None,
         }
     }
 
