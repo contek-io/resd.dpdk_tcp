@@ -269,6 +269,9 @@ fn apply_tcp_input_counters(
     if outcome.sack_blocks_decoded > 0 {
         add(&counters.rx_sack_blocks, outcome.sack_blocks_decoded as u64);
     }
+    if outcome.rx_dsack_count > 0 {
+        add(&counters.rx_dsack, outcome.rx_dsack_count as u64);
+    }
     if outcome.bad_seq {
         inc(&counters.rx_bad_seq);
     }
@@ -2767,6 +2770,17 @@ mod tests {
         assert_eq!(c.rx_sack_blocks.load(Ordering::Relaxed), 2);
     }
 
+    // A5 Task 16: DSACK counter bumped by the count in Outcome.
+    #[test]
+    fn apply_tcp_input_counters_rx_dsack_adds_count() {
+        let c = crate::counters::TcpCounters::default();
+        let mut o = crate::tcp_input::Outcome::base();
+        o.rx_dsack_count = 2;
+        super::apply_tcp_input_counters(&o, &c);
+        use std::sync::atomic::Ordering;
+        assert_eq!(c.rx_dsack.load(Ordering::Relaxed), 2);
+    }
+
     #[test]
     fn apply_tcp_input_counters_backfill_flags_each_bump_once() {
         let c = crate::counters::TcpCounters::default();
@@ -2802,5 +2816,6 @@ mod tests {
         assert_eq!(c.rx_dup_ack.load(Ordering::Relaxed), 0);
         assert_eq!(c.rx_urgent_dropped.load(Ordering::Relaxed), 0);
         assert_eq!(c.rx_zero_window.load(Ordering::Relaxed), 0);
+        assert_eq!(c.rx_dsack.load(Ordering::Relaxed), 0);
     }
 }

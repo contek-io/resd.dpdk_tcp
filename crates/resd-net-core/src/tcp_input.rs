@@ -180,6 +180,10 @@ pub struct Outcome {
     /// acceptable; a Stage-2 optimization could use an inline
     /// fixed-size array).
     pub rack_lost_indexes: Vec<u16>,
+    /// A5 Task 16: RFC 2883 DSACK blocks detected this ACK. Engine
+    /// bumps `tcp.rx_dsack` by this count. Visibility only — A5 does
+    /// not adapt reo_wnd or scoreboard prune based on DSACK.
+    pub rx_dsack_count: u32,
     pub connected: bool,
     pub closed: bool,
 }
@@ -205,6 +209,7 @@ impl Outcome {
             snd_una_advanced_to: None,
             rtt_sample_taken: false,
             rack_lost_indexes: Vec::new(),
+            rx_dsack_count: 0,
             connected: false,
             closed: false,
         }
@@ -343,6 +348,28 @@ fn handle_syn_sent(conn: &mut TcpConn, seg: &ParsedSegment) -> Outcome {
     }
 }
 
+/// RFC 2883 §4 DSACK detection (receive side). Returns true iff `block`
+/// is a duplicate-SACK report, meaning either:
+///   (a) `block.right <= snd_una` — block covers already-cumulatively-ACKed
+///       data, OR
+///   (b) `block` is fully enclosed by some entry already in `scoreboard` —
+///       the peer is re-reporting a range we've already recorded as SACKed.
+/// A5 uses this for visibility only (`tcp.rx_dsack` + `rack.dsack_seen`);
+/// Stage 2 may add reo_wnd adaptation (RFC 8985 §7).
+pub(crate) fn is_dsack(
+    block: &crate::tcp_options::SackBlock,
+    snd_una: u32,
+    scoreboard: &crate::tcp_sack::SackScoreboard,
+) -> bool {
+    if crate::tcp_seq::seq_le(block.right, snd_una) {
+        return true;
+    }
+    scoreboard.blocks().iter().any(|existing| {
+        crate::tcp_seq::seq_le(existing.left, block.left)
+            && crate::tcp_seq::seq_le(block.right, existing.right)
+    })
+}
+
 fn handle_established(conn: &mut TcpConn, seg: &ParsedSegment) -> Outcome {
     use crate::tcp_seq::{in_window, seq_le, seq_lt};
 
@@ -458,9 +485,23 @@ fn handle_established(conn: &mut TcpConn, seg: &ParsedSegment) -> Outcome {
     // A5 Task 15: also mark matching snd_retrans entries sacked so the
     // RACK pass below sees them (RFC 8985 §6.1 treats SACKed entries as
     // delivered for RACK.xmit_ts update purposes).
+    // A5 Task 16: classify each SACK block as DSACK (RFC 2883 §4) before
+    // insert. DSACK blocks cover already-acked data — skip the scoreboard
+    // insert/mark_sacked (would waste the 4-slot scoreboard budget and
+    // mark_sacked on pruned data is a no-op anyway). Count goes to
+    // `tcp.rx_dsack` via Outcome; `rack.dsack_seen` latches for Stage 2.
+    // Ordering note: the DSACK check must run BEFORE `insert` for the
+    // same block, otherwise condition (b) "fully covered by existing"
+    // would falsely match the block we just inserted.
     let mut sack_blocks_decoded = 0u32;
+    let mut rx_dsack_count = 0u32;
     if conn.sack_enabled && parsed_opts.sack_block_count > 0 {
         for block in &parsed_opts.sack_blocks[..parsed_opts.sack_block_count as usize] {
+            if is_dsack(block, conn.snd_una, &conn.sack_scoreboard) {
+                rx_dsack_count += 1;
+                conn.rack.dsack_seen = true;
+                continue;
+            }
             conn.sack_scoreboard.insert(*block);
             conn.snd_retrans.mark_sacked(*block);
         }
@@ -682,6 +723,7 @@ fn handle_established(conn: &mut TcpConn, seg: &ParsedSegment) -> Outcome {
         snd_una_advanced_to,
         rtt_sample_taken,
         rack_lost_indexes,
+        rx_dsack_count,
         ..Outcome::base()
     }
 }
@@ -1681,6 +1723,219 @@ mod tests {
         assert_eq!(c.snd_una, 1015);
         assert_eq!(c.sack_scoreboard.len(), 1);
         assert_eq!(c.sack_scoreboard.blocks()[0].left, 1020);
+    }
+
+    // A5 Task 16: RFC 2883 DSACK detection. Visibility only — no behavior
+    // change; the block is skipped from the scoreboard and counted.
+
+    #[test]
+    fn is_dsack_below_snd_una() {
+        // Condition (a): block.right <= snd_una — the peer is reporting a
+        // range the cumulative ACK has already covered.
+        let scoreboard = crate::tcp_sack::SackScoreboard::new();
+        assert!(super::is_dsack(
+            &crate::tcp_options::SackBlock {
+                left: 150,
+                right: 180
+            },
+            200,
+            &scoreboard
+        ));
+        // Equality at the right edge (RFC 2883 "S2 ≤ cumulative ACK"):
+        // block.right == snd_una still qualifies.
+        assert!(super::is_dsack(
+            &crate::tcp_options::SackBlock {
+                left: 150,
+                right: 200
+            },
+            200,
+            &scoreboard
+        ));
+    }
+
+    #[test]
+    fn is_dsack_covered_by_existing_scoreboard_block() {
+        // Condition (b): block is fully enclosed by an existing scoreboard
+        // entry — the peer is re-reporting an already-SACKed range.
+        let mut scoreboard = crate::tcp_sack::SackScoreboard::new();
+        scoreboard.insert(crate::tcp_options::SackBlock {
+            left: 100,
+            right: 200,
+        });
+        assert!(super::is_dsack(
+            &crate::tcp_options::SackBlock {
+                left: 120,
+                right: 180
+            },
+            50, // snd_una far below; not the deciding condition
+            &scoreboard
+        ));
+        // Exact equal-bounds also "fully covered".
+        assert!(super::is_dsack(
+            &crate::tcp_options::SackBlock {
+                left: 100,
+                right: 200
+            },
+            50,
+            &scoreboard
+        ));
+    }
+
+    #[test]
+    fn is_dsack_rejects_block_reporting_new_data() {
+        // Block above snd_una and not covered by any existing scoreboard
+        // block → not DSACK, legitimate new SACK.
+        let scoreboard = crate::tcp_sack::SackScoreboard::new();
+        assert!(!super::is_dsack(
+            &crate::tcp_options::SackBlock {
+                left: 500,
+                right: 600
+            },
+            300,
+            &scoreboard
+        ));
+    }
+
+    #[test]
+    fn is_dsack_rejects_partial_overlap_with_existing() {
+        // Block overlaps but is NOT fully covered by the existing entry —
+        // the peer is reporting a SACK that extends what we knew. Not DSACK.
+        let mut scoreboard = crate::tcp_sack::SackScoreboard::new();
+        scoreboard.insert(crate::tcp_options::SackBlock {
+            left: 100,
+            right: 200,
+        });
+        assert!(!super::is_dsack(
+            &crate::tcp_options::SackBlock {
+                left: 150,
+                right: 250
+            },
+            50,
+            &scoreboard
+        ));
+    }
+
+    #[test]
+    fn established_dsack_below_snd_una_counted_and_skipped() {
+        use crate::tcp_options::{SackBlock, TcpOpts};
+        // est_conn: snd_una = 1001. SACK decode runs BEFORE the ACK
+        // processing advances snd_una, so the DSACK check sees the
+        // pre-advance snd_una (1001). Block (995, 1000) has right <=
+        // snd_una → DSACK (a).
+        let mut c = est_conn(1000, 5000, 1024);
+        c.sack_enabled = true;
+        c.snd.push(&[0u8; 30]);
+        c.snd_nxt = c.snd_una.wrapping_add(30);
+        let mut peer_opts = TcpOpts::default();
+        peer_opts.push_sack_block(SackBlock {
+            left: 995,
+            right: 1000,
+        });
+        let mut buf = [0u8; 40];
+        let n = peer_opts.encode(&mut buf).unwrap();
+
+        let seg = ParsedSegment {
+            src_port: 5000,
+            dst_port: 40000,
+            seq: 5001,
+            ack: 1001,
+            flags: TCP_ACK,
+            window: 65535,
+            header_len: 20 + n,
+            payload: &[],
+            options: &buf[..n],
+        };
+        let out = dispatch(&mut c, &seg);
+        assert_eq!(out.rx_dsack_count, 1);
+        assert_eq!(out.sack_blocks_decoded, 1);
+        // DSACK block was skipped — scoreboard remains empty, no
+        // snd_retrans entry got marked sacked.
+        assert_eq!(c.sack_scoreboard.len(), 0);
+        assert!(c.rack.dsack_seen);
+    }
+
+    #[test]
+    fn established_dsack_covered_by_existing_counted_and_skipped() {
+        use crate::tcp_options::{SackBlock, TcpOpts};
+        let mut c = est_conn(1000, 5000, 1024);
+        c.sack_enabled = true;
+        c.snd.push(&[0u8; 30]);
+        c.snd_nxt = c.snd_una.wrapping_add(30);
+        // Pre-seed the scoreboard with (1010, 1020); a re-report of
+        // (1012, 1018) is DSACK (b): fully covered by an existing block.
+        c.sack_scoreboard.insert(SackBlock {
+            left: 1010,
+            right: 1020,
+        });
+        let mut peer_opts = TcpOpts::default();
+        peer_opts.push_sack_block(SackBlock {
+            left: 1012,
+            right: 1018,
+        });
+        let mut buf = [0u8; 40];
+        let n = peer_opts.encode(&mut buf).unwrap();
+
+        let seg = ParsedSegment {
+            src_port: 5000,
+            dst_port: 40000,
+            seq: 5001,
+            ack: 1001,
+            flags: TCP_ACK,
+            window: 65535,
+            header_len: 20 + n,
+            payload: &[],
+            options: &buf[..n],
+        };
+        let out = dispatch(&mut c, &seg);
+        assert_eq!(out.rx_dsack_count, 1);
+        assert!(c.rack.dsack_seen);
+        // Scoreboard unchanged — the DSACK block was skipped, original
+        // (1010, 1020) remains.
+        assert_eq!(c.sack_scoreboard.len(), 1);
+        assert_eq!(c.sack_scoreboard.blocks()[0].left, 1010);
+        assert_eq!(c.sack_scoreboard.blocks()[0].right, 1020);
+    }
+
+    #[test]
+    fn established_mixed_dsack_plus_live_sack_handled_separately() {
+        use crate::tcp_options::{SackBlock, TcpOpts};
+        let mut c = est_conn(1000, 5000, 1024);
+        c.sack_enabled = true;
+        c.snd.push(&[0u8; 40]);
+        c.snd_nxt = c.snd_una.wrapping_add(40);
+        // SACK decode runs pre-ACK-advance, so snd_una here is 1001.
+        // First block (990, 1000) has right <= 1001 → DSACK. Second
+        // block (1015, 1020) is live SACK → inserted into the scoreboard.
+        let mut peer_opts = TcpOpts::default();
+        peer_opts.push_sack_block(SackBlock {
+            left: 990,
+            right: 1000,
+        });
+        peer_opts.push_sack_block(SackBlock {
+            left: 1015,
+            right: 1020,
+        });
+        let mut buf = [0u8; 40];
+        let n = peer_opts.encode(&mut buf).unwrap();
+
+        let seg = ParsedSegment {
+            src_port: 5000,
+            dst_port: 40000,
+            seq: 5001,
+            ack: 1005,
+            flags: TCP_ACK,
+            window: 65535,
+            header_len: 20 + n,
+            payload: &[],
+            options: &buf[..n],
+        };
+        let out = dispatch(&mut c, &seg);
+        assert_eq!(out.rx_dsack_count, 1);
+        assert_eq!(out.sack_blocks_decoded, 2);
+        assert!(c.rack.dsack_seen);
+        // Only the live SACK block entered the scoreboard.
+        assert_eq!(c.sack_scoreboard.len(), 1);
+        assert_eq!(c.sack_scoreboard.blocks()[0].left, 1015);
     }
 
     #[test]
