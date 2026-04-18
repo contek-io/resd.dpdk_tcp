@@ -341,8 +341,74 @@ fn handle_established(conn: &mut TcpConn, seg: &ParsedSegment) -> Outcome {
     Outcome { tx, new_state, delivered, connected: false, closed: false }
 }
 
-fn handle_close_path(_conn: &mut TcpConn, _seg: &ParsedSegment) -> Outcome {
-    Outcome::none()
+fn handle_close_path(conn: &mut TcpConn, seg: &ParsedSegment) -> Outcome {
+    use crate::tcp_seq::{in_window, seq_le, seq_lt};
+
+    // RST in any close state → CLOSED.
+    if (seg.flags & TCP_RST) != 0 {
+        return Outcome {
+            tx: TxAction::None,
+            new_state: Some(TcpState::Closed),
+            delivered: 0,
+            connected: false,
+            closed: true,
+        };
+    }
+
+    // TIME_WAIT: replay-ACK anything the peer sends; reaper will move
+    // us to CLOSED via the engine tick (Task 19).
+    if conn.state == TcpState::TimeWait {
+        return Outcome { tx: TxAction::Ack, new_state: None, delivered: 0, connected: false, closed: false };
+    }
+
+    // Segment must have ACK in these states.
+    if (seg.flags & TCP_ACK) == 0 {
+        return Outcome::none();
+    }
+
+    // Window check — same rule as ESTABLISHED.
+    let seg_len = seg.payload.len() as u32 + ((seg.flags & TCP_FIN) != 0) as u32;
+    let in_win = if seg_len == 0 {
+        seg.seq == conn.rcv_nxt
+    } else {
+        let last = seg.seq.wrapping_add(seg_len).wrapping_sub(1);
+        in_window(conn.rcv_nxt, seg.seq, conn.rcv_wnd)
+            && in_window(conn.rcv_nxt, last, conn.rcv_wnd)
+    };
+    if !in_win {
+        return Outcome { tx: TxAction::Ack, new_state: None, delivered: 0, connected: false, closed: false };
+    }
+
+    // Advance snd_una if ack covers more of our stream.
+    let fin_acked = conn.fin_has_been_acked(seg.ack);
+    if seq_lt(conn.snd_una, seg.ack) && seq_le(seg.ack, conn.snd_nxt) {
+        conn.snd_una = seg.ack;
+    }
+
+    let peer_has_fin = (seg.flags & TCP_FIN) != 0
+        && seg.seq.wrapping_add(seg.payload.len() as u32) == conn.rcv_nxt;
+    if peer_has_fin {
+        conn.rcv_nxt = conn.rcv_nxt.wrapping_add(1);
+    }
+
+    // State transitions keyed by (current_state, fin_acked, peer_has_fin).
+    let (new_state, tx) = match (conn.state, fin_acked, peer_has_fin) {
+        (TcpState::FinWait1, true, true) => (Some(TcpState::TimeWait), TxAction::Ack),
+        (TcpState::FinWait1, true, false) => (Some(TcpState::FinWait2), TxAction::None),
+        (TcpState::FinWait1, false, true) => (Some(TcpState::Closing), TxAction::Ack),
+        (TcpState::FinWait1, false, false) => (None, TxAction::None),
+        (TcpState::FinWait2, _, true) => (Some(TcpState::TimeWait), TxAction::Ack),
+        (TcpState::FinWait2, _, false) => (None, TxAction::None),
+        (TcpState::Closing, true, _) => (Some(TcpState::TimeWait), TxAction::None),
+        (TcpState::Closing, false, _) => (None, TxAction::None),
+        (TcpState::LastAck, true, _) => (Some(TcpState::Closed), TxAction::None),
+        (TcpState::LastAck, false, _) => (None, TxAction::None),
+        (TcpState::CloseWait, _, _) => (None, TxAction::None),
+        _ => (None, TxAction::None),
+    };
+
+    let closed = new_state == Some(TcpState::Closed);
+    Outcome { tx, new_state, delivered: 0, connected: false, closed }
 }
 
 /// Build the 4-tuple from a parsed segment's ports + the IPv4 header's
@@ -626,5 +692,167 @@ mod tests {
         let out = dispatch(&mut c, &seg);
         assert_eq!(out.new_state, Some(TcpState::Closed));
         assert!(out.closed);
+    }
+
+    #[test]
+    fn fin_wait1_ack_of_our_fin_transitions_to_fin_wait2() {
+        use crate::flow_table::FourTuple;
+        use crate::tcp_conn::TcpConn;
+        let t = FourTuple { local_ip: 0x0a_00_00_02, local_port: 40000,
+                            peer_ip: 0x0a_00_00_01, peer_port: 5000 };
+        let mut c = TcpConn::new_client(t, 1000, 1460, 1024, 2048);
+        c.state = TcpState::FinWait1;
+        c.snd_una = 1001;
+        c.snd_nxt = 1002; // after our FIN
+        c.our_fin_seq = Some(1001);
+        c.irs = 5000;
+        c.rcv_nxt = 5001;
+        c.rcv_wnd = 1024;
+        c.snd_wnd = 1024;
+        let seg = ParsedSegment {
+            src_port: 5000, dst_port: 40000,
+            seq: 5001, ack: 1002, // acks our FIN
+            flags: TCP_ACK,
+            window: 65535,
+            header_len: 20,
+            payload: &[], options: &[],
+        };
+        let out = dispatch(&mut c, &seg);
+        assert_eq!(out.new_state, Some(TcpState::FinWait2));
+    }
+
+    #[test]
+    fn fin_wait2_peer_fin_transitions_to_time_wait() {
+        use crate::flow_table::FourTuple;
+        use crate::tcp_conn::TcpConn;
+        let t = FourTuple { local_ip: 0x0a_00_00_02, local_port: 40000,
+                            peer_ip: 0x0a_00_00_01, peer_port: 5000 };
+        let mut c = TcpConn::new_client(t, 1000, 1460, 1024, 2048);
+        c.state = TcpState::FinWait2;
+        c.snd_una = 1002;
+        c.snd_nxt = 1002;
+        c.our_fin_seq = Some(1001);
+        c.irs = 5000;
+        c.rcv_nxt = 5001;
+        c.rcv_wnd = 1024;
+        c.snd_wnd = 1024;
+        let seg = ParsedSegment {
+            src_port: 5000, dst_port: 40000,
+            seq: 5001, ack: 1002,
+            flags: TCP_ACK | TCP_FIN,
+            window: 65535,
+            header_len: 20,
+            payload: &[], options: &[],
+        };
+        let out = dispatch(&mut c, &seg);
+        assert_eq!(out.new_state, Some(TcpState::TimeWait));
+        assert_eq!(out.tx, TxAction::Ack);
+        assert_eq!(c.rcv_nxt, 5002);
+    }
+
+    #[test]
+    fn fin_wait1_peer_fin_without_ack_of_our_fin_transitions_to_closing() {
+        use crate::flow_table::FourTuple;
+        use crate::tcp_conn::TcpConn;
+        let t = FourTuple { local_ip: 0x0a_00_00_02, local_port: 40000,
+                            peer_ip: 0x0a_00_00_01, peer_port: 5000 };
+        let mut c = TcpConn::new_client(t, 1000, 1460, 1024, 2048);
+        c.state = TcpState::FinWait1;
+        c.snd_una = 1001;
+        c.snd_nxt = 1002;
+        c.our_fin_seq = Some(1001);
+        c.irs = 5000;
+        c.rcv_nxt = 5001;
+        c.rcv_wnd = 1024;
+        c.snd_wnd = 1024;
+        let seg = ParsedSegment {
+            src_port: 5000, dst_port: 40000,
+            seq: 5001, ack: 1001, // does NOT ack our FIN
+            flags: TCP_ACK | TCP_FIN,
+            window: 65535,
+            header_len: 20,
+            payload: &[], options: &[],
+        };
+        let out = dispatch(&mut c, &seg);
+        assert_eq!(out.new_state, Some(TcpState::Closing));
+    }
+
+    #[test]
+    fn closing_ack_of_our_fin_transitions_to_time_wait() {
+        use crate::flow_table::FourTuple;
+        use crate::tcp_conn::TcpConn;
+        let t = FourTuple { local_ip: 0x0a_00_00_02, local_port: 40000,
+                            peer_ip: 0x0a_00_00_01, peer_port: 5000 };
+        let mut c = TcpConn::new_client(t, 1000, 1460, 1024, 2048);
+        c.state = TcpState::Closing;
+        c.snd_una = 1001;
+        c.snd_nxt = 1002;
+        c.our_fin_seq = Some(1001);
+        c.irs = 5000;
+        c.rcv_nxt = 5002; // peer's FIN already consumed
+        c.rcv_wnd = 1024;
+        c.snd_wnd = 1024;
+        let seg = ParsedSegment {
+            src_port: 5000, dst_port: 40000,
+            seq: 5002, ack: 1002,
+            flags: TCP_ACK,
+            window: 0,
+            header_len: 20,
+            payload: &[], options: &[],
+        };
+        let out = dispatch(&mut c, &seg);
+        assert_eq!(out.new_state, Some(TcpState::TimeWait));
+    }
+
+    #[test]
+    fn last_ack_ack_of_our_fin_closes_connection() {
+        use crate::flow_table::FourTuple;
+        use crate::tcp_conn::TcpConn;
+        let t = FourTuple { local_ip: 0x0a_00_00_02, local_port: 40000,
+                            peer_ip: 0x0a_00_00_01, peer_port: 5000 };
+        let mut c = TcpConn::new_client(t, 1000, 1460, 1024, 2048);
+        c.state = TcpState::LastAck;
+        c.snd_una = 1001;
+        c.snd_nxt = 1002;
+        c.our_fin_seq = Some(1001);
+        c.irs = 5000;
+        c.rcv_nxt = 5002;
+        c.rcv_wnd = 1024;
+        c.snd_wnd = 1024;
+        let seg = ParsedSegment {
+            src_port: 5000, dst_port: 40000,
+            seq: 5002, ack: 1002,
+            flags: TCP_ACK,
+            window: 0,
+            header_len: 20,
+            payload: &[], options: &[],
+        };
+        let out = dispatch(&mut c, &seg);
+        assert_eq!(out.new_state, Some(TcpState::Closed));
+        assert!(out.closed);
+    }
+
+    #[test]
+    fn time_wait_replays_ack_on_any_segment() {
+        use crate::flow_table::FourTuple;
+        use crate::tcp_conn::TcpConn;
+        let t = FourTuple { local_ip: 0x0a_00_00_02, local_port: 40000,
+                            peer_ip: 0x0a_00_00_01, peer_port: 5000 };
+        let mut c = TcpConn::new_client(t, 1000, 1460, 1024, 2048);
+        c.state = TcpState::TimeWait;
+        c.our_fin_seq = Some(1001);
+        c.rcv_nxt = 5002;
+        c.rcv_wnd = 1024;
+        let seg = ParsedSegment {
+            src_port: 5000, dst_port: 40000,
+            seq: 5001, ack: 1002,
+            flags: TCP_ACK | TCP_FIN,
+            window: 0,
+            header_len: 20,
+            payload: &[], options: &[],
+        };
+        let out = dispatch(&mut c, &seg);
+        assert_eq!(out.tx, TxAction::Ack);
+        assert_eq!(out.new_state, None); // stay in TIME_WAIT until reaper
     }
 }
