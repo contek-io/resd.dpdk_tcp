@@ -129,10 +129,6 @@ pub struct Outcome {
     pub new_state: Option<TcpState>,
     pub delivered: u32,
     pub buf_full_drop: u32,
-    /// Legacy A3 counter path. A4 always leaves this at 0 (OOO payload
-    /// now goes through `reassembly_queued_bytes`); kept in the struct
-    /// until an A5+ task drops it from all call sites.
-    pub ooo_drop: u32,
     /// A4: bytes newly buffered into `recv.reorder` on this segment.
     /// Engine bumps `tcp.rx_reassembly_queued` once when > 0.
     pub reassembly_queued_bytes: u32,
@@ -205,7 +201,6 @@ impl Outcome {
             new_state: None,
             delivered: 0,
             buf_full_drop: 0,
-            ooo_drop: 0,
             reassembly_queued_bytes: 0,
             reassembly_hole_filled: 0,
             paws_rejected: false,
@@ -1272,7 +1267,6 @@ mod tests {
         let out = dispatch(&mut c, &seg);
         assert_eq!(out.tx, TxAction::Ack);
         assert_eq!(out.delivered, 0);
-        assert_eq!(out.ooo_drop, 0); // A4: legacy, always zero
         assert_eq!(out.reassembly_queued_bytes, 3);
         assert_eq!(c.rcv_nxt, 5001);
         assert_eq!(c.recv.reorder.len(), 1);
@@ -1337,7 +1331,6 @@ mod tests {
         };
         let out = dispatch(&mut c, &seg);
         assert_eq!(out.delivered, 3);
-        assert_eq!(out.ooo_drop, 0);
         assert_eq!(out.buf_full_drop, 0);
     }
 
@@ -1364,7 +1357,6 @@ mod tests {
         // 1024 accepted, 976 dropped — overflow is `buf_full_drop`, not OOO.
         assert_eq!(out.delivered, 1024);
         assert_eq!(out.buf_full_drop, 2000 - 1024);
-        assert_eq!(out.ooo_drop, 0);
     }
 
     #[test]
