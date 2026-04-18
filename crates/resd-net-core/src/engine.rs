@@ -425,6 +425,7 @@ impl Engine {
         for h in candidates {
             self.transition_conn(h, TcpState::Closed);
             self.events.borrow_mut().push(InternalEvent::Closed { conn: h, err: 0 });
+            crate::counters::inc(&self.counters.tcp.conn_close);
             self.flow_table.borrow_mut().remove(h);
         }
     }
