@@ -2,6 +2,7 @@
 //! The public `extern "C"` surface lives in the `resd-net` crate.
 
 pub mod tcp_seq;
+pub mod tcp_state;
 pub mod arp;
 pub mod clock;
 pub mod counters;
