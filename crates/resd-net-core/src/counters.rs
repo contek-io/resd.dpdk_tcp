@@ -107,10 +107,19 @@ pub struct TcpCounters {
     pub conn_table_full: AtomicU64,
     /// TIME_WAIT deadline expired, connection reclaimed.
     pub conn_time_wait_reaped: AtomicU64,
+    /// HOT-PATH, feature-gated by `obs-byte-counters` (default OFF).
+    /// Per-burst-batched — see spec §9.1.1. Increment site lives in
+    /// engine.rs, gated by `#[cfg(feature = "obs-byte-counters")]`.
+    /// Answers: "how many TCP payload bytes did this engine move?"
+    /// Irreducible to eth.tx_bytes (which includes L2/L3 overhead).
+    pub tx_payload_bytes: AtomicU64,
+    /// HOT-PATH, feature-gated by `obs-byte-counters` (default OFF).
+    /// Same rationale as `tx_payload_bytes`, applied to RX.
+    pub rx_payload_bytes: AtomicU64,
     /// 11×11 state transition matrix, indexed [from][to] where from/to are
     /// `TcpState as u8`. Per spec §9.1. Unused cells stay at zero.
     pub state_trans: [[AtomicU64; 11]; 11],
-    _pad: [u64; 3],
+    _pad: [u64; 1],
 }
 
 #[repr(C, align(64))]
@@ -119,7 +128,13 @@ pub struct PollCounters {
     pub iters_with_rx: AtomicU64,
     pub iters_with_tx: AtomicU64,
     pub iters_idle: AtomicU64,
-    _pad: [u64; 12],
+    /// HOT-PATH, feature-gated by `obs-poll-saturation` (default ON).
+    /// Bumped on every poll iteration where `rx_burst` returned
+    /// `max_burst` — signals "we may be falling behind the NIC". No
+    /// cheap alternative; batching pattern is a single conditional
+    /// `fetch_add` per poll.
+    pub iters_with_rx_burst_max: AtomicU64,
+    _pad: [u64; 11],
 }
 
 #[repr(C)]
@@ -336,6 +351,14 @@ mod tests {
         assert_eq!(c.tcp.tx_retrans.load(Ordering::Relaxed), 0);
         assert_eq!(c.tcp.tx_rto.load(Ordering::Relaxed), 0);
         assert_eq!(c.tcp.tx_tlp.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn a4_hotpath_fields_declared_and_zero() {
+        let c = Counters::new();
+        assert_eq!(c.tcp.tx_payload_bytes.load(Ordering::Relaxed), 0);
+        assert_eq!(c.tcp.rx_payload_bytes.load(Ordering::Relaxed), 0);
+        assert_eq!(c.poll.iters_with_rx_burst_max.load(Ordering::Relaxed), 0);
     }
 
     #[test]

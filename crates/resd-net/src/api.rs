@@ -222,8 +222,12 @@ pub struct resd_net_tcp_counters_t {
     pub tx_window_update: u64,
     pub conn_table_full: u64,
     pub conn_time_wait_reaped: u64,
+    /// HOT-PATH, feature-gated by `obs-byte-counters` (default OFF).
+    /// Per-burst-batched TCP payload byte counters. See core counters.rs.
+    pub tx_payload_bytes: u64,
+    pub rx_payload_bytes: u64,
     pub state_trans: [[u64; 11]; 11],
-    pub _pad: [u64; 3],
+    pub _pad: [u64; 1],
 }
 #[repr(C, align(64))]
 pub struct resd_net_poll_counters_t {
@@ -231,7 +235,10 @@ pub struct resd_net_poll_counters_t {
     pub iters_with_rx: u64,
     pub iters_with_tx: u64,
     pub iters_idle: u64,
-    pub _pad: [u64; 12],
+    /// HOT-PATH, feature-gated by `obs-poll-saturation` (default ON).
+    /// See core counters.rs for the full field doc.
+    pub iters_with_rx_burst_max: u64,
+    pub _pad: [u64; 11],
 }
 #[repr(C)]
 pub struct resd_net_counters_t {

@@ -212,8 +212,14 @@ struct RESD_NET_ALIGNED(64) resd_net_tcp_counters_t {
   uint64_t tx_window_update;
   uint64_t conn_table_full;
   uint64_t conn_time_wait_reaped;
+  /**
+   * HOT-PATH, feature-gated by `obs-byte-counters` (default OFF).
+   * Per-burst-batched TCP payload byte counters. See core counters.rs.
+   */
+  uint64_t tx_payload_bytes;
+  uint64_t rx_payload_bytes;
   uint64_t state_trans[11][11];
-  uint64_t _pad[3];
+  uint64_t _pad[1];
 };
 
 struct RESD_NET_ALIGNED(64) resd_net_poll_counters_t {
@@ -221,7 +227,12 @@ struct RESD_NET_ALIGNED(64) resd_net_poll_counters_t {
   uint64_t iters_with_rx;
   uint64_t iters_with_tx;
   uint64_t iters_idle;
-  uint64_t _pad[12];
+  /**
+   * HOT-PATH, feature-gated by `obs-poll-saturation` (default ON).
+   * See core counters.rs for the full field doc.
+   */
+  uint64_t iters_with_rx_burst_max;
+  uint64_t _pad[11];
 };
 
 struct resd_net_counters_t {
