@@ -797,7 +797,7 @@ impl Engine {
     /// returns a negative errno (Err(Error::SendBufferFull) mapped to
     /// `-ENOMEM` at the public-API layer).
     pub fn send_bytes(&self, handle: ConnHandle, bytes: &[u8]) -> Result<u32, Error> {
-        use crate::counters::{add, inc};
+        use crate::counters::inc;
         use crate::tcp_output::{build_segment, SegmentTx, TCP_ACK, TCP_PSH};
 
         let (tuple, seq_start, snd_una, snd_wnd, peer_mss, state, rcv_nxt, rcv_wnd)
@@ -854,7 +854,6 @@ impl Engine {
                 break;
             }
             inc(&self.counters.tcp.tx_data);
-            add(&self.counters.eth.rx_bytes, 0); // no-op: kept for parity with A2 pattern
             offset += take;
             accepted += take as u32;
             cur_seq = cur_seq.wrapping_add(take as u32);
@@ -878,6 +877,59 @@ impl Engine {
             inc(&self.counters.tcp.send_buf_full);
         }
         Ok(accepted)
+    }
+
+    pub fn close_conn(&self, handle: ConnHandle) -> Result<(), Error> {
+        use crate::counters::inc;
+        use crate::tcp_output::{build_segment, SegmentTx, TCP_ACK, TCP_FIN};
+
+        let (tuple, seq, rcv_nxt, state, rcv_wnd) = {
+            let ft = self.flow_table.borrow();
+            let Some(c) = ft.get(handle) else {
+                return Err(Error::InvalidConnHandle(handle as u64));
+            };
+            (c.four_tuple(), c.snd_nxt, c.rcv_nxt, c.state, c.rcv_wnd)
+        };
+
+        // Only ESTABLISHED and CLOSE_WAIT may initiate FIN. Others are
+        // already closing/closed; caller gets a successful no-op.
+        let to_state = match state {
+            TcpState::Established => TcpState::FinWait1,
+            TcpState::CloseWait => TcpState::LastAck,
+            _ => return Ok(()),
+        };
+
+        let seg = SegmentTx {
+            src_mac: self.our_mac,
+            dst_mac: self.cfg.gateway_mac,
+            src_ip: tuple.local_ip, dst_ip: tuple.peer_ip,
+            src_port: tuple.local_port, dst_port: tuple.peer_port,
+            seq,
+            ack: rcv_nxt,
+            flags: TCP_ACK | TCP_FIN,
+            window: rcv_wnd.min(u16::MAX as u32) as u16,
+            mss_option: None,
+            payload: &[],
+        };
+        let mut buf = [0u8; 64];
+        let Some(n) = build_segment(&seg, &mut buf) else {
+            return Err(Error::PeerUnreachable(tuple.peer_ip));
+        };
+        if !self.tx_frame(&buf[..n]) {
+            return Err(Error::PeerUnreachable(tuple.peer_ip));
+        }
+        inc(&self.counters.tcp.tx_fin);
+
+        // Record our FIN seq and advance snd_nxt (FIN consumes one seq).
+        {
+            let mut ft = self.flow_table.borrow_mut();
+            if let Some(c) = ft.get_mut(handle) {
+                c.our_fin_seq = Some(seq);
+                c.snd_nxt = seq.wrapping_add(1);
+            }
+        }
+        self.transition_conn(handle, to_state);
+        Ok(())
     }
 
     fn maybe_emit_gratuitous_arp(&self) {
@@ -969,6 +1021,13 @@ mod tests {
     fn send_bytes_signature_exists() {
         fn _check(e: &Engine, h: crate::flow_table::ConnHandle) {
             let _: Result<u32, crate::Error> = e.send_bytes(h, b"x");
+        }
+    }
+
+    #[test]
+    fn close_conn_signature_exists() {
+        fn _check(e: &Engine, h: crate::flow_table::ConnHandle) {
+            let _: Result<(), crate::Error> = e.close_conn(h);
         }
     }
 }
