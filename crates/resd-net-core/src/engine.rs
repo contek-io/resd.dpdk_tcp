@@ -1682,6 +1682,206 @@ impl Engine {
         Ok(())
     }
 
+    /// Retransmit the entry at `entry_index` in `conn.snd_retrans`. Allocates
+    /// a fresh header mbuf from `tx_hdr_mempool`, writes L2+L3+TCP headers via
+    /// `build_retrans_header`, bumps the held data mbuf's refcount, chains
+    /// header → data via `rte_pktmbuf_chain`, and TXes. On chain-failure or
+    /// alloc-failure, cleans up mbuf references atomically; on TX-ring-full,
+    /// `rte_pktmbuf_free(head)` frees the whole chain per DPDK semantics.
+    ///
+    /// Bumps `xmit_count` + `xmit_ts_ns` on the entry and `tcp.tx_retrans` on
+    /// success. Does NOT decide whether to retransmit — that's the caller's
+    /// responsibility (Tasks 12 RTO / 15 RACK / 17 TLP / 18 SYN).
+    ///
+    /// Spec §6.5 "retransmit primitive": fresh header mbuf chained to the
+    /// original data mbuf — never edits the in-flight mbuf in place.
+    #[allow(dead_code)] // wired up in Tasks 12 / 15 / 17 / 18
+    pub(crate) fn retransmit(&self, conn_handle: ConnHandle, entry_index: usize) {
+        use crate::counters::inc;
+        use crate::tcp_output::{build_retrans_header, SegmentTx, TCP_ACK, TCP_PSH};
+
+        // Phase 1: snapshot the SegmentTx-building inputs + the data mbuf
+        // pointer and payload-for-checksum bytes. We release the flow-table
+        // borrow before doing any mbuf work.
+        let Some(snapshot) = ({
+            let ft = self.flow_table.borrow();
+            let Some(conn) = ft.get(conn_handle) else {
+                return;
+            };
+            let Some(entry) = conn.snd_retrans.entries.get(entry_index) else {
+                return;
+            };
+            let tuple = conn.four_tuple();
+            let seg_seq = entry.seq;
+            let entry_len = entry.len;
+            let data_mbuf_ptr = entry.mbuf.as_ptr();
+            // Advertised window mirrors `send_bytes` (F-4 RFC 7323 §2.3):
+            // non-SYN segment ⇒ right-shift rcv_wnd by ws_shift_out.
+            let advertised_window = (conn.rcv_wnd >> conn.ws_shift_out).min(u16::MAX as u32) as u16;
+            let ts_enabled = conn.ts_enabled;
+            let ts_recent = conn.ts_recent;
+            let rcv_nxt = conn.rcv_nxt;
+            Some((
+                tuple,
+                seg_seq,
+                entry_len,
+                data_mbuf_ptr,
+                advertised_window,
+                ts_enabled,
+                ts_recent,
+                rcv_nxt,
+            ))
+        }) else {
+            return;
+        };
+        let (
+            tuple,
+            seg_seq,
+            entry_len,
+            data_mbuf_ptr,
+            advertised_window,
+            ts_enabled,
+            ts_recent,
+            rcv_nxt,
+        ) = snapshot;
+
+        if data_mbuf_ptr.is_null() {
+            // Nothing we can do — entry has no backing data mbuf.
+            return;
+        }
+
+        // Phase 2: allocate the header mbuf.
+        let hdr_mbuf = unsafe { sys::resd_rte_pktmbuf_alloc(self.tx_hdr_mempool.as_ptr()) };
+        if hdr_mbuf.is_null() {
+            inc(&self.counters.eth.tx_drop_nomem);
+            return;
+        }
+
+        // Build the SegmentTx template + read the original payload bytes
+        // out of the data mbuf (for the TCP-checksum fold).
+        // F-6 RFC 7323 §3 MUST-22: retrans segments carry TSopt when TS
+        // was negotiated. TSval = now_µs per §4.1 (fresh on each retrans
+        // so Karn-safe — the first-tx RTT sample is discarded on retx).
+        let options = if ts_enabled {
+            let tsval = (crate::clock::now_ns() / 1000) as u32;
+            crate::tcp_options::TcpOpts {
+                timestamps: Some((tsval, ts_recent)),
+                ..Default::default()
+            }
+        } else {
+            crate::tcp_options::TcpOpts::default()
+        };
+        let seg = SegmentTx {
+            src_mac: self.our_mac,
+            dst_mac: self.cfg.gateway_mac,
+            src_ip: tuple.local_ip,
+            dst_ip: tuple.peer_ip,
+            src_port: tuple.local_port,
+            dst_port: tuple.peer_port,
+            seq: seg_seq,
+            ack: rcv_nxt,
+            flags: TCP_ACK | TCP_PSH,
+            window: advertised_window,
+            options,
+            payload: &[],
+        };
+
+        // Read the original payload bytes directly from the data mbuf for
+        // the TCP checksum fold. Stage 1 is single-segment-per-data-mbuf
+        // (no nested chains in `snd_retrans`), so data_len == entry_len.
+        //
+        // Safety: data_mbuf_ptr came from a live RetransEntry; the engine
+        // holds a refcount on it via Mbuf (incremented at push-time, not
+        // yet decremented — snd_retrans still owns the entry).
+        let data_ptr = unsafe { sys::resd_rte_pktmbuf_data(data_mbuf_ptr) } as *const u8;
+        let data_len = unsafe { sys::resd_rte_pktmbuf_data_len(data_mbuf_ptr) };
+        debug_assert!(
+            !data_ptr.is_null(),
+            "live mbuf in snd_retrans must have a valid data pointer"
+        );
+        debug_assert_eq!(
+            data_len, entry_len,
+            "Stage 1 invariant: snd_retrans entries are single-segment"
+        );
+        // Safety: data_ptr + data_len describe the data region of a live
+        // mbuf we hold a refcount on. The slice lifetime is bounded by
+        // this function (we do not stash it past the build_retrans_header
+        // call, which copies out the bytes into its checksum fold).
+        let payload_bytes: &[u8] =
+            unsafe { std::slice::from_raw_parts(data_ptr, data_len as usize) };
+
+        // Phase 3: write header bytes into the hdr mbuf. Budget the same
+        // 40-byte TCP-options cushion as `send_bytes` (MSS + WS + SACK-perm
+        // + TS peak = 20, plus SACK blocks). Ethernet(14) + IPv4(20) +
+        // TCP(20+40) = 94 bytes; round to 128.
+        let mut hdr_scratch = [0u8; 128];
+        let Some(hdr_n) = build_retrans_header(&seg, payload_bytes, &mut hdr_scratch) else {
+            // Header-too-small is impossible for 128-byte scratch; keep explicit.
+            unsafe { sys::resd_rte_pktmbuf_free(hdr_mbuf) };
+            inc(&self.counters.eth.tx_drop_nomem);
+            return;
+        };
+        let dst = unsafe { sys::resd_rte_pktmbuf_append(hdr_mbuf, hdr_n as u16) };
+        if dst.is_null() {
+            unsafe { sys::resd_rte_pktmbuf_free(hdr_mbuf) };
+            inc(&self.counters.eth.tx_drop_nomem);
+            return;
+        }
+        // Safety: `dst` points to `hdr_n` writable bytes inside hdr_mbuf.
+        unsafe {
+            std::ptr::copy_nonoverlapping(hdr_scratch.as_ptr(), dst as *mut u8, hdr_n);
+        }
+
+        // Phase 4: bump data mbuf's refcount and chain. The refcnt_update
+        // is paired with either the chain-success (the chain now owns one
+        // of the references, dropped by rte_pktmbuf_free on the chain's
+        // head) or the chain-failure rollback below.
+        unsafe { sys::resd_rte_mbuf_refcnt_update(data_mbuf_ptr, 1) };
+        let rc = unsafe { sys::resd_rte_pktmbuf_chain(hdr_mbuf, data_mbuf_ptr) };
+        if rc != 0 {
+            // Chain failed (e.g. would exceed RTE_MBUF_MAX_NB_SEGS). Roll
+            // back the refcnt bump and free the hdr mbuf. The hdr mbuf
+            // still owns zero chained segs at this point, so freeing it
+            // only releases the header; the data mbuf is untouched.
+            unsafe { sys::resd_rte_pktmbuf_free(hdr_mbuf) };
+            unsafe { sys::resd_rte_mbuf_refcnt_update(data_mbuf_ptr, -1) };
+            inc(&self.counters.eth.tx_drop_nomem);
+            return;
+        }
+
+        // Phase 5: TX the chained mbuf.
+        let mut bufs = [hdr_mbuf];
+        let sent = unsafe {
+            sys::resd_rte_eth_tx_burst(self.cfg.port_id, self.cfg.tx_queue_id, bufs.as_mut_ptr(), 1)
+        } as usize;
+        if sent == 0 {
+            // TX ring full. `rte_pktmbuf_free(hdr_mbuf)` walks the chain
+            // and drops the data-mbuf refcount we bumped in Phase 4 as
+            // part of the standard chain-free path — do NOT double-free.
+            unsafe { sys::resd_rte_pktmbuf_free(hdr_mbuf) };
+            inc(&self.counters.eth.tx_drop_full_ring);
+            return;
+        }
+
+        // Phase 6: update per-entry state + bump counters. Re-borrow the
+        // flow table mutably only now, after all mbuf work is done.
+        {
+            let mut ft = self.flow_table.borrow_mut();
+            if let Some(conn) = ft.get_mut(conn_handle) {
+                if let Some(entry) = conn.snd_retrans.entries.get_mut(entry_index) {
+                    entry.xmit_count = entry.xmit_count.saturating_add(1);
+                    entry.xmit_ts_ns = crate::clock::now_ns();
+                }
+            }
+        }
+        inc(&self.counters.tcp.tx_retrans);
+        inc(&self.counters.eth.tx_pkts);
+        crate::counters::add(
+            &self.counters.eth.tx_bytes,
+            (hdr_n + entry_len as usize) as u64,
+        );
+    }
+
     fn maybe_emit_gratuitous_arp(&self) {
         if self.cfg.garp_interval_sec == 0 || self.cfg.local_ip == 0 {
             return;
@@ -1785,6 +1985,20 @@ mod tests {
     fn drain_events_signature_exists() {
         fn _check(e: &Engine) {
             e.drain_events(1, |_ev, _engine| {});
+        }
+    }
+
+    // Task 9: retransmit primitive. Full TAP-level exercise lives in
+    // Task 28 (RTO/RACK/TLP integration) and Task 30 (mbuf-chain). Here we
+    // compile-check the method signature — a real Engine needs EAL/DPDK,
+    // so unit coverage of the body is via the `build_retrans_header` unit
+    // tests in `tcp_output.rs` plus the refcount/chain hand-trace in the
+    // self-review. A `retransmit(...)` call on an empty `snd_retrans` or
+    // stale entry_index is a silent no-op by design.
+    #[test]
+    fn retransmit_signature_exists() {
+        fn _check(e: &Engine, h: crate::flow_table::ConnHandle) {
+            e.retransmit(h, 0);
         }
     }
 

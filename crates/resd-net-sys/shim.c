@@ -61,3 +61,22 @@ void *resd_rte_pktmbuf_data(const struct rte_mbuf *m) {
 uint16_t resd_rte_pktmbuf_data_len(const struct rte_mbuf *m) {
     return rte_pktmbuf_data_len(m);
 }
+
+/* rte_pktmbuf_chain is static inline; re-export. Attaches `tail` to `head`
+ * updating nb_segs + pkt_len. Returns 0 on success; -EOVERFLOW if the chain
+ * would exceed RTE_MBUF_MAX_NB_SEGS. */
+int resd_rte_pktmbuf_chain(struct rte_mbuf *head, struct rte_mbuf *tail) {
+    return rte_pktmbuf_chain(head, tail);
+}
+
+/* rte_mbuf_refcnt_update is static inline; re-export. Adds `v` (may be
+ * negative) to the refcount. */
+void resd_rte_mbuf_refcnt_update(struct rte_mbuf *m, int16_t v) {
+    rte_mbuf_refcnt_update(m, v);
+}
+
+/* rte_pktmbuf_nb_segs — field accessor for test assertions + debug.
+ * bindgen can't expose the rte_mbuf field layout directly. */
+uint16_t resd_rte_pktmbuf_nb_segs(const struct rte_mbuf *m) {
+    return m->nb_segs;
+}
