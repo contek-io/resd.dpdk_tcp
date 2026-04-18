@@ -10,6 +10,7 @@ pub mod tcp_events;
 pub mod tcp_input;
 pub mod tcp_options;
 pub mod tcp_reassembly;
+pub mod tcp_sack;
 pub mod iss;
 pub mod arp;
 pub mod clock;
