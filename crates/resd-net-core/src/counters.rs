@@ -358,12 +358,11 @@ mod tests {
         assert_eq!(c.poll.iters_idle.load(Ordering::Relaxed), 0);
     }
 
-    /// Counters declared for forward-phase accounting: A5 TX retransmit
-    /// (tx_retrans, tx_rto, tx_tlp). These live in the struct so the
-    /// public ABI is stable across phases and bindgen doesn't re-layout
-    /// on phase bumps; they stay at zero in A3.
+    /// A5 TX retransmit counters (tx_retrans, tx_rto, tx_tlp) start at
+    /// zero at construction. They're wired in Tasks 9/12/17 (retransmit
+    /// primitive, on_rto_fire, on_tlp_fire).
     #[test]
-    fn deferred_tcp_counters_zero_at_construction() {
+    fn tx_retrans_counters_zero_at_construction() {
         let c = Counters::new();
         assert_eq!(c.tcp.rx_out_of_order.load(Ordering::Relaxed), 0);
         assert_eq!(c.tcp.tx_retrans.load(Ordering::Relaxed), 0);

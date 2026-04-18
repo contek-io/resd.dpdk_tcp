@@ -314,6 +314,9 @@ fn apply_tcp_input_counters(
     if outcome.ws_shift_clamped {
         inc(&counters.rx_ws_shift_clamped);
     }
+    if outcome.rtt_sample_taken {
+        inc(&counters.rtt_samples);
+    }
 }
 
 /// EAL is process-global; only initialize once.
@@ -3296,6 +3299,17 @@ mod tests {
         assert_eq!(c.rx_ws_shift_clamped.load(Ordering::Relaxed), 1);
     }
 
+    // A5 Task 26: RTT sample taken (Task 11's Outcome flag) → counter bump.
+    #[test]
+    fn apply_tcp_input_counters_bumps_rtt_samples_when_flag_set() {
+        let c = crate::counters::TcpCounters::default();
+        let mut o = crate::tcp_input::Outcome::base();
+        o.rtt_sample_taken = true;
+        super::apply_tcp_input_counters(&o, &c);
+        use std::sync::atomic::Ordering;
+        assert_eq!(c.rtt_samples.load(Ordering::Relaxed), 1);
+    }
+
     #[test]
     fn apply_tcp_input_counters_base_outcome_no_bumps() {
         let c = crate::counters::TcpCounters::default();
@@ -3315,5 +3329,6 @@ mod tests {
         assert_eq!(c.rx_zero_window.load(Ordering::Relaxed), 0);
         assert_eq!(c.rx_dsack.load(Ordering::Relaxed), 0);
         assert_eq!(c.rx_ws_shift_clamped.load(Ordering::Relaxed), 0);
+        assert_eq!(c.rtt_samples.load(Ordering::Relaxed), 0);
     }
 }
