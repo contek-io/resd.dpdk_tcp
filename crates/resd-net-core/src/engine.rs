@@ -354,11 +354,25 @@ impl Engine {
     }
 
     /// One iteration of the run-to-completion loop.
-    /// Phase A2: decode L2/L3/ICMP/ARP. Counts every packet by its outcome.
-    /// TCP dispatches to a stub that only bumps ip.rx_tcp. Real TCP is A3.
+    /// A3: clears each conn's per-poll `last_read_buf` accumulator,
+    /// drains an RX burst, dispatches frames through the L2/L3/TCP
+    /// pipeline, then reaps any TIME_WAIT flows past their 2×MSL deadline.
     pub fn poll_once(&self) -> usize {
         use crate::counters::{add, inc};
         inc(&self.counters.poll.iters);
+
+        // Clear per-conn last_read_buf so prior borrowed views are
+        // invalidated per spec §4.2, before any rx_frame dispatches
+        // can append new data this iteration.
+        {
+            let mut ft = self.flow_table.borrow_mut();
+            let handles: Vec<_> = ft.iter_handles().collect();
+            for h in handles {
+                if let Some(c) = ft.get_mut(h) {
+                    c.recv.last_read_buf.clear();
+                }
+            }
+        }
 
         const BURST: usize = 32;
         let mut mbufs: [*mut sys::rte_mbuf; BURST] = [std::ptr::null_mut(); BURST];
@@ -373,6 +387,7 @@ impl Engine {
 
         if n == 0 {
             inc(&self.counters.poll.iters_idle);
+            self.reap_time_wait();
             self.maybe_emit_gratuitous_arp();
             return 0;
         }
@@ -381,18 +396,49 @@ impl Engine {
         add(&self.counters.eth.rx_pkts, n as u64);
 
         for &m in &mbufs[..n] {
-            // Safety: mbuf is valid for the duration of this iteration.
             let bytes = unsafe { crate::mbuf_data_slice(m) };
             add(&self.counters.eth.rx_bytes, bytes.len() as u64);
-
             self.rx_frame(bytes);
-
-            // Phase A2: we free every packet at the end of the iteration.
-            // Phase A3 will transfer ownership to recv_queues for TCP pkts.
             unsafe { sys::resd_rte_pktmbuf_free(m) };
         }
 
+        self.reap_time_wait();
         self.maybe_emit_gratuitous_arp();
+        n
+    }
+
+    /// Walk the flow table and move any TIME_WAIT connection past its
+    /// 2×MSL deadline to CLOSED. Naïve O(N) scan in A3 — acceptable at
+    /// ≤100 connections; A6's timer wheel replaces this.
+    fn reap_time_wait(&self) {
+        let now = crate::clock::now_ns();
+        let candidates: Vec<_> = {
+            let ft = self.flow_table.borrow();
+            ft.iter_handles()
+                .filter(|h| {
+                    let Some(c) = ft.get(*h) else { return false; };
+                    c.state == TcpState::TimeWait
+                        && c.time_wait_deadline_ns.map_or(false, |d| now >= d)
+                })
+                .collect()
+        };
+        for h in candidates {
+            self.transition_conn(h, TcpState::Closed);
+            self.events.borrow_mut().push(InternalEvent::Closed { conn: h, err: 0 });
+            self.flow_table.borrow_mut().remove(h);
+        }
+    }
+
+    /// Drain up to `max` events from the internal queue. Returns the
+    /// number of events drained. Callers in the C ABI layer translate
+    /// the `InternalEvent` enum to the public union-tagged form.
+    pub fn drain_events<F: FnMut(&InternalEvent, &Engine)>(&self, max: u32, mut sink: F) -> u32 {
+        let mut n = 0u32;
+        while n < max {
+            let Some(ev) = self.events.borrow_mut().pop() else { break; };
+            sink(&ev, self);
+            n += 1;
+        }
         n
     }
 
@@ -680,10 +726,10 @@ impl Engine {
         use crate::counters::add;
         let mut ft = self.flow_table.borrow_mut();
         let Some(conn) = ft.get_mut(handle) else { return; };
-        // Drain the VecDeque's two slices into the last_read_buf so the
-        // caller sees one contiguous view. The buf is cleared at the top
-        // of the next poll by the caller (see Task 19).
-        conn.recv.last_read_buf.clear();
+        // Append delivered bytes to last_read_buf (do NOT clear — the poll
+        // entry point clears once per iteration so multiple Readable events
+        // within one poll stack contiguously in the buffer).
+        let byte_offset = conn.recv.last_read_buf.len() as u32;
         conn.recv.last_read_buf.reserve(delivered as usize);
         let (a, b) = conn.recv.bytes.as_slices();
         let from_a = a.len().min(delivered as usize);
@@ -696,7 +742,10 @@ impl Engine {
         drop(ft);
         add(&self.counters.tcp.recv_buf_delivered, delivered as u64);
         self.events.borrow_mut().push(InternalEvent::Readable {
-            conn: handle, byte_len: delivered, rx_hw_ts_ns: 0,
+            conn: handle,
+            byte_offset,
+            byte_len: delivered,
+            rx_hw_ts_ns: 0,
         });
     }
 
@@ -1028,6 +1077,13 @@ mod tests {
     fn close_conn_signature_exists() {
         fn _check(e: &Engine, h: crate::flow_table::ConnHandle) {
             let _: Result<(), crate::Error> = e.close_conn(h);
+        }
+    }
+
+    #[test]
+    fn drain_events_signature_exists() {
+        fn _check(e: &Engine) {
+            e.drain_events(1, |_ev, _engine| {});
         }
     }
 }

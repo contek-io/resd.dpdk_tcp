@@ -20,6 +20,11 @@ pub enum InternalEvent {
     /// to a `(data, data_len)` view at the ABI boundary.
     Readable {
         conn: ConnHandle,
+        /// Offset within `conn.recv.last_read_buf` where this event's bytes begin.
+        /// Multiple Readable events can fire per poll iteration; each one
+        /// describes a contiguous slice `last_read_buf[byte_offset..byte_offset+byte_len]`.
+        /// The buffer is cleared at the top of each `resd_net_poll`.
+        byte_offset: u32,
         byte_len: u32,
         rx_hw_ts_ns: u64,
     },
