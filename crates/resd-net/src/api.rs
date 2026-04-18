@@ -51,6 +51,11 @@ pub struct resd_net_connect_opts_t {
     pub local_port: u16,
     pub connect_timeout_ms: u32,
     pub idle_keepalive_sec: u32,
+    // A5 Task 19: per-connect opt-ins. Appended at the tail so zero-init
+    // of existing callers keeps both disabled (A5 baseline). See
+    // `resd_net_core::engine::ConnectOpts` for field semantics.
+    pub rack_aggressive: bool,
+    pub rto_no_backoff: bool,
 }
 
 #[repr(u32)]
@@ -227,6 +232,17 @@ pub struct resd_net_tcp_counters_t {
     pub tx_payload_bytes: u64,
     pub rx_payload_bytes: u64,
     pub state_trans: [[u64; 11]; 11],
+    // Phase A5 additions — slow-path only. Declaration order must match
+    // `resd_net_core::counters::TcpCounters` exactly. Field docs live on
+    // the core struct (see counters.rs).
+    pub conn_timeout_retrans: u64,
+    pub conn_timeout_syn_sent: u64,
+    pub rtt_samples: u64,
+    pub tx_rack_loss: u64,
+    pub rack_reo_wnd_override_active: u64,
+    pub rto_no_backoff_active: u64,
+    pub rx_ws_shift_clamped: u64,
+    pub rx_dsack: u64,
     pub _pad: [u64; 1],
 }
 #[repr(C, align(64))]

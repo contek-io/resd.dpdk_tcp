@@ -308,6 +308,24 @@ pub fn eal_init(args: &[&str]) -> Result<(), Error> {
     Ok(())
 }
 
+/// Per-connect options for A5. Defaults: both `false` (A5 baseline,
+/// standards-conformant behavior).
+///
+/// * `rack_aggressive` forces RACK reo_wnd = 0 on this connection (valid
+///   sender discretion per RFC 8985 §6.2; trades reorder tolerance for
+///   lower detection latency — intended for stable DC / intra-region
+///   links where reordering is rare).
+/// * `rto_no_backoff` disables exponential RTO backoff on this connection
+///   (deviates from RFC 6298 §5.5, but opt-in per-connect; the RTO stays
+///   at its current value across consecutive retransmits instead of
+///   doubling — intended for latency-sensitive trading paths where the
+///   operator prefers faster reprobe over AIMD-style congestion backoff).
+#[derive(Debug, Default, Clone, Copy)]
+pub struct ConnectOpts {
+    pub rack_aggressive: bool,
+    pub rto_no_backoff: bool,
+}
+
 impl Engine {
     pub fn new(cfg: EngineConfig) -> Result<Self, Error> {
         // Fail fast on non-invariant-TSC hosts (spec §7.5). Also primes
@@ -1881,11 +1899,27 @@ impl Engine {
     /// `peer_ip` / `peer_port` in host byte order.
     /// `local_port_hint`: if nonzero, used as the source port; else we
     /// pick an ephemeral port from [49152, 65535].
+    ///
+    /// Thin wrapper over `connect_with_opts` using default per-connect
+    /// opts (both A5 opt-ins disabled). Prefer `connect_with_opts` when
+    /// caller needs `rack_aggressive` or `rto_no_backoff`.
     pub fn connect(
         &self,
         peer_ip: u32,
         peer_port: u16,
         local_port_hint: u16,
+    ) -> Result<ConnHandle, Error> {
+        self.connect_with_opts(peer_ip, peer_port, local_port_hint, ConnectOpts::default())
+    }
+
+    /// `connect` variant that accepts per-connect opt-ins (A5 Task 19).
+    /// See [`ConnectOpts`] for field semantics.
+    pub fn connect_with_opts(
+        &self,
+        peer_ip: u32,
+        peer_port: u16,
+        local_port_hint: u16,
+        opts: ConnectOpts,
     ) -> Result<ConnHandle, Error> {
         use crate::counters::inc;
         use crate::tcp_conn::TcpConn;
@@ -1932,6 +1966,24 @@ impl Engine {
                 return Err(Error::TooManyConns);
             }
         };
+
+        // A5 Task 19: apply per-connect opts to the freshly-inserted conn,
+        // BEFORE emit_syn / SYN retrans timer arm so the fields are already
+        // in effect if emit_syn (or a later RTO/RACK path after SYN-ACK)
+        // consults them.
+        {
+            let mut ft = self.flow_table.borrow_mut();
+            if let Some(c) = ft.get_mut(handle) {
+                c.rack_aggressive = opts.rack_aggressive;
+                c.rto_no_backoff = opts.rto_no_backoff;
+            }
+        }
+        if opts.rack_aggressive {
+            inc(&self.counters.tcp.rack_reo_wnd_override_active);
+        }
+        if opts.rto_no_backoff {
+            inc(&self.counters.tcp.rto_no_backoff_active);
+        }
 
         // Build and transmit SYN with the full Stage-1 option set: MSS
         // (already clamped to MTU-40 above) + Window Scale + SACK-permitted
@@ -2621,6 +2673,26 @@ mod tests {
         fn _check(e: &Engine) {
             let _: Result<crate::flow_table::ConnHandle, crate::Error> =
                 e.connect(0x0a_00_00_01, 5000, 0);
+        }
+    }
+
+    // A5 Task 19: ConnectOpts type + connect_with_opts signature.
+    #[test]
+    fn connect_opts_default_is_both_false() {
+        let opts = super::ConnectOpts::default();
+        assert!(!opts.rack_aggressive);
+        assert!(!opts.rto_no_backoff);
+    }
+
+    #[test]
+    fn connect_with_opts_signature_exists() {
+        // Compile-only: engine can't be constructed without EAL. This
+        // asserts the method signature + that ConnectOpts is Copy (the
+        // call site below moves it into a second slot).
+        fn _check(e: &Engine) {
+            let opts = super::ConnectOpts::default();
+            let _ = e.connect_with_opts(0, 0, 0, opts);
+            let _ = e.connect_with_opts(0, 0, 0, opts);
         }
     }
 

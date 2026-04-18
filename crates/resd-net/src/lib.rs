@@ -282,7 +282,12 @@ pub unsafe extern "C" fn resd_net_connect(
     let peer_ip = u32::from_be(opts.peer_addr);
     let peer_port = u16::from_be(opts.peer_port);
     let local_port = u16::from_be(opts.local_port);
-    match e.connect(peer_ip, peer_port, local_port) {
+    // A5 Task 19: plumb per-connect opt-ins into engine::ConnectOpts.
+    let connect_opts = resd_net_core::engine::ConnectOpts {
+        rack_aggressive: opts.rack_aggressive,
+        rto_no_backoff: opts.rto_no_backoff,
+    };
+    match e.connect_with_opts(peer_ip, peer_port, local_port, connect_opts) {
         Ok(h) => {
             *out = h as resd_net_conn_t;
             0
@@ -426,6 +431,8 @@ mod tests {
             local_port: 0,
             connect_timeout_ms: 0,
             idle_keepalive_sec: 0,
+            rack_aggressive: false,
+            rto_no_backoff: false,
         };
         let mut out: u64 = 0;
         let rc = unsafe { resd_net_connect(std::ptr::null_mut(), &opts, &mut out) };
