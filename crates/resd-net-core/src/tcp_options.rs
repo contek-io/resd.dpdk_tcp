@@ -32,6 +32,12 @@ pub const LEN_TIMESTAMP: u8 = 10;
 ///   with Timestamps so 3 is the right ceiling.
 pub const MAX_SACK_BLOCKS_EMIT: usize = 3;
 
+/// Maximum number of SACK blocks we decode from an inbound ACK. RFC 2018
+/// §3 allows up to 4 blocks on the wire when the peer omits Timestamps;
+/// we widen our decode storage so we never silently drop the 4th block.
+/// (Encode/emit stays at 3 since our outbound ACKs always carry TS.)
+pub const MAX_SACK_BLOCKS_DECODE: usize = 4;
+
 /// A single SACK block (RFC 2018 §3). Seqs are host byte order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct SackBlock {
@@ -41,7 +47,10 @@ pub struct SackBlock {
 
 /// Parsed TCP options + SACK blocks. Used for both RX decode and TX
 /// build. `sack_blocks` is a fixed-size array to avoid allocation on
-/// the hot path.
+/// the hot path. The array is sized to `MAX_SACK_BLOCKS_DECODE` (4) so
+/// we can receive the peer's 4-block ACKs without dropping the tail; the
+/// encode path (`push_sack_block`) still caps at `MAX_SACK_BLOCKS_EMIT`
+/// (3) since our outbound ACKs always include Timestamps.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct TcpOpts {
     pub mss: Option<u16>,
@@ -49,13 +58,29 @@ pub struct TcpOpts {
     pub sack_permitted: bool,
     /// TSval + TSecr per RFC 7323 §3.
     pub timestamps: Option<(u32, u32)>,
-    pub sack_blocks: [SackBlock; MAX_SACK_BLOCKS_EMIT],
+    pub sack_blocks: [SackBlock; MAX_SACK_BLOCKS_DECODE],
     pub sack_block_count: u8,
 }
 
 impl TcpOpts {
+    /// Encode-path append: caps at `MAX_SACK_BLOCKS_EMIT` (3) so we never
+    /// produce an outbound SACK option that exceeds the 40-byte option
+    /// budget alongside Timestamps.
     pub fn push_sack_block(&mut self, block: SackBlock) -> bool {
         if (self.sack_block_count as usize) >= MAX_SACK_BLOCKS_EMIT {
+            return false;
+        }
+        self.sack_blocks[self.sack_block_count as usize] = block;
+        self.sack_block_count += 1;
+        true
+    }
+
+    /// Decode-path append: caps at `MAX_SACK_BLOCKS_DECODE` (4) so the
+    /// parser can record all blocks RFC 2018 §3 allows on the wire (up
+    /// to 4 when the peer omits Timestamps). Only `parse_options` should
+    /// call this; the encode path must go through `push_sack_block`.
+    pub fn push_sack_block_decode(&mut self, block: SackBlock) -> bool {
+        if (self.sack_block_count as usize) >= MAX_SACK_BLOCKS_DECODE {
             return false;
         }
         self.sack_blocks[self.sack_block_count as usize] = block;
@@ -155,7 +180,7 @@ pub enum OptionParseError {
     BadKnownLen,
     /// Option would extend past the end of the options region.
     Truncated,
-    /// SACK block count isn't in 1..=MAX_SACK_BLOCKS_EMIT (zero blocks
+    /// SACK block count isn't in 1..=MAX_SACK_BLOCKS_DECODE (zero blocks
     /// or too many).
     BadSackBlockCount,
 }
@@ -223,15 +248,17 @@ pub fn parse_options(opts: &[u8]) -> Result<TcpOpts, OptionParseError> {
                         out.timestamps = Some((tsval, tsecr));
                     }
                     OPT_SACK => {
-                        // len = 2 (hdr) + 8 * N, N in 1..=4.
+                        // len = 2 (hdr) + 8 * N, N in 1..=MAX_SACK_BLOCKS_DECODE.
                         let block_bytes = olen.saturating_sub(2);
-                        if block_bytes == 0 || !block_bytes.is_multiple_of(8) || block_bytes / 8 > 4
+                        if block_bytes == 0
+                            || !block_bytes.is_multiple_of(8)
+                            || block_bytes / 8 > MAX_SACK_BLOCKS_DECODE
                         {
                             return Err(OptionParseError::BadSackBlockCount);
                         }
-                        // Store as many as fit in our fixed-size array; drop
-                        // the excess silently (RFC-legal since SACK blocks
-                        // are advisory for the sender).
+                        // Decode every block the peer sent; array is sized
+                        // to MAX_SACK_BLOCKS_DECODE so push_sack_block_decode
+                        // never drops a valid on-wire block.
                         let mut bi = i + 2;
                         for _ in 0..(block_bytes / 8) {
                             let left = u32::from_be_bytes([
@@ -246,7 +273,7 @@ pub fn parse_options(opts: &[u8]) -> Result<TcpOpts, OptionParseError> {
                                 opts[bi + 6],
                                 opts[bi + 7],
                             ]);
-                            out.push_sack_block(SackBlock { left, right });
+                            out.push_sack_block_decode(SackBlock { left, right });
                             bi += 8;
                         }
                     }
@@ -486,5 +513,49 @@ mod tests {
         let bytes = [99u8, 4, 0xaa, 0xbb, OPT_MSS, LEN_MSS, 0x05, 0xb4];
         let opts = parse_options(&bytes).unwrap();
         assert_eq!(opts.mss, Some(1460));
+    }
+
+    #[test]
+    fn parse_sack_four_blocks_without_timestamps_all_captured() {
+        // RFC 2018 §3: up to 4 SACK blocks on the wire when Timestamps
+        // is absent. Hand-build the option rather than using encode()
+        // (which caps emit at 3). Assert all 4 land in the array.
+        let mut bytes = [0u8; 2 + 8 * 4];
+        bytes[0] = OPT_SACK;
+        bytes[1] = (2 + 8 * 4) as u8;
+        let blocks = [
+            (100u32, 200u32),
+            (300, 400),
+            (500, 600),
+            (700, 800),
+        ];
+        for (idx, (l, r)) in blocks.iter().enumerate() {
+            let off = 2 + idx * 8;
+            bytes[off..off + 4].copy_from_slice(&l.to_be_bytes());
+            bytes[off + 4..off + 8].copy_from_slice(&r.to_be_bytes());
+        }
+        let parsed = parse_options(&bytes).unwrap();
+        assert_eq!(parsed.sack_block_count, 4);
+        for (idx, (l, r)) in blocks.iter().enumerate() {
+            assert_eq!(
+                parsed.sack_blocks[idx],
+                SackBlock {
+                    left: *l,
+                    right: *r,
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn parse_rejects_sack_with_five_blocks() {
+        // 2 + 8 * 5 = 42 bytes, which exceeds MAX_SACK_BLOCKS_DECODE = 4
+        // and is also larger than the 40-byte option budget. Must reject
+        // with BadSackBlockCount.
+        let mut bytes = [0u8; 2 + 8 * 5];
+        bytes[0] = OPT_SACK;
+        bytes[1] = (2 + 8 * 5) as u8;
+        let err = parse_options(&bytes).unwrap_err();
+        assert_eq!(err, OptionParseError::BadSackBlockCount);
     }
 }
