@@ -619,11 +619,11 @@ fn handle_established(conn: &mut TcpConn, seg: &ParsedSegment) -> Outcome {
         // RFC 5681 §2 strict duplicate-ACK: all 5 conditions must hold.
         // A4 used a loose `ack <= snd_una` test; A5 Task 23 tightens to
         // spec so diagnostic `tcp.rx_dup_ack` only fires on real dup ACKs.
-        //   c1: seg.ack == snd.una   (ACK of largest seen ACK)
-        //   c2: seg.payload.is_empty()  (no data)
-        //   c3: seg.window unchanged  (no window update)
-        //   c4: snd.una != snd.nxt    (outstanding data)
-        //   c5: state in { ESTABLISHED, CLOSE_WAIT, FIN_WAIT_1/2, CLOSING }
+        //   c1: seg.ack == snd.una    (ACK of largest seen ACK)
+        //   c2: seg.payload.is_empty() (no data)
+        //   c3: seg.window unchanged   (no window update)
+        //   c4: snd.una != snd.nxt     (outstanding data)
+        //   c5: SYN and FIN flags both off (RFC 5681 §2 (c))
         //
         // c3 window comparison: on-wire `seg.window` is pre-scale (u16);
         // `conn.snd_wnd` is post-scale (u32). Right-shift snd_wnd back by
@@ -633,14 +633,7 @@ fn handle_established(conn: &mut TcpConn, seg: &ParsedSegment) -> Outcome {
         let c2 = seg.payload.is_empty();
         let c3 = (seg.window as u32) == (conn.snd_wnd >> conn.ws_shift_in);
         let c4 = conn.snd_una != conn.snd_nxt;
-        let c5 = matches!(
-            conn.state,
-            TcpState::Established
-                | TcpState::CloseWait
-                | TcpState::FinWait1
-                | TcpState::FinWait2
-                | TcpState::Closing
-        );
+        let c5 = (seg.flags & (TCP_SYN | TCP_FIN)) == 0;
         dup_ack = c1 && c2 && c3 && c4 && c5;
     }
 
@@ -2209,6 +2202,53 @@ mod tests {
         };
         let out = dispatch(&mut c, &seg);
         assert!(out.dup_ack);
+    }
+
+    #[test]
+    fn dup_ack_ignored_when_fin_flag_set() {
+        // c5 violated: FIN flag set. All other conditions (c1-c4) hold,
+        // so a correct RFC 5681 §2 (c) implementation must NOT classify
+        // this segment as a duplicate ACK.
+        let mut c = est_conn(1000, 5000, 1024);
+        c.snd_nxt = c.snd_una.wrapping_add(100);
+        c.snd_wnd = 65535;
+        c.ws_shift_in = 0;
+        let seg = ParsedSegment {
+            src_port: 5000,
+            dst_port: 40000,
+            seq: 5001,
+            ack: 1001,
+            flags: TCP_ACK | TCP_FIN,
+            window: 65535,
+            header_len: 20,
+            payload: &[],
+            options: &[],
+        };
+        let out = dispatch(&mut c, &seg);
+        assert!(!out.dup_ack);
+    }
+
+    #[test]
+    fn dup_ack_ignored_when_syn_flag_set() {
+        // c5 violated: SYN flag set. Mirrors the FIN case — RFC 5681 §2 (c)
+        // requires both SYN and FIN bits off for a segment to be a dup_ack.
+        let mut c = est_conn(1000, 5000, 1024);
+        c.snd_nxt = c.snd_una.wrapping_add(100);
+        c.snd_wnd = 65535;
+        c.ws_shift_in = 0;
+        let seg = ParsedSegment {
+            src_port: 5000,
+            dst_port: 40000,
+            seq: 5001,
+            ack: 1001,
+            flags: TCP_ACK | TCP_SYN,
+            window: 65535,
+            header_len: 20,
+            payload: &[],
+            options: &[],
+        };
+        let out = dispatch(&mut c, &seg);
+        assert!(!out.dup_ack);
     }
 
     #[test]
