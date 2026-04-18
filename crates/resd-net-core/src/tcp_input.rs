@@ -287,16 +287,23 @@ fn handle_syn_sent(conn: &mut TcpConn, seg: &ParsedSegment) -> Outcome {
     conn.irs = seg.seq;
     conn.rcv_nxt = seg.seq.wrapping_add(1);
     conn.snd_una = seg.ack;
-    // Scale the peer's advertised window by their WS if they advertised one.
-    let peer_ws = parsed_opts.wscale.unwrap_or(0);
-    conn.snd_wnd = (seg.window as u32).wrapping_shl(peer_ws as u32);
+    // F-3 RFC 7323 §2.2: the window field in a <SYN,ACK> MUST NOT be scaled.
+    // Both ends have not yet agreed on WS; the handshake carries unscaled
+    // windows. Scaling begins with the first post-handshake segment (see
+    // the established-state branch below).
+    conn.snd_wnd = seg.window as u32;
     conn.snd_wl1 = seg.seq;
     conn.snd_wl2 = seg.ack;
     conn.peer_mss = parsed_opts.mss.unwrap_or(536);
 
     match parsed_opts.wscale {
         Some(ws_peer) => {
-            conn.ws_shift_in = ws_peer;
+            // F-1 RFC 7323 §2.3: "If a Window Scale option is received with
+            // a shift.cnt value larger than 14, the TCP SHOULD log the error
+            // but MUST use 14 instead of the specified value." Clamp at 14
+            // before the shift flows into any subsequent `snd_wnd` left-shift
+            // (F-2 path below).
+            conn.ws_shift_in = ws_peer.min(14);
         }
         None => {
             conn.ws_shift_in = 0;
@@ -455,7 +462,11 @@ fn handle_established(conn: &mut TcpConn, seg: &ParsedSegment) -> Outcome {
         if seq_lt(conn.snd_wl1, seg.seq)
             || (conn.snd_wl1 == seg.seq && seq_le(conn.snd_wl2, seg.ack))
         {
-            conn.snd_wnd = seg.window as u32;
+            // F-2 RFC 7323 §2.3: on non-SYN segments the receiver MUST
+            // left-shift SEG.WND by Snd.Wind.Shift bits before updating
+            // SND.WND. `ws_shift_in` is bounded at 14 (F-1), so wrapping_shl
+            // is safe and deterministic.
+            conn.snd_wnd = (seg.window as u32).wrapping_shl(conn.ws_shift_in as u32);
             conn.snd_wl1 = seg.seq;
             conn.snd_wl2 = seg.ack;
         }
@@ -808,6 +819,116 @@ mod tests {
         // RFC 7323 §1.3: WS only active if both sides advertise.
         assert_eq!(c.ws_shift_in, 0);
         assert_eq!(c.ws_shift_out, 0);
+    }
+
+    #[test]
+    fn syn_ack_window_is_not_ws_scaled_per_rfc7323_2_2() {
+        // F-3 RFC 7323 §2.2: SYN/SYN-ACK window fields MUST NOT be scaled.
+        // Peer advertises WS=7 and window=65535; we must interpret snd_wnd
+        // as 65535, not 65535<<7.
+        use crate::flow_table::FourTuple;
+        use crate::tcp_conn::TcpConn;
+        use crate::tcp_options::TcpOpts;
+
+        let t = FourTuple {
+            local_ip: 0x0a_00_00_02,
+            local_port: 40000,
+            peer_ip: 0x0a_00_00_01,
+            peer_port: 5000,
+        };
+        let mut c = TcpConn::new_client(t, 1000, 1460, 1024, 2048);
+        c.state = TcpState::SynSent;
+        c.snd_nxt = c.snd_nxt.wrapping_add(1);
+        c.ws_shift_out = 7;
+
+        let mut peer_opts = TcpOpts::default();
+        peer_opts.mss = Some(1400);
+        peer_opts.wscale = Some(7);
+        let mut opts_buf = [0u8; 40];
+        let opts_len = peer_opts.encode(&mut opts_buf).unwrap();
+
+        let seg = ParsedSegment {
+            src_port: 5000,
+            dst_port: 40000,
+            seq: 5000,
+            ack: 1001,
+            flags: TCP_SYN | TCP_ACK,
+            window: 65535,
+            header_len: 20 + opts_len,
+            payload: &[],
+            options: &opts_buf[..opts_len],
+        };
+        let _out = dispatch(&mut c, &seg);
+        assert_eq!(c.snd_wnd, 65535, "SYN-ACK window must be unscaled");
+        assert_eq!(c.ws_shift_in, 7, "peer's WS is recorded for post-handshake");
+    }
+
+    #[test]
+    fn syn_ack_ws_shift_clamped_at_14_per_rfc7323_2_3() {
+        // F-1 RFC 7323 §2.3: peer's shift.cnt > 14 MUST be clamped to 14.
+        use crate::flow_table::FourTuple;
+        use crate::tcp_conn::TcpConn;
+        use crate::tcp_options::TcpOpts;
+
+        let t = FourTuple {
+            local_ip: 0x0a_00_00_02,
+            local_port: 40000,
+            peer_ip: 0x0a_00_00_01,
+            peer_port: 5000,
+        };
+        let mut c = TcpConn::new_client(t, 1000, 1460, 1024, 2048);
+        c.state = TcpState::SynSent;
+        c.snd_nxt = c.snd_nxt.wrapping_add(1);
+
+        let mut peer_opts = TcpOpts::default();
+        peer_opts.wscale = Some(20); // illegal; must clamp to 14
+        let mut opts_buf = [0u8; 40];
+        let opts_len = peer_opts.encode(&mut opts_buf).unwrap();
+
+        let seg = ParsedSegment {
+            src_port: 5000,
+            dst_port: 40000,
+            seq: 5000,
+            ack: 1001,
+            flags: TCP_SYN | TCP_ACK,
+            window: 65535,
+            header_len: 20 + opts_len,
+            payload: &[],
+            options: &opts_buf[..opts_len],
+        };
+        let _out = dispatch(&mut c, &seg);
+        assert_eq!(
+            c.ws_shift_in, 14,
+            "peer's WS shift MUST be clamped at 14 per RFC 7323 §2.3"
+        );
+    }
+
+    #[test]
+    fn established_post_handshake_snd_wnd_is_ws_scaled_per_rfc7323_2_3() {
+        // F-2 RFC 7323 §2.3: on post-handshake segments, receiver MUST
+        // left-shift SEG.WND by `ws_shift_in` before storing into SND.WND.
+        let mut c = est_conn(1000, 5000, 1024);
+        c.ws_shift_in = 7;
+        // Simulate 5 bytes in flight.
+        c.snd.push(b"hello");
+        c.snd_nxt = c.snd_una.wrapping_add(5);
+        let seg = ParsedSegment {
+            src_port: 5000,
+            dst_port: 40000,
+            seq: 5001,
+            ack: 1006,
+            flags: TCP_ACK,
+            window: 512, // scaled form; peer means 512 << 7 = 65_536
+            header_len: 20,
+            payload: &[],
+            options: &[],
+        };
+        let _ = dispatch(&mut c, &seg);
+        assert_eq!(
+            c.snd_wnd,
+            512u32 << 7,
+            "snd_wnd must be left-shifted by ws_shift_in"
+        );
     }
 
     #[test]
