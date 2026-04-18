@@ -80,16 +80,18 @@ fn handshake_echo_close_over_tap() {
 
     let kernel_mac = read_kernel_tap_mac(TAP_IFACE);
 
-    let mut cfg = EngineConfig::default();
-    cfg.port_id = 0;
-    cfg.local_ip = OUR_IP;
-    cfg.gateway_ip = PEER_IP;
-    cfg.gateway_mac = kernel_mac;
-    cfg.tcp_mss = 1460;
-    cfg.max_connections = 8;
     // Default MSL is 30s → 2×MSL=60s before TIME_WAIT reap. The test only
     // budgets 5s for CLOSED. Use a 100ms MSL so the reaper fires fast.
-    cfg.tcp_msl_ms = 100;
+    let cfg = EngineConfig {
+        port_id: 0,
+        local_ip: OUR_IP,
+        gateway_ip: PEER_IP,
+        gateway_mac: kernel_mac,
+        tcp_mss: 1460,
+        max_connections: 8,
+        tcp_msl_ms: 100,
+        ..Default::default()
+    };
 
     let engine = Engine::new(cfg).expect("engine new");
     let our_mac = engine.our_mac();
@@ -98,7 +100,7 @@ fn handshake_echo_close_over_tap() {
     let listener = TcpListener::bind("10.99.2.1:5000").expect("listener bind");
     let (done_tx, done_rx) = mpsc::channel::<()>();
     let server = thread::spawn(move || {
-        for stream in listener.incoming() {
+        if let Some(stream) = listener.incoming().next() {
             let mut s = stream.expect("accept");
             let mut buf = [0u8; 64];
             loop {
@@ -107,7 +109,6 @@ fn handshake_echo_close_over_tap() {
                 s.write_all(&buf[..n]).unwrap();
             }
             let _ = done_tx.send(());
-            break;
         }
     });
 

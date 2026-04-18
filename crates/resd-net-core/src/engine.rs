@@ -418,7 +418,7 @@ impl Engine {
                 .filter(|h| {
                     let Some(c) = ft.get(*h) else { return false; };
                     c.state == TcpState::TimeWait
-                        && c.time_wait_deadline_ns.map_or(false, |d| now >= d)
+                        && c.time_wait_deadline_ns.is_some_and(|d| now >= d)
                 })
                 .collect()
         };

@@ -7,6 +7,7 @@
 //!   - explicit SipHash-2-4 implementation (not from std)
 //!   - `boot_nonce` from `/proc/sys/kernel/random/boot_id`
 //!   - 4µs-tick monotonic clock (A3 uses 1µs)
+//!
 //! The call signature `IssGen::next(&FourTuple)` stays the same.
 
 use std::collections::hash_map::DefaultHasher;

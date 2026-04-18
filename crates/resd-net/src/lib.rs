@@ -136,7 +136,7 @@ pub unsafe extern "C" fn resd_net_poll(
                 // last_read_buf at the event's byte_offset (Task 19 fix
                 // for multi-segment polls).
                 let ft = engine.flow_table();
-                let (data_ptr, data_len) = match ft.get(*conn as u32) {
+                let (data_ptr, data_len) = match ft.get(*conn) {
                     Some(c) => {
                         let off = *byte_offset as usize;
                         let ptr = unsafe { c.recv.last_read_buf.as_ptr().add(off) };
