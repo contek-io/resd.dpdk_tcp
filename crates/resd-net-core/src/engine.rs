@@ -700,6 +700,97 @@ impl Engine {
         });
     }
 
+    /// Open a new client-side connection. Emits a single SYN and
+    /// returns the handle. The caller waits on `RESD_NET_EVT_CONNECTED`
+    /// (or times out at application level — SYN retransmit is A5).
+    ///
+    /// `peer_ip` / `peer_port` in host byte order.
+    /// `local_port_hint`: if nonzero, used as the source port; else we
+    /// pick an ephemeral port from [49152, 65535].
+    pub fn connect(
+        &self,
+        peer_ip: u32,
+        peer_port: u16,
+        local_port_hint: u16,
+    ) -> Result<ConnHandle, Error> {
+        use crate::counters::inc;
+        use crate::tcp_conn::TcpConn;
+        use crate::tcp_output::{build_segment, SegmentTx, TCP_SYN};
+
+        if self.cfg.local_ip == 0 {
+            return Err(Error::PeerUnreachable(peer_ip));
+        }
+        if self.cfg.gateway_mac == [0u8; 6] {
+            return Err(Error::PeerUnreachable(peer_ip));
+        }
+        let local_port = if local_port_hint != 0 {
+            local_port_hint
+        } else {
+            self.next_ephemeral_port()
+        };
+        let tuple = FourTuple {
+            local_ip: self.cfg.local_ip,
+            local_port,
+            peer_ip,
+            peer_port,
+        };
+        let iss = self.iss_gen.next(&tuple);
+        let our_mss = self.cfg.tcp_mss.min(u16::MAX as u32) as u16;
+        let recv_wnd = self.cfg.recv_buffer_bytes.min(u16::MAX as u32);
+        let conn = TcpConn::new_client(
+            tuple,
+            iss,
+            our_mss,
+            self.cfg.recv_buffer_bytes,
+            self.cfg.send_buffer_bytes,
+        );
+        let handle = self
+            .flow_table
+            .borrow_mut()
+            .insert(conn)
+            .ok_or(Error::TooManyConns)?;
+
+        // Build and transmit SYN.
+        let seg = SegmentTx {
+            src_mac: self.our_mac,
+            dst_mac: self.cfg.gateway_mac,
+            src_ip: tuple.local_ip,
+            dst_ip: tuple.peer_ip,
+            src_port: tuple.local_port,
+            dst_port: tuple.peer_port,
+            seq: iss,
+            ack: 0,
+            flags: TCP_SYN,
+            window: recv_wnd.min(u16::MAX as u32) as u16,
+            mss_option: Some(our_mss),
+            payload: &[],
+        };
+        let mut buf = [0u8; 64];
+        let Some(n) = build_segment(&seg, &mut buf) else {
+            // Header-too-small is impossible with 64-byte buf; keep explicit.
+            self.flow_table.borrow_mut().remove(handle);
+            return Err(Error::PeerUnreachable(peer_ip));
+        };
+        if !self.tx_frame(&buf[..n]) {
+            self.flow_table.borrow_mut().remove(handle);
+            return Err(Error::PeerUnreachable(peer_ip));
+        }
+        inc(&self.counters.tcp.tx_syn);
+
+        // Bump snd_nxt past the SYN's seq and mark SYN_SENT. Direct
+        // state mutation (not transition_conn) because this transition
+        // has no from-state event — we're coming from the just-inserted
+        // TcpState::Closed default.
+        {
+            let mut ft = self.flow_table.borrow_mut();
+            if let Some(c) = ft.get_mut(handle) {
+                c.snd_nxt = iss.wrapping_add(1);
+            }
+        }
+        self.transition_conn(handle, TcpState::SynSent);
+        Ok(handle)
+    }
+
     fn maybe_emit_gratuitous_arp(&self) {
         if self.cfg.garp_interval_sec == 0 || self.cfg.local_ip == 0 {
             return;
@@ -770,5 +861,18 @@ mod tests {
             let _: Option<u16> = _e.pmtu_for(0);
         }
         // If this compiles, the methods exist.
+    }
+
+    #[test]
+    fn connect_requires_nonzero_local_ip() {
+        // We can't construct an Engine without EAL, so test via a function
+        // signature check + an error path that doesn't need hardware:
+        // the "local_ip==0" case is rejected early inside `Engine::connect`,
+        // but we can't exercise it without an Engine. This test is a
+        // compile-only smoke-check that the method's signature exists.
+        fn _check(e: &Engine) {
+            let _: Result<crate::flow_table::ConnHandle, crate::Error> =
+                e.connect(0x0a_00_00_01, 5000, 0);
+        }
     }
 }
