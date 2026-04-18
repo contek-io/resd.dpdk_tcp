@@ -24,4 +24,25 @@ pub enum Error {
     ProcArpRead(String),
     #[error("could not read NIC MAC for port {0}: rte_errno={1}")]
     MacAddrLookup(u16, i32),
+    #[error("too many open connections (max_connections reached)")]
+    TooManyConns,
+    #[error("invalid connection handle: {0}")]
+    InvalidConnHandle(u64),
+    #[error("peer unreachable: ip={0:#x}")]
+    PeerUnreachable(u32),
+    #[error("send buffer full for this connection")]
+    SendBufferFull,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Error;
+
+    #[test]
+    fn a3_variants_format_cleanly() {
+        assert!(format!("{}", Error::TooManyConns).contains("too many"));
+        assert!(format!("{}", Error::InvalidConnHandle(0)).contains("0"));
+        assert!(format!("{}", Error::PeerUnreachable(0xdeadbeef)).contains("deadbeef"));
+        assert!(format!("{}", Error::SendBufferFull).contains("buffer"));
+    }
 }
