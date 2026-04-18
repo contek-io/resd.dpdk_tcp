@@ -265,7 +265,11 @@
 ## Cross-phase process notes
 
 - Each per-phase plan file gets its date-prefixed name: `YYYY-MM-DD-stage1-phase-aN-<slug>.md`. Prefix with the date the plan is written, not the phase number.
-- **Every phase from A2 onward ends with an mTCP comparison review (spec §10.13).** Before the `phase-aN-complete` tag, dispatch the `mtcp-comparison-reviewer` subagent (`.claude/agents/mtcp-comparison-reviewer.md`). The subagent writes `docs/superpowers/reviews/phase-aN-mtcp-compare.md`; the human edits the Accepted-divergence section and verdict. Tag is blocked while any unresolved `[ ]` item remains in Must-fix or Missed-edge-cases. First phase to run the review (A2) also adds the `third_party/mtcp` submodule as a one-time prerequisite.
+- **Phase review gates** before the `phase-aN-complete` tag:
+  1. **mTCP comparison review (A2 onward, spec §10.13)** — dispatch `mtcp-comparison-reviewer` (`.claude/agents/mtcp-comparison-reviewer.md`); subagent writes `docs/superpowers/reviews/phase-aN-mtcp-compare.md`; human edits Accepted-divergence + verdict. First phase to run the review (A2) added `third_party/mtcp` as a one-time submodule prerequisite.
+  2. **RFC compliance review (A3 onward, spec §10.14)** — dispatch `rfc-compliance-reviewer` (`.claude/agents/rfc-compliance-reviewer.md`); subagent writes `docs/superpowers/reviews/phase-aN-rfc-compliance.md`; human edits Accepted-deviation + verdict. One-time prerequisite: `scripts/fetch-rfcs.sh` has already vendored RFC text under `docs/rfcs/`. A2 is exempt because this gate was added after A2 shipped; optionally run a retroactive A2 RFC review at A3 kickoff.
+
+  The tag is blocked while either applicable report has any unresolved `[ ]` item in its Must-fix / Missed-edge-cases / Missing-SHOULD sections.
 - After a phase ships, tag: `git tag -a phase-aN-complete -m "Phase AN: <title>"`.
 - Update the "Status" column in this file when a phase starts (→ In progress) or ships (→ Complete, link the plan file if not already there).
 - The spec at `docs/superpowers/specs/2026-04-17-dpdk-tcp-design.md` is the single source of truth for what Stage 1 actually needs. If a phase reveals a spec gap or contradiction, amend the spec first (in a separate commit), then the plan.

@@ -610,6 +610,16 @@ Every Stage 1 phase from A2 onward ends with a comparison review against mTCP as
 - **Gate:** the `phase-aN-complete` git tag cannot be placed while any unresolved `[ ]` checkbox remains in the report's Must-fix or Missed-edge-cases sections, and every Accepted-divergence entry must carry a concrete spec-section or memory-file citation.
 - **Invocation:** each phase's sign-off task lists the review as an explicit step before the commit + tag step. Inputs to the subagent are the phase number, the phase plan path, the phase-scoped git diff, the spec §refs the phase claims to cover, and the mTCP focus areas (specific `mtcp/src/*.c` files corresponding to this phase's functionality).
 
+### 10.14 Per-phase RFC compliance review (Stage 1 process gate)
+
+A second review gate, parallel to §10.13, verifies each phase's implementation against the specific RFC clauses the phase claims to cover. Effective from **Phase A3 onward** — the gate was added after A2 shipped, so A2 is exempt (A2's mTCP gate ran; its RFC review is deferred or folded into a one-time retroactive check at A3 kickoff at the user's discretion). Scope is MUST/SHALL violations (→ Must-fix), SHOULDs not covered by the spec §6.4 deviation allowlist (→ Missing-SHOULD), and accepted deviations for §6.4 entries (→ Accepted-deviation). Informational RFC notes and clauses deferred to later phases go under FYI.
+
+- **Source of truth:** RFC text files vendored in `docs/rfcs/rfcNNNN.txt`, fetched once via `scripts/fetch-rfcs.sh` and committed in-tree. Citations are stable line refs into these files; the reviewer does not fetch RFCs from the network. Obsoleted RFCs (793, 1323, 2581) are kept for historical reference; the reviewer prefers the current RFC in each pair unless a specific clause only exists in the older one.
+- **Mechanism:** a project-local subagent at `.claude/agents/rfc-compliance-reviewer.md` performs the check and emits `docs/superpowers/reviews/phase-aN-rfc-compliance.md` in a schema matching §10.13's (Must-fix / Missing-SHOULD / Accepted-deviation / FYI / Verdict).
+- **Scope bounding:** the reviewer uses the phase plan's "Spec reference" line and the spec §6.3 RFC matrix as the checklist, not an end-to-end RFC read. Clauses scoped to later phases are not flagged.
+- **Gate:** identical rule to §10.13 — the `phase-aN-complete` git tag is blocked while any unresolved `[ ]` item remains in Must-fix or Missing-SHOULD, and each Accepted-deviation entry must cite a concrete line in spec §6.4.
+- **Invocation:** each phase's sign-off task runs this review as a separate step after the mTCP review and before the roadmap-update / commit / tag steps.
+
 ## 11. Benchmark Plan
 
 Goal: quantify latency and stability under trading-representative workloads, catch regressions per-commit, and establish defensible comparisons against Linux TCP as the reference baseline. Performance is verified separately from correctness (§10) — both must pass for a stage ship.
