@@ -23,6 +23,7 @@ pub mod tcp_rtt;
 pub mod tcp_sack;
 pub mod tcp_seq;
 pub mod tcp_state;
+pub(crate) mod tcp_timer_wheel;
 
 pub use error::Error;
 
