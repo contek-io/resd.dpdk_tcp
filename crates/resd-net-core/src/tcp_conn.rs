@@ -38,12 +38,15 @@ impl SendQueue {
     }
 }
 
-/// Per-connection receive buffer. A3 holds contiguous in-order bytes only.
-/// Out-of-order segments are dropped (counted); A4 replaces this with a
-/// reassembly list.
+/// Per-connection receive buffer. A4 co-locates the out-of-order
+/// reassembly queue (`reorder`) with the in-order ring (`bytes`); both
+/// share the same cap, so `free_space_total` reports combined room.
 pub struct RecvQueue {
     pub bytes: VecDeque<u8>,
     pub cap: u32,
+    /// A4: out-of-order segments buffered past the in-order point.
+    /// Shares `cap` with `bytes`; `free_space_total` reports combined room.
+    pub reorder: crate::tcp_reassembly::ReorderQueue,
     /// Scratch buffer for the borrow-view exposed to
     /// `RESD_NET_EVT_READABLE.data`. Cleared at the start of each
     /// `resd_net_poll` on the owning engine (not here).
@@ -55,17 +58,26 @@ impl RecvQueue {
         Self {
             bytes: VecDeque::with_capacity(cap as usize),
             cap,
+            reorder: crate::tcp_reassembly::ReorderQueue::new(cap),
             last_read_buf: Vec::new(),
         }
     }
 
+    /// In-order free-space only (matches A3's semantic).
     pub fn free_space(&self) -> u32 {
         self.cap.saturating_sub(self.bytes.len() as u32)
     }
 
-    /// Append `payload` to the receive queue, up to free space.
+    /// Combined free-space across in-order bytes + reorder queue.
+    pub fn free_space_total(&self) -> u32 {
+        self.cap
+            .saturating_sub(self.bytes.len() as u32)
+            .saturating_sub(self.reorder.total_bytes())
+    }
+
+    /// Append `payload` to the in-order queue, up to in-order free-space.
     /// Returns the number of bytes accepted (may be < payload.len() if
-    /// the queue would overflow).
+    /// the in-order half would overflow).
     pub fn append(&mut self, payload: &[u8]) -> u32 {
         let take = payload.len().min(self.free_space() as usize);
         self.bytes.extend(&payload[..take]);
@@ -246,6 +258,15 @@ mod tests {
         assert!(!c.fin_has_been_acked(200));
         assert!(c.fin_has_been_acked(201));
         assert!(c.fin_has_been_acked(500));
+    }
+
+    #[test]
+    fn recv_queue_has_reorder_field_and_shares_cap() {
+        let rq = RecvQueue::new(1024);
+        assert_eq!(rq.cap, 1024);
+        assert!(rq.reorder.is_empty());
+        assert_eq!(rq.reorder.total_bytes(), 0);
+        assert_eq!(rq.free_space_total(), 1024);
     }
 
     #[test]
