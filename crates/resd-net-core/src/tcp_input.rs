@@ -490,7 +490,9 @@ mod tests {
             ack: 200,
             flags,
             window: 65535,
-            mss_option: mss,
+            options: crate::tcp_options::TcpOpts {
+                mss, ..Default::default()
+            },
             payload,
         };
         let mut out = vec![0u8; 256];

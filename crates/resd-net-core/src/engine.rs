@@ -692,7 +692,7 @@ impl Engine {
             ack: conn.rcv_nxt,
             flags: TCP_ACK,
             window,
-            mss_option: None,
+            options: crate::tcp_options::TcpOpts::default(),
             payload: &[],
         };
         let mut buf = [0u8; 64];
@@ -719,7 +719,7 @@ impl Engine {
             ack,
             flags: TCP_RST | TCP_ACK,
             window: 0,
-            mss_option: None,
+            options: crate::tcp_options::TcpOpts::default(),
             payload: &[],
         };
         let mut buf = [0u8; 64];
@@ -750,7 +750,7 @@ impl Engine {
             ack: 0,
             flags: TCP_RST, // no ACK flag
             window: 0,
-            mss_option: None,
+            options: crate::tcp_options::TcpOpts::default(),
             payload: &[],
         };
         let mut buf = [0u8; 64];
@@ -786,7 +786,7 @@ impl Engine {
             src_ip: tuple.local_ip, dst_ip: tuple.peer_ip,
             src_port: tuple.local_port, dst_port: tuple.peer_port,
             seq, ack, flags, window: 0,
-            mss_option: None, payload: &[],
+            options: crate::tcp_options::TcpOpts::default(), payload: &[],
         };
         let mut buf = [0u8; 64];
         let Some(n) = build_segment(&seg, &mut buf) else { return; };
@@ -892,7 +892,7 @@ impl Engine {
             ack: 0,
             flags: TCP_SYN,
             window: recv_wnd.min(u16::MAX as u32) as u16,
-            mss_option: Some(our_mss),
+            options: crate::tcp_options::TcpOpts { mss: Some(our_mss), ..Default::default() },
             payload: &[],
         };
         let mut buf = [0u8; 64];
@@ -967,7 +967,7 @@ impl Engine {
                 ack: rcv_nxt,
                 flags: TCP_ACK | TCP_PSH,
                 window: rcv_wnd.min(u16::MAX as u32) as u16,
-                mss_option: None,
+                options: crate::tcp_options::TcpOpts::default(),
                 payload,
             };
             if frame.len() < crate::tcp_output::FRAME_HDRS_MIN + take {
@@ -1038,7 +1038,7 @@ impl Engine {
             ack: rcv_nxt,
             flags: TCP_ACK | TCP_FIN,
             window: rcv_wnd.min(u16::MAX as u32) as u16,
-            mss_option: None,
+            options: crate::tcp_options::TcpOpts::default(),
             payload: &[],
         };
         let mut buf = [0u8; 64];

@@ -1,31 +1,29 @@
 //! TCP segment builders. Every builder emits a complete Ethernet + IPv4 +
-//! TCP frame, ready to hand to `Engine::tx_frame` for burst TX. We compute
-//! both the IPv4 header checksum (software — later phases will flip to NIC
-//! offload) and the TCP pseudo-header checksum per RFC 9293 §3.1.
+//! TCP frame with optional TCP options (MSS / WS / SACK-permitted / TS /
+//! SACK blocks). IPv4 header checksum is computed in software; TCP
+//! checksum uses the pseudo-header form per RFC 9293 §3.1.
 //!
-//! No TCP options beyond MSS (2-byte NOP-pad appended to keep the header a
-//! multiple of 4 bytes). WSCALE / TS / SACK-permitted land in Phase A4.
+//! Option encoding is delegated to `tcp_options::TcpOpts::encode` (canonical
+//! order + NOP-word-alignment).
 
 use crate::l2::{ETHERTYPE_IPV4, ETH_HDR_LEN};
 use crate::l3_ip::{internet_checksum, IPPROTO_TCP};
+use crate::tcp_options::TcpOpts;
 
 pub const TCP_HDR_MIN: usize = 20;
 pub const IPV4_HDR_MIN: usize = 20;
-pub const FRAME_HDRS_MIN: usize = ETH_HDR_LEN + IPV4_HDR_MIN + TCP_HDR_MIN; // 54
+pub const FRAME_HDRS_MIN: usize = ETH_HDR_LEN + IPV4_HDR_MIN + TCP_HDR_MIN;
 
-// TCP flag bits.
 pub const TCP_FIN: u8 = 0x01;
 pub const TCP_SYN: u8 = 0x02;
 pub const TCP_RST: u8 = 0x04;
 pub const TCP_PSH: u8 = 0x08;
 pub const TCP_ACK: u8 = 0x10;
 
-/// One-segment fields the caller controls. `payload` is appended after
-/// the header (possibly empty).
 pub struct SegmentTx<'a> {
     pub src_mac: [u8; 6],
     pub dst_mac: [u8; 6],
-    pub src_ip: u32,  // host byte order
+    pub src_ip: u32,
     pub dst_ip: u32,
     pub src_port: u16,
     pub dst_port: u16,
@@ -33,20 +31,16 @@ pub struct SegmentTx<'a> {
     pub ack: u32,
     pub flags: u8,
     pub window: u16,
-    pub mss_option: Option<u16>,  // Some(mss) → append MSS option on SYN
+    /// Any combination of options; use `TcpOpts::default()` for none.
+    pub options: TcpOpts,
     pub payload: &'a [u8],
 }
 
-/// Write the frame into `out`, returning the number of bytes written,
-/// or `None` if `out` is too small. Minimum output size is
-/// `FRAME_HDRS_MIN + mss_option.map_or(0, |_| 4) + payload.len()`.
 pub fn build_segment(seg: &SegmentTx, out: &mut [u8]) -> Option<usize> {
-    let opts_len = if seg.mss_option.is_some() { 4 } else { 0 };
+    let opts_len = seg.options.encoded_len();
     let tcp_hdr_len = TCP_HDR_MIN + opts_len;
     let total = ETH_HDR_LEN + IPV4_HDR_MIN + tcp_hdr_len + seg.payload.len();
-    if out.len() < total {
-        return None;
-    }
+    if out.len() < total { return None; }
 
     // Ethernet
     out[0..6].copy_from_slice(&seg.dst_mac);
@@ -57,14 +51,14 @@ pub fn build_segment(seg: &SegmentTx, out: &mut [u8]) -> Option<usize> {
     let ip_start = ETH_HDR_LEN;
     let ip = &mut out[ip_start..ip_start + IPV4_HDR_MIN];
     let total_ip_len = (IPV4_HDR_MIN + tcp_hdr_len + seg.payload.len()) as u16;
-    ip[0] = 0x45; // ver=4, IHL=5
+    ip[0] = 0x45;
     ip[1] = 0x00;
     ip[2..4].copy_from_slice(&total_ip_len.to_be_bytes());
-    ip[4..6].copy_from_slice(&0x0000u16.to_be_bytes()); // identification
-    ip[6..8].copy_from_slice(&0x4000u16.to_be_bytes()); // flags=DF, frag_off=0
-    ip[8] = 64; // TTL
+    ip[4..6].copy_from_slice(&0x0000u16.to_be_bytes());
+    ip[6..8].copy_from_slice(&0x4000u16.to_be_bytes());
+    ip[8] = 64;
     ip[9] = IPPROTO_TCP;
-    ip[10..12].copy_from_slice(&0x0000u16.to_be_bytes()); // csum placeholder
+    ip[10..12].copy_from_slice(&0x0000u16.to_be_bytes());
     ip[12..16].copy_from_slice(&seg.src_ip.to_be_bytes());
     ip[16..20].copy_from_slice(&seg.dst_ip.to_be_bytes());
     let ip_csum = internet_checksum(&out[ip_start..ip_start + IPV4_HDR_MIN]);
@@ -78,27 +72,23 @@ pub fn build_segment(seg: &SegmentTx, out: &mut [u8]) -> Option<usize> {
     th[2..4].copy_from_slice(&seg.dst_port.to_be_bytes());
     th[4..8].copy_from_slice(&seg.seq.to_be_bytes());
     th[8..12].copy_from_slice(&seg.ack.to_be_bytes());
-    th[12] = ((tcp_hdr_len / 4) as u8) << 4; // data offset
+    th[12] = ((tcp_hdr_len / 4) as u8) << 4;
     th[13] = seg.flags;
     th[14..16].copy_from_slice(&seg.window.to_be_bytes());
-    th[16..18].copy_from_slice(&0u16.to_be_bytes()); // csum placeholder
-    th[18..20].copy_from_slice(&0u16.to_be_bytes()); // urgent ptr
-    if let Some(mss) = seg.mss_option {
-        // MSS option: kind=2, len=4, 2-byte value.
-        th[20] = 2;
-        th[21] = 4;
-        th[22..24].copy_from_slice(&mss.to_be_bytes());
+    th[16..18].copy_from_slice(&0u16.to_be_bytes());
+    th[18..20].copy_from_slice(&0u16.to_be_bytes());
+    if opts_len > 0 {
+        seg.options
+            .encode(&mut th[TCP_HDR_MIN..TCP_HDR_MIN + opts_len])
+            .expect("pre-sized exactly; encode must fit");
     }
-    // Copy payload
+
     let payload_start = tcp_start + tcp_hdr_len;
     out[payload_start..payload_start + seg.payload.len()].copy_from_slice(seg.payload);
 
-    // Compute TCP checksum over pseudo-header + TCP header + payload.
     let tcp_seg_len = (tcp_hdr_len + seg.payload.len()) as u32;
     let csum = tcp_checksum(
-        seg.src_ip,
-        seg.dst_ip,
-        tcp_seg_len,
+        seg.src_ip, seg.dst_ip, tcp_seg_len,
         &out[tcp_start..payload_start + seg.payload.len()],
     );
     out[tcp_start + 16] = (csum >> 8) as u8;
@@ -138,7 +128,9 @@ mod tests {
             ack: 0,
             flags: TCP_SYN,
             window: 65535,
-            mss_option: Some(1460),
+            options: crate::tcp_options::TcpOpts {
+                mss: Some(1460), ..Default::default()
+            },
             payload: &[],
         }
     }
@@ -173,7 +165,7 @@ mod tests {
         let mut seg = base();
         let payload = b"HELLO";
         seg.flags = TCP_ACK | TCP_PSH;
-        seg.mss_option = None;
+        seg.options = crate::tcp_options::TcpOpts::default();
         seg.payload = payload;
         let mut out = [0u8; 128];
         let n = build_segment(&seg, &mut out).unwrap();
@@ -200,7 +192,7 @@ mod tests {
     fn rst_frame_has_rst_flag_and_no_options() {
         let mut seg = base();
         seg.flags = TCP_RST | TCP_ACK;
-        seg.mss_option = None;
+        seg.options = crate::tcp_options::TcpOpts::default();
         let mut out = [0u8; 64];
         let n = build_segment(&seg, &mut out).unwrap();
         assert_eq!(n, 54);
