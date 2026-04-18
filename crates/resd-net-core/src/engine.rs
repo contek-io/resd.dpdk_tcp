@@ -735,7 +735,24 @@ impl Engine {
         self.retransmit(handle, 0);
         crate::counters::inc(&self.counters.tcp.tx_rto);
 
-        // Task 13 inserts the max-retrans-count check here.
+        // Task 13: max-retrans-count check. `retransmit()` above bumped
+        // `xmit_count` on the front entry; once it crosses the budget we
+        // abandon the connection with ETIMEDOUT. A hardcoded constant
+        // here; Task 21 plumbs this through engine config.
+        const TCP_MAX_RETRANS_COUNT: u16 = 15;
+        let xmit_count = {
+            let ft = self.flow_table.borrow();
+            ft.get(handle)
+                .and_then(|c| c.snd_retrans.front())
+                .map(|e| e.xmit_count)
+                .unwrap_or(0)
+        };
+        if xmit_count > TCP_MAX_RETRANS_COUNT {
+            crate::counters::inc(&self.counters.tcp.conn_timeout_retrans);
+            self.force_close_etimedout(handle);
+            return;
+        }
+
         // Task 20 inserts the RESD_NET_EVT_TCP_RETRANS emission here.
 
         // Phase 4: apply backoff unless per-connect opt-out.
@@ -776,6 +793,75 @@ impl Engine {
                 c.timer_ids.push(id);
             }
         }
+    }
+
+    /// A5 Task 13: force-close a connection due to RTO or SYN-retransmit
+    /// budget exhaustion. Unlike `close_conn` (which sends a FIN), this
+    /// does no wire-level sending — the peer is either unresponsive or
+    /// has no listener. Drains `snd_retrans` (frees held mbufs via
+    /// `rte_pktmbuf_free`), cancels all conn timers (`timer_ids` plus
+    /// the three named handles `rto_timer_id` / `tlp_timer_id` /
+    /// `syn_retrans_timer_id`), transitions to CLOSED, emits
+    /// `Error` + `Closed` (err = -ETIMEDOUT), removes the conn slot.
+    ///
+    /// Borrow discipline (no nested borrows across phases):
+    /// P1 mut flow_table → drain + take + snapshot; P2 FFI free (no
+    /// borrows); P3 mut timer_wheel; P4 mut events; P5 mut flow_table.
+    /// Each phase's borrow ends at the block's closing `}`.
+    pub(crate) fn force_close_etimedout(&self, handle: ConnHandle) {
+        // Phase 1: snapshot timer ids + drain snd_retrans mbufs.
+        let (timer_ids_to_cancel, dropped_entries) = {
+            let mut ft = self.flow_table.borrow_mut();
+            let Some(conn) = ft.get_mut(handle) else {
+                return;
+            };
+            let mut ids: Vec<crate::tcp_timer_wheel::TimerId> = conn.timer_ids.to_vec();
+            if let Some(id) = conn.rto_timer_id.take() {
+                ids.push(id);
+            }
+            if let Some(id) = conn.tlp_timer_id.take() {
+                ids.push(id);
+            }
+            if let Some(id) = conn.syn_retrans_timer_id.take() {
+                ids.push(id);
+            }
+            conn.timer_ids.clear();
+            let entries: Vec<crate::tcp_retrans::RetransEntry> =
+                conn.snd_retrans.entries.drain(..).collect();
+            conn.state = TcpState::Closed;
+            (ids, entries)
+        };
+        // Phase 2: free mbufs (outside any RefCell borrow).
+        for entry in dropped_entries {
+            unsafe {
+                sys::resd_rte_pktmbuf_free(entry.mbuf.as_ptr());
+            }
+        }
+        // Phase 3: cancel timers. `cancel()` is idempotent so overlap
+        // between `timer_ids` and the three named handles is benign.
+        {
+            let mut w = self.timer_wheel.borrow_mut();
+            for id in timer_ids_to_cancel {
+                w.cancel(id);
+            }
+        }
+        // Phase 4: push Error + Closed events (both carry -ETIMEDOUT;
+        // the C ABI boundary translates the negative errno in Task 20).
+        // `libc::ETIMEDOUT` is already `i32` on Linux — no cast needed.
+        {
+            let mut ev = self.events.borrow_mut();
+            ev.push(InternalEvent::Error {
+                conn: handle,
+                err: -libc::ETIMEDOUT,
+            });
+            ev.push(InternalEvent::Closed {
+                conn: handle,
+                err: -libc::ETIMEDOUT,
+            });
+        }
+        // Phase 5: remove from flow_table.
+        self.flow_table.borrow_mut().remove(handle);
+        crate::counters::inc(&self.counters.tcp.conn_close);
     }
 
     /// Walk the flow table and move any TIME_WAIT connection past its
@@ -2279,6 +2365,16 @@ mod tests {
             id: crate::tcp_timer_wheel::TimerId,
         ) {
             e.on_rto_fire(h, id);
+        }
+    }
+
+    // Task 13: `force_close_etimedout` signature compile-check. Body
+    // coverage via Task 28 TAP integration (RTO budget-exhaustion end-
+    // to-end). The method is pub(crate) so this test can reference it.
+    #[test]
+    fn force_close_etimedout_signature_exists() {
+        fn _check(e: &Engine, h: crate::flow_table::ConnHandle) {
+            e.force_close_etimedout(h);
         }
     }
 

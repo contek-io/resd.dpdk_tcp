@@ -119,6 +119,24 @@ pub struct TcpCounters {
     /// 11×11 state transition matrix, indexed [from][to] where from/to are
     /// `TcpState as u8`. Per spec §9.1. Unused cells stay at zero.
     pub state_trans: [[AtomicU64; 11]; 11],
+    // A5 additions (slow-path only; hot-path additions need compile-time
+    // feature gate per spec §9.1.1).
+    /// Task 13: data-retransmit budget exhausted → conn ETIMEDOUT.
+    pub conn_timeout_retrans: AtomicU64,
+    /// Task 18: SYN retransmit budget exhausted → conn ETIMEDOUT.
+    pub conn_timeout_syn_sent: AtomicU64,
+    /// Task 26 (from Task 11): RTT sample taken (TS or Karn's).
+    pub rtt_samples: AtomicU64,
+    /// Task 15: RACK detect-lost identified a segment as lost.
+    pub tx_rack_loss: AtomicU64,
+    /// Task 19 diagnostic: conn has rack_aggressive=true.
+    pub rack_reo_wnd_override_active: AtomicU64,
+    /// Task 19 diagnostic: conn has rto_no_backoff=true.
+    pub rto_no_backoff_active: AtomicU64,
+    /// Task 22: peer offered WS>14; clamped to 14 per RFC 7323 §2.3.
+    pub rx_ws_shift_clamped: AtomicU64,
+    /// Task 16: DSACK observed (RFC 2883; visibility only).
+    pub rx_dsack: AtomicU64,
     _pad: [u64; 1],
 }
 
@@ -381,5 +399,25 @@ mod tests {
         assert_eq!(c.tcp.tx_window_update.load(Ordering::Relaxed), 0);
         assert_eq!(c.tcp.conn_table_full.load(Ordering::Relaxed), 0);
         assert_eq!(c.tcp.conn_time_wait_reaped.load(Ordering::Relaxed), 0);
+    }
+
+    /// A5 pre-declared slow-path fields. Task 13 wires
+    /// `conn_timeout_retrans`; the rest are wired in later A5 tasks
+    /// (15/16/18/19/22/26) but the fields live here now to avoid
+    /// re-touching counters.rs on every task.
+    #[test]
+    fn a5_new_tcp_counters_exist_and_zero() {
+        let c = Counters::new();
+        assert_eq!(c.tcp.conn_timeout_retrans.load(Ordering::Relaxed), 0);
+        assert_eq!(c.tcp.conn_timeout_syn_sent.load(Ordering::Relaxed), 0);
+        assert_eq!(c.tcp.rtt_samples.load(Ordering::Relaxed), 0);
+        assert_eq!(c.tcp.tx_rack_loss.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            c.tcp.rack_reo_wnd_override_active.load(Ordering::Relaxed),
+            0
+        );
+        assert_eq!(c.tcp.rto_no_backoff_active.load(Ordering::Relaxed), 0);
+        assert_eq!(c.tcp.rx_ws_shift_clamped.load(Ordering::Relaxed), 0);
+        assert_eq!(c.tcp.rx_dsack.load(Ordering::Relaxed), 0);
     }
 }
