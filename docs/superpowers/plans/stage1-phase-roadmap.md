@@ -17,6 +17,7 @@
 | A3 | TCP handshake + basic data transfer | **Complete** ✓ | `2026-04-18-stage1-phase-a3-tcp-basic.md` |
 | A4 | TCP options + PAWS + reassembly + SACK scoreboard | **Complete** ✓ | `2026-04-18-stage1-phase-a4-options-paws-reassembly-sack.md` |
 | A5 | RACK-TLP + RTO + retransmit + ISS | Not started | — |
+| A5.5 | Event-log forensics (emission-time ts, queue overflow counter, send-state getter) | Not started | — |
 | A-HW | ENA hardware offload enablement (LLQ verify + TX/RX checksum + MBUF_FAST_FREE + RSS-hash plumbing) | Not started | — |
 | A6 | Public API surface completeness | Not started | — |
 | A7 | Loopback test server + packetdrill-shim | Not started | — |
@@ -183,6 +184,38 @@
 **Dependencies:** A4.
 
 **Rough scale:** ~20 tasks.
+
+---
+
+## A5.5 — Event-log forensics + in-flight introspection
+
+**Numbering note:** Inserted after A5 as a focused forensics pack driven by the order-entry post-mortem use case. Uses the decimal "A5.5" tag (rather than bumping A-HW/A6+) because the scope is genuinely downstream of A5 (extends A5's event producers) and independent of both A-HW (no offload overlap) and A6 (no API-surface overlap beyond a small slow-path getter). Can run serially after A5 or in parallel with A-HW.
+
+**Goal:** Close three forensics gaps identified during A5 design review: (1) `enqueued_ts_ns` is currently sampled at poll-drain time rather than event-emission time (±poll-interval skew); (2) event queue is unbounded with no overflow visibility; (3) `snd_una`/`snd_nxt`/`snd_wnd` are not readable by the application. All three are small, slow-path, observability-only changes — no wire behavior moves.
+
+**Spec refs:** §4 (public API surface addition), §4.2 (event-queue contract), §9.1 (counters), §9.3 (events).
+
+**Deliverables:**
+
+- `InternalEvent::emitted_ts_ns` field on every event variant, sampled at push time inside the engine (not at drain in `resd_net_poll`). `resd_net_event_t::enqueued_ts_ns` semantic tightens from "drain time" to "emission time" — field name unchanged, doc comment updated. Eliminates ±poll-interval skew (up to tens of µs at realistic poll rates) on every event's apparent time.
+- `EventQueue` soft cap + drop-oldest policy on overflow. New slow-path counters `obs.events_dropped` (count of events discarded from the front) and `obs.events_queue_high_water` (latched max observed depth). New engine config field `event_queue_soft_cap` (u32, default 4096, min 64). Preserves "don't silently accumulate" without introducing head-of-line blocking on the producer side.
+- New extern "C" function `resd_net_conn_send_state(engine, conn, out) → i32` returning `{ snd_una, snd_nxt, snd_wnd, send_buf_bytes_pending, send_buf_bytes_free }`. Enables per-order forensics tagging: "bytes in flight at send time." Slow-path; safe per-order, not per-segment.
+- New `obs` counter group in `counters.rs` for engine-internal observability signals.
+- Integration tests on TAP pair: emission-time correctness, overflow behavior (including that drained events are the most-recent, not the oldest), send-state getter under backpressure, `-ENOENT` on stale handle.
+
+**Does NOT include:**
+- Any wire-behavior change, retransmit/FSM adjustment, or RFC clause touched. A5.5 is strictly observability.
+- Event-queue-overflow events (i.e., emitting a new event on overflow) — per `feedback_observability_primitives_only.md` the counter + high-water pair is sufficient; app polls counters.
+- `events_pending` live-depth gauge — intentionally deferred; revisit if A8 counter-coverage audit shows it's wanted.
+- Persistent/ring-buffered event log — app owns persistence. A5.5 just keeps the in-engine FIFO honest.
+- Changes to `rx_hw_ts_ns` semantics (owned by A-HW).
+- WRITABLE event / timer API (owned by A6).
+
+**Dependencies:** A5 (extends A5's event producer call sites for retransmit / loss-detected / ETIMEDOUT). **Independent of A-HW** — no shared files; can run in parallel.
+
+**Ship gate:** `phase-a5-5-complete` tag requires (a) all integration tests green, (b) mTCP review report landed (expected brief / no ADs — scope difference not behavioral), (c) RFC compliance review landed (expected trivial — no wire behavior).
+
+**Rough scale:** ~6–8 tasks. See `docs/superpowers/specs/2026-04-18-stage1-phase-a5-5-event-log-forensics-design.md` §9.
 
 ---
 
@@ -417,7 +450,8 @@ docs/
 │   ├── 09-counters.md            Every counter from §9.1 — meaning, expected steady-state, red-flag patterns
 │   ├── 10-events.md              Every event from §9.2 — when emitted, payload semantics, ordering guarantees
 │   ├── 11-limitations.md         Wire-compat subset vs Linux, RFCs not implemented (index into phase RFC reviews), TIME_WAIT, stage bounds
-│   └── 12-troubleshooting.md     "No SYN-ACK", "peer window zero", "stuck in SYN_SENT", "RST on unmatched", "TIME_WAIT exhaustion" — counter-symptom driven
+│   ├── 12-troubleshooting.md     "No SYN-ACK", "peer window zero", "stuck in SYN_SENT", "RST on unmatched", "TIME_WAIT exhaustion" — counter-symptom driven
+│   └── 13-order-entry-telemetry.md  Playbook for trading apps: how to tag every outbound order with stack-state snapshots (counters + `resd_net_conn_send_state`) and the event log, then reconstruct what happened during congestion episodes. Complements 09-counters (dictionary) and 10-events (dictionary) with end-to-end recipes. Sections: (a) per-order telemetry pattern — pre-send + on-ACK counter snapshot, `snd_nxt` / `snd_wnd` / `send_buf_bytes_pending` tagging, event-log capture; (b) congestion-episode reconstruction — the six canonical patterns (`rx_zero_window↑` = peer/exchange slow, `send_buf_full↑` + partial send = our buffer saturating, `tx_rto↑` / `tx_rack_loss↑` (A5) = path loss, `rx_dup_ack↑` + high `rx_sack_blocks` = reorder not loss, `conn_timeout_retrans↑` = session dying, `tx_zero_window↑` + `recv_buf_drops↑` = our consumer slow), each with a concrete counter+event trace and the "what to do about it" action (reconnect, parallel connection, `rack_aggressive=true`, app-side pacing); (c) aggressive-retry strategies the library's primitives enable but do not implement (parallel sockets, duplicate-clOrdID across connections, A5's `rto_no_backoff`), with explicit notes on where stack ends and app orchestration begins; (d) the `obs.events_dropped` / `obs.events_queue_high_water` signal (A5.5) and what it means when nonzero during an episode. Worked example from a simulated stall: raw counter-snapshot stream + event log reconstructed into a human-readable timeline.
 │
 ├── maintainer-guide/
 │   ├── README.md                 Index + reading order for new maintainers
@@ -464,7 +498,7 @@ docs/
 
 **Dependencies:** A11 complete (ship report is the source for several sections in `future-work/`).
 
-**Rough scale:** ~12 tasks — 3 for the user-guide tree (index + 12 sections grouped into ~3 commits by theme: overview/build/lifecycle, config/threading/send-recv/close, errors/counters/events/limitations/troubleshooting), 4 for the maintainer-guide tree (architecture+invariants, state+options+flow+timers+iss+mempool, ffi+tests+bench, reviews+debugging+conventions), 2 for the future-work tree (reviews-consolidation + remainder), 1 for the TODO-audit script, 1 for root README+CHANGELOG refresh, 1 for the tag.
+**Rough scale:** ~13 tasks — 4 for the user-guide tree (index + 13 sections grouped into ~4 commits by theme: overview/build/lifecycle, config/threading/send-recv/close, errors/counters/events/limitations/troubleshooting, and a dedicated commit for 13-order-entry-telemetry given it pulls together counter + event + send-state material into a trading-specific forensics playbook with a worked example), 4 for the maintainer-guide tree (architecture+invariants, state+options+flow+timers+iss+mempool, ffi+tests+bench, reviews+debugging+conventions), 2 for the future-work tree (reviews-consolidation + remainder), 1 for the TODO-audit script, 1 for root README+CHANGELOG refresh, 1 for the tag.
 
 ---
 
