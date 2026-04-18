@@ -127,6 +127,98 @@ impl TcpOpts {
     }
 }
 
+/// Errors from `parse_options`. Every variant maps to one `tcp.rx_bad_option`
+/// bump on the caller side.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OptionParseError {
+    /// `optlen < 2` on an unknown option kind (would underflow advance).
+    ShortUnknown,
+    /// `optlen` on a known-kind doesn't match the RFC value.
+    BadKnownLen,
+    /// Option would extend past the end of the options region.
+    Truncated,
+    /// SACK block count isn't in 1..=MAX_SACK_BLOCKS_EMIT (zero blocks
+    /// or too many).
+    BadSackBlockCount,
+}
+
+/// Parse TCP options per RFC 9293 §3.1. Returns the fully populated
+/// `TcpOpts`; unknown option kinds are skipped by their declared length
+/// (with the defensive `optlen >= 2` check that mTCP's `ParseTCPOptions`
+/// lacks, see the mTCP I-6 note in A3's review).
+pub fn parse_options(opts: &[u8]) -> Result<TcpOpts, OptionParseError> {
+    let mut out = TcpOpts::default();
+    let mut i = 0usize;
+    while i < opts.len() {
+        match opts[i] {
+            OPT_END => return Ok(out),
+            OPT_NOP => { i += 1; continue; }
+            kind => {
+                if i + 1 >= opts.len() {
+                    return Err(OptionParseError::Truncated);
+                }
+                let olen = opts[i + 1] as usize;
+                if olen < 2 {
+                    return Err(OptionParseError::ShortUnknown);
+                }
+                if i + olen > opts.len() {
+                    return Err(OptionParseError::Truncated);
+                }
+                match kind {
+                    OPT_MSS => {
+                        if olen != LEN_MSS as usize {
+                            return Err(OptionParseError::BadKnownLen);
+                        }
+                        out.mss = Some(u16::from_be_bytes([opts[i+2], opts[i+3]]));
+                    }
+                    OPT_WSCALE => {
+                        if olen != LEN_WSCALE as usize {
+                            return Err(OptionParseError::BadKnownLen);
+                        }
+                        out.wscale = Some(opts[i+2]);
+                    }
+                    OPT_SACK_PERMITTED => {
+                        if olen != LEN_SACK_PERMITTED as usize {
+                            return Err(OptionParseError::BadKnownLen);
+                        }
+                        out.sack_permitted = true;
+                    }
+                    OPT_TIMESTAMP => {
+                        if olen != LEN_TIMESTAMP as usize {
+                            return Err(OptionParseError::BadKnownLen);
+                        }
+                        let tsval = u32::from_be_bytes([opts[i+2], opts[i+3], opts[i+4], opts[i+5]]);
+                        let tsecr = u32::from_be_bytes([opts[i+6], opts[i+7], opts[i+8], opts[i+9]]);
+                        out.timestamps = Some((tsval, tsecr));
+                    }
+                    OPT_SACK => {
+                        // len = 2 (hdr) + 8 * N, N in 1..=4.
+                        let block_bytes = olen.saturating_sub(2);
+                        if block_bytes == 0 || !block_bytes.is_multiple_of(8) || block_bytes / 8 > 4 {
+                            return Err(OptionParseError::BadSackBlockCount);
+                        }
+                        // Store as many as fit in our fixed-size array; drop
+                        // the excess silently (RFC-legal since SACK blocks
+                        // are advisory for the sender).
+                        let mut bi = i + 2;
+                        for _ in 0..(block_bytes / 8) {
+                            let left = u32::from_be_bytes([opts[bi], opts[bi+1], opts[bi+2], opts[bi+3]]);
+                            let right = u32::from_be_bytes([opts[bi+4], opts[bi+5], opts[bi+6], opts[bi+7]]);
+                            out.push_sack_block(SackBlock { left, right });
+                            bi += 8;
+                        }
+                    }
+                    _ => {
+                        // Unknown kind — skip by len. olen ≥ 2 guaranteed above.
+                    }
+                }
+                i += olen;
+            }
+        }
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 #[allow(clippy::field_reassign_with_default)]
 mod tests {
@@ -200,5 +292,123 @@ mod tests {
         assert!(opts.push_sack_block(SackBlock { left: 4, right: 5 }));
         assert!(!opts.push_sack_block(SackBlock { left: 6, right: 7 }));
         assert_eq!(opts.sack_block_count, 3);
+    }
+
+    #[test]
+    fn parse_empty_options_returns_default() {
+        let opts = parse_options(&[]).unwrap();
+        assert_eq!(opts.mss, None);
+        assert_eq!(opts.wscale, None);
+        assert!(!opts.sack_permitted);
+        assert_eq!(opts.timestamps, None);
+        assert_eq!(opts.sack_block_count, 0);
+    }
+
+    #[test]
+    fn parse_end_short_circuits() {
+        let bytes = [OPT_MSS, LEN_MSS, 0x05, 0xb4, OPT_END, 0xff, 0xff];
+        let opts = parse_options(&bytes).unwrap();
+        assert_eq!(opts.mss, Some(1460));
+    }
+
+    #[test]
+    fn parse_nop_advances_one_byte() {
+        let bytes = [OPT_NOP, OPT_NOP, OPT_MSS, LEN_MSS, 0x05, 0xb4];
+        let opts = parse_options(&bytes).unwrap();
+        assert_eq!(opts.mss, Some(1460));
+    }
+
+    #[test]
+    fn parse_full_syn_options_round_trips_encode() {
+        let mut built = TcpOpts::default();
+        built.mss = Some(1460);
+        built.sack_permitted = true;
+        built.timestamps = Some((0x1122_3344, 0x5566_7788));
+        built.wscale = Some(7);
+        let mut buf = [0u8; 40];
+        let n = built.encode(&mut buf).unwrap();
+        let parsed = parse_options(&buf[..n]).unwrap();
+        assert_eq!(parsed.mss, Some(1460));
+        assert_eq!(parsed.wscale, Some(7));
+        assert!(parsed.sack_permitted);
+        assert_eq!(parsed.timestamps, Some((0x1122_3344, 0x5566_7788)));
+    }
+
+    #[test]
+    fn parse_sack_blocks_three_roundtrips() {
+        let mut built = TcpOpts::default();
+        built.timestamps = Some((0, 0));
+        built.push_sack_block(SackBlock { left: 100, right: 200 });
+        built.push_sack_block(SackBlock { left: 300, right: 400 });
+        built.push_sack_block(SackBlock { left: 500, right: 600 });
+        let mut buf = [0u8; 40];
+        let n = built.encode(&mut buf).unwrap();
+        let parsed = parse_options(&buf[..n]).unwrap();
+        assert_eq!(parsed.sack_block_count, 3);
+        assert_eq!(parsed.sack_blocks[0], SackBlock { left: 100, right: 200 });
+        assert_eq!(parsed.sack_blocks[1], SackBlock { left: 300, right: 400 });
+        assert_eq!(parsed.sack_blocks[2], SackBlock { left: 500, right: 600 });
+    }
+
+    #[test]
+    fn parse_rejects_zero_optlen_unknown_kind() {
+        // Kind 99 (unknown), len=0 — would infinite-loop in mTCP.
+        let bytes = [99u8, 0u8, 0x42];
+        let err = parse_options(&bytes).unwrap_err();
+        assert_eq!(err, OptionParseError::ShortUnknown);
+    }
+
+    #[test]
+    fn parse_rejects_wrong_mss_len() {
+        // MSS with len=6 (A3's parse_mss_option would also reject).
+        let bytes = [OPT_MSS, 6, 0x05, 0xb4, 0x00, 0x00];
+        let err = parse_options(&bytes).unwrap_err();
+        assert_eq!(err, OptionParseError::BadKnownLen);
+    }
+
+    #[test]
+    fn parse_rejects_wrong_wscale_len() {
+        let bytes = [OPT_WSCALE, 4, 7, 0];
+        let err = parse_options(&bytes).unwrap_err();
+        assert_eq!(err, OptionParseError::BadKnownLen);
+    }
+
+    #[test]
+    fn parse_rejects_wrong_ts_len() {
+        let bytes = [OPT_TIMESTAMP, 8, 0,0,0,0, 0,0];
+        let err = parse_options(&bytes).unwrap_err();
+        assert_eq!(err, OptionParseError::BadKnownLen);
+    }
+
+    #[test]
+    fn parse_rejects_truncated_mss() {
+        // MSS header claims 4 bytes but only 3 present.
+        let bytes = [OPT_MSS, 4, 0x05];
+        let err = parse_options(&bytes).unwrap_err();
+        assert_eq!(err, OptionParseError::Truncated);
+    }
+
+    #[test]
+    fn parse_rejects_sack_with_zero_blocks() {
+        let bytes = [OPT_SACK, 2]; // header only, no blocks.
+        let err = parse_options(&bytes).unwrap_err();
+        assert_eq!(err, OptionParseError::BadSackBlockCount);
+    }
+
+    #[test]
+    fn parse_rejects_sack_with_odd_block_bytes() {
+        // 2 + 7 = odd block region.
+        let mut bytes = [0u8; 9];
+        bytes[0] = OPT_SACK; bytes[1] = 9;
+        let err = parse_options(&bytes).unwrap_err();
+        assert_eq!(err, OptionParseError::BadSackBlockCount);
+    }
+
+    #[test]
+    fn parse_skips_unknown_kind_with_valid_len() {
+        // Kind 99, len 4, two bytes of payload — skipped; MSS follows.
+        let bytes = [99u8, 4, 0xaa, 0xbb, OPT_MSS, LEN_MSS, 0x05, 0xb4];
+        let opts = parse_options(&bytes).unwrap();
+        assert_eq!(opts.mss, Some(1460));
     }
 }
