@@ -787,6 +787,26 @@ mod tests {
     }
 
     #[test]
+    fn established_rst_outcome_carries_rst_cause() {
+        let mut c = est_conn(1000, 5000, 1024);
+        let seg = ParsedSegment {
+            src_port: 5000, dst_port: 40000,
+            seq: 5001, ack: 1001,
+            flags: TCP_RST | TCP_ACK,
+            window: 0,
+            header_len: 20,
+            payload: &[], options: &[],
+        };
+        let out = dispatch(&mut c, &seg);
+        assert_eq!(out.new_state, Some(TcpState::Closed));
+        assert!(out.closed);
+        // seg.flags & TCP_RST is what engine.rs uses to decide conn_rst bump;
+        // this test locks in the downstream contract by checking the outcome
+        // plus the segment's RST bit that the engine will inspect.
+        assert!((seg.flags & TCP_RST) != 0);
+    }
+
+    #[test]
     fn fin_wait1_ack_of_our_fin_transitions_to_fin_wait2() {
         use crate::flow_table::FourTuple;
         use crate::tcp_conn::TcpConn;

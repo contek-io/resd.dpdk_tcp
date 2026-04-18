@@ -289,9 +289,9 @@ mod tests {
     }
 
     /// Counters declared for forward-phase accounting: A5 TX retransmit
-    /// (tx_retrans, tx_rto, tx_tlp), A5/A6 explicit RST (conn_rst). These
-    /// live in the struct so the public ABI is stable across phases and
-    /// bindgen doesn't re-layout on phase bumps; they stay at zero in A3.
+    /// (tx_retrans, tx_rto, tx_tlp). These live in the struct so the
+    /// public ABI is stable across phases and bindgen doesn't re-layout
+    /// on phase bumps; they stay at zero in A3.
     #[test]
     fn deferred_tcp_counters_zero_at_construction() {
         let c = Counters::new();
@@ -299,6 +299,5 @@ mod tests {
         assert_eq!(c.tcp.tx_retrans.load(Ordering::Relaxed), 0);
         assert_eq!(c.tcp.tx_rto.load(Ordering::Relaxed), 0);
         assert_eq!(c.tcp.tx_tlp.load(Ordering::Relaxed), 0);
-        assert_eq!(c.tcp.conn_rst.load(Ordering::Relaxed), 0);
     }
 }

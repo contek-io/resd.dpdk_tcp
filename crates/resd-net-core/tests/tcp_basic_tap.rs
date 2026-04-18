@@ -260,6 +260,9 @@ fn handshake_echo_close_over_tap() {
         st[time_wait][closed].load(Ordering::Relaxed)
     );
 
+    // Clean FIN close — no RST involved. conn_rst must remain zero.
+    assert_eq!(c.tcp.conn_rst.load(Ordering::Relaxed), 0);
+
     drop(engine);
     let _ = done_rx.recv_timeout(Duration::from_secs(2));
     let _ = server.join();

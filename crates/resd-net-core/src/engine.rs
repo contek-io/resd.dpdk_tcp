@@ -634,6 +634,16 @@ impl Engine {
                 conn: handle, err: 0,
             });
             inc(&self.counters.tcp.conn_close);
+            // Bump conn_rst when the close was caused by RST (either
+            // inbound RST received, or we're sending one via the SYN_SENT
+            // bad-ACK / sync-state Rst paths). LastAck-fin_acked closes
+            // and TIME_WAIT reaper closes are clean, not counted as RST.
+            let rst_close = (parsed.flags & crate::tcp_output::TCP_RST) != 0
+                || matches!(outcome.tx,
+                    TxAction::Rst | TxAction::RstForSynSentBadAck);
+            if rst_close {
+                inc(&self.counters.tcp.conn_rst);
+            }
             // Remove the flow on final close (but leave TIME_WAIT alive
             // for the reaper — that's handled via `transition_conn`).
             let state = self.flow_table.borrow().get(handle).map(|c| c.state);
