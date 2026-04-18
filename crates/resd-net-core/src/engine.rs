@@ -686,10 +686,12 @@ impl Engine {
                 crate::tcp_timer_wheel::TimerKind::Rto => {
                     self.on_rto_fire(node.owner_handle, id);
                 }
-                crate::tcp_timer_wheel::TimerKind::Tlp
-                | crate::tcp_timer_wheel::TimerKind::SynRetrans
+                crate::tcp_timer_wheel::TimerKind::Tlp => {
+                    self.on_tlp_fire(node.owner_handle, id);
+                }
+                crate::tcp_timer_wheel::TimerKind::SynRetrans
                 | crate::tcp_timer_wheel::TimerKind::ApiPublic => {
-                    // Wired in Tasks 17 / 18 / A6. Silent no-op for now.
+                    // Wired in Tasks 18 / A6. Silent no-op for now.
                 }
             }
         }
@@ -796,6 +798,67 @@ impl Engine {
                 c.timer_ids.push(id);
             }
         }
+    }
+
+    /// A5 Task 17: TLP fire (RFC 8985 §7.3). Retransmits the last
+    /// `snd_retrans` entry as a probe, soliciting a SACK that may reveal a
+    /// tail loss not discoverable by RACK alone. Silent no-op when the
+    /// fired `TimerId` is stale (doesn't match `conn.tlp_timer_id`) or
+    /// `snd_retrans` is empty by fire time.
+    ///
+    /// For Stage 1, `select_probe` returns `NewData` when `snd.pending` is
+    /// non-empty and `LastSegmentRetransmit` otherwise. Both branches
+    /// retransmit the last in-flight segment here — true NewData probing
+    /// (sending from `snd.pending` via a fresh `send_bytes`-shaped path)
+    /// is a Stage 2 follow-up once post-TX push is re-enabled.
+    ///
+    /// Borrow discipline mirrors `on_rto_fire`: three phases with no
+    /// nested borrows (validate → clear-state → retransmit). Task 20
+    /// will insert `RESD_NET_EVT_TCP_LOSS_DETECTED{cause: Tlp}` emission
+    /// gated on `tcp_per_packet_events`.
+    pub(crate) fn on_tlp_fire(
+        &self,
+        handle: ConnHandle,
+        fired_id: crate::tcp_timer_wheel::TimerId,
+    ) {
+        // Phase 1: validate fired_id + read probe inputs.
+        let (is_current, retrans_len, pending_empty) = {
+            let ft = self.flow_table.borrow();
+            let Some(c) = ft.get(handle) else { return };
+            let current = c.tlp_timer_id == Some(fired_id);
+            (current, c.snd_retrans.len(), c.snd.pending.is_empty())
+        };
+        if !is_current {
+            // Stale fire (cancel raced, or slot reused). Ignore.
+            return;
+        }
+
+        // Phase 2: clear tlp_timer_id + prune timer_ids.
+        {
+            let mut ft = self.flow_table.borrow_mut();
+            if let Some(c) = ft.get_mut(handle) {
+                c.tlp_timer_id = None;
+                c.timer_ids.retain(|t| *t != fired_id);
+            }
+        }
+
+        // Phase 3: select + execute probe. `retrans_len` is captured from
+        // the Phase-1 snapshot — it can't grow between phases (the ACK
+        // path is the only mutator of `snd_retrans` and we're synchronous
+        // here), so `retrans_len - 1` is a valid last index at fire time.
+        // `select_probe` returning `Some` implies `retrans_len > 0` (the
+        // `snd_retrans_nonempty` gate inside `select_probe`), so the
+        // subtraction never underflows. Stage 1: both `NewData` and
+        // `LastSegmentRetransmit` probe by retransmitting the last
+        // in-flight segment. True NewData probing (draining from
+        // `snd.pending`) is a Stage 2 follow-up.
+        if crate::tcp_tlp::select_probe(!pending_empty, retrans_len > 0).is_some() {
+            self.retransmit(handle, retrans_len - 1);
+            crate::counters::inc(&self.counters.tcp.tx_tlp);
+        }
+
+        // Task 20 will add RESD_NET_EVT_TCP_LOSS_DETECTED emission here
+        // (cause = LossCause::Tlp) gated on tcp_per_packet_events.
     }
 
     /// A5 Task 13: force-close a connection due to RTO or SYN-retransmit
@@ -1166,14 +1229,15 @@ impl Engine {
         // A5 task 11: on an ACK that advanced snd.una, prune snd_retrans
         // below the new snd.una and free each dropped mbuf (its stashed
         // refcount 1→0 returns the mbuf to the mempool). If snd_retrans
-        // is now empty AND snd.una == snd.nxt, cancel the RTO timer.
+        // is now empty AND snd.una == snd.nxt, cancel the RTO timer (and,
+        // per Task 17, the TLP timer — same queue-empty precondition).
         //
         // Borrow ordering (no double-borrow on any RefCell):
         //   1. mut-borrow flow_table, prune, release.
         //   2. `resd_rte_pktmbuf_free` FFI calls outside any borrow.
-        //   3. shared-borrow flow_table to check empty + read rto_timer_id, release.
+        //   3. shared-borrow flow_table to check empty + read rto/tlp timer_id, release.
         //   4. mut-borrow timer_wheel to cancel, release.
-        //   5. mut-borrow flow_table to clear rto_timer_id + prune timer_ids.
+        //   5. mut-borrow flow_table to clear rto/tlp_timer_id + prune timer_ids.
         if let Some(new_snd_una) = outcome.snd_una_advanced_to {
             let dropped = {
                 let mut ft = self.flow_table.borrow_mut();
@@ -1186,16 +1250,16 @@ impl Engine {
             for entry in dropped {
                 unsafe { sys::resd_rte_pktmbuf_free(entry.mbuf.as_ptr()) };
             }
-            let rto_id_to_cancel = {
+            let (rto_id_to_cancel, tlp_id_to_cancel) = {
                 let ft = self.flow_table.borrow();
                 if let Some(c) = ft.get(handle) {
                     if c.snd_retrans.is_empty() && c.snd_una == c.snd_nxt {
-                        c.rto_timer_id
+                        (c.rto_timer_id, c.tlp_timer_id)
                     } else {
-                        None
+                        (None, None)
                     }
                 } else {
-                    None
+                    (None, None)
                 }
             };
             if let Some(id) = rto_id_to_cancel {
@@ -1205,6 +1269,53 @@ impl Engine {
                     c.rto_timer_id = None;
                     c.timer_ids.retain(|t| *t != id);
                 }
+            }
+            // A5 Task 17: also cancel TLP when snd_retrans empties + snd.una
+            // caught up to snd.nxt — no tail to probe once the queue drains.
+            if let Some(id) = tlp_id_to_cancel {
+                self.timer_wheel.borrow_mut().cancel(id);
+                let mut ft = self.flow_table.borrow_mut();
+                if let Some(c) = ft.get_mut(handle) {
+                    c.tlp_timer_id = None;
+                    c.timer_ids.retain(|t| *t != id);
+                }
+            }
+        }
+
+        // A5 Task 17: TLP schedule (RFC 8985 §7.2). Arm a probe timer at
+        // `now + PTO` when snd_retrans is non-empty AND no TLP is already
+        // pending. PTO = max(2·SRTT, DEFAULT_MIN_RTO_US); falls back to
+        // DEFAULT_MIN_RTO_US when the RTT estimator has no sample yet.
+        // Runs after the Task 11 prune so we don't arm a probe on a queue
+        // that just emptied.
+        let tlp_arm = {
+            let ft = self.flow_table.borrow();
+            ft.get(handle)
+                .map(|c| !c.snd_retrans.is_empty() && c.tlp_timer_id.is_none())
+                .unwrap_or(false)
+        };
+        if tlp_arm {
+            let (srtt, now_ns) = {
+                let ft = self.flow_table.borrow();
+                let srtt = ft.get(handle).and_then(|c| c.rtt_est.srtt_us());
+                (srtt, crate::clock::now_ns())
+            };
+            let pto_us = crate::tcp_tlp::pto_us(srtt, crate::tcp_rtt::DEFAULT_MIN_RTO_US);
+            let fire_at_ns = now_ns + (pto_us as u64 * 1_000);
+            let id = self.timer_wheel.borrow_mut().add(
+                now_ns,
+                crate::tcp_timer_wheel::TimerNode {
+                    fire_at_ns,
+                    owner_handle: handle,
+                    kind: crate::tcp_timer_wheel::TimerKind::Tlp,
+                    generation: 0,
+                    cancelled: false,
+                },
+            );
+            let mut ft = self.flow_table.borrow_mut();
+            if let Some(c) = ft.get_mut(handle) {
+                c.tlp_timer_id = Some(id);
+                c.timer_ids.push(id);
             }
         }
 
@@ -2408,6 +2519,20 @@ mod tests {
     fn force_close_etimedout_signature_exists() {
         fn _check(e: &Engine, h: crate::flow_table::ConnHandle) {
             e.force_close_etimedout(h);
+        }
+    }
+
+    // Task 17: `on_tlp_fire` signature compile-check. Body coverage lives
+    // in Task 28 (RTO/RACK/TLP TAP integration) — a real fire needs EAL/
+    // DPDK. Exercised indirectly via `advance_timer_wheel` from `poll_once`.
+    #[test]
+    fn on_tlp_fire_signature_exists() {
+        fn _check(
+            e: &Engine,
+            h: crate::flow_table::ConnHandle,
+            id: crate::tcp_timer_wheel::TimerId,
+        ) {
+            e.on_tlp_fire(h, id);
         }
     }
 
