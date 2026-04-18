@@ -356,7 +356,7 @@ struct TcpConn {
 | 7323 | Timestamps + Window Scale | yes | enables RTT + PAWS + large windows |
 | 2018 | SACK | yes | essential for WAN loss recovery |
 | 5681 | Congestion control | off-by-default; Reno via `cc_mode` | `dup_ack` counter strict per §2 in A5 (was loose in A3/A4). |
-| 6298 | RTO | yes | minRTO=20ms (tunable) |
+| 6298 | RTO | yes | minRTO=5ms, maxRTO=1s, both tunable (§6.4) |
 | 6582 | NewReno | with Reno mode | |
 | 6691 | MSS | yes | clamp to local MTU |
 | 3168 | ECN | off-by-default (flag) | |
