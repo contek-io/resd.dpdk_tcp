@@ -791,6 +791,95 @@ impl Engine {
         Ok(handle)
     }
 
+    /// Enqueue `bytes` on the connection's send path. Returns the number
+    /// of bytes accepted (could be < bytes.len() under send-buffer or
+    /// peer-window backpressure). On `tx_data_mempool` exhaustion mid-send,
+    /// returns a negative errno (Err(Error::SendBufferFull) mapped to
+    /// `-ENOMEM` at the public-API layer).
+    pub fn send_bytes(&self, handle: ConnHandle, bytes: &[u8]) -> Result<u32, Error> {
+        use crate::counters::{add, inc};
+        use crate::tcp_output::{build_segment, SegmentTx, TCP_ACK, TCP_PSH};
+
+        let (tuple, seq_start, snd_una, snd_wnd, peer_mss, state, rcv_nxt, rcv_wnd)
+            = {
+                let ft = self.flow_table.borrow();
+                let Some(c) = ft.get(handle) else {
+                    return Err(Error::InvalidConnHandle(handle as u64));
+                };
+                (c.four_tuple(), c.snd_nxt, c.snd_una, c.snd_wnd, c.peer_mss,
+                 c.state, c.rcv_nxt, c.rcv_wnd)
+            };
+        if state != TcpState::Established {
+            return Err(Error::InvalidConnHandle(handle as u64));
+        }
+
+        let mss_cap = (peer_mss as u32).min(self.cfg.tcp_mss).max(1);
+        // Remaining peer-window room (relative to snd_una): snd_wnd minus
+        // (snd_nxt - snd_una).
+        let in_flight = seq_start.wrapping_sub(snd_una);
+        let room_in_peer_wnd = snd_wnd.saturating_sub(in_flight);
+        let send_buf_room = self.cfg.send_buffer_bytes.saturating_sub(in_flight);
+        let mut remaining = bytes.len().min(room_in_peer_wnd as usize).min(send_buf_room as usize);
+        let mut offset = 0usize;
+        let mut accepted = 0u32;
+        let mut cur_seq = seq_start;
+
+        let mut frame = vec![0u8; 1600];
+        while remaining > 0 {
+            let take = remaining.min(mss_cap as usize);
+            let payload = &bytes[offset..offset + take];
+            let seg = SegmentTx {
+                src_mac: self.our_mac,
+                dst_mac: self.cfg.gateway_mac,
+                src_ip: tuple.local_ip, dst_ip: tuple.peer_ip,
+                src_port: tuple.local_port, dst_port: tuple.peer_port,
+                seq: cur_seq,
+                ack: rcv_nxt,
+                flags: TCP_ACK | TCP_PSH,
+                window: rcv_wnd.min(u16::MAX as u32) as u16,
+                mss_option: None,
+                payload,
+            };
+            if frame.len() < crate::tcp_output::FRAME_HDRS_MIN + take {
+                frame.resize(crate::tcp_output::FRAME_HDRS_MIN + take, 0);
+            }
+            let Some(n) = build_segment(&seg, &mut frame) else {
+                // Shouldn't happen; buf is sized for hdrs+take.
+                break;
+            };
+            if !self.tx_data_frame(&frame[..n]) {
+                if accepted == 0 {
+                    return Err(Error::SendBufferFull);
+                }
+                break;
+            }
+            inc(&self.counters.tcp.tx_data);
+            add(&self.counters.eth.rx_bytes, 0); // no-op: kept for parity with A2 pattern
+            offset += take;
+            accepted += take as u32;
+            cur_seq = cur_seq.wrapping_add(take as u32);
+            remaining -= take;
+        }
+
+        // Persist accepted bytes to `snd.pending` (for spec-future retx)
+        // and advance `snd_nxt`.
+        {
+            let mut ft = self.flow_table.borrow_mut();
+            if let Some(c) = ft.get_mut(handle) {
+                let stored = c.snd.push(&bytes[..accepted as usize]);
+                // If the send buffer was too small, we may have sent
+                // bytes we can't retx-track. Not an error in A3; noted
+                // for A5.
+                let _ = stored;
+                c.snd_nxt = cur_seq;
+            }
+        }
+        if accepted < bytes.len() as u32 {
+            inc(&self.counters.tcp.send_buf_full);
+        }
+        Ok(accepted)
+    }
+
     fn maybe_emit_gratuitous_arp(&self) {
         if self.cfg.garp_interval_sec == 0 || self.cfg.local_ip == 0 {
             return;
@@ -873,6 +962,13 @@ mod tests {
         fn _check(e: &Engine) {
             let _: Result<crate::flow_table::ConnHandle, crate::Error> =
                 e.connect(0x0a_00_00_01, 5000, 0);
+        }
+    }
+
+    #[test]
+    fn send_bytes_signature_exists() {
+        fn _check(e: &Engine, h: crate::flow_table::ConnHandle) {
+            let _: Result<u32, crate::Error> = e.send_bytes(h, b"x");
         }
     }
 }
