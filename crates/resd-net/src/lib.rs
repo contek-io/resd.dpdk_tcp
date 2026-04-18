@@ -107,17 +107,95 @@ pub unsafe extern "C" fn resd_net_engine_destroy(p: *mut resd_net_engine) {
 #[no_mangle]
 pub unsafe extern "C" fn resd_net_poll(
     p: *mut resd_net_engine,
-    _events_out: *mut resd_net_event_t,
-    _max_events: u32,
+    events_out: *mut resd_net_event_t,
+    max_events: u32,
     _timeout_ns: u64,
 ) -> i32 {
-    match engine_from_raw(p) {
-        Some(e) => {
-            e.poll_once();
-            0
-        }
-        None => -libc::EINVAL,
+    let Some(e) = engine_from_raw(p) else { return -libc::EINVAL; };
+    e.poll_once();
+    if events_out.is_null() || max_events == 0 {
+        return 0;
     }
+    let mut filled: u32 = 0;
+    e.drain_events(max_events, |ev, engine| {
+        let ts = resd_net_core::clock::now_ns();
+        // Build the event value fully before writing it to events_out, so
+        // we never read a possibly-uninitialized `kind` discriminant.
+        let event: resd_net_event_t = match ev {
+            resd_net_core::tcp_events::InternalEvent::Connected { conn, rx_hw_ts_ns } => {
+                resd_net_event_t {
+                    kind: resd_net_event_kind_t::RESD_NET_EVT_CONNECTED,
+                    conn: *conn as u64,
+                    rx_hw_ts_ns: *rx_hw_ts_ns,
+                    enqueued_ts_ns: ts,
+                    u: resd_net_event_payload_t { _pad: [0u8; 16] },
+                }
+            }
+            resd_net_core::tcp_events::InternalEvent::Readable { conn, byte_offset, byte_len, rx_hw_ts_ns } => {
+                // Build the borrowed-view pointer into the connection's
+                // last_read_buf at the event's byte_offset (Task 19 fix
+                // for multi-segment polls).
+                let ft = engine.flow_table();
+                let (data_ptr, data_len) = match ft.get(*conn as u32) {
+                    Some(c) => {
+                        let off = *byte_offset as usize;
+                        let ptr = unsafe { c.recv.last_read_buf.as_ptr().add(off) };
+                        (ptr, *byte_len)
+                    }
+                    None => (std::ptr::null(), 0),
+                };
+                resd_net_event_t {
+                    kind: resd_net_event_kind_t::RESD_NET_EVT_READABLE,
+                    conn: *conn as u64,
+                    rx_hw_ts_ns: *rx_hw_ts_ns,
+                    enqueued_ts_ns: ts,
+                    u: resd_net_event_payload_t {
+                        readable: resd_net_event_readable_t { data: data_ptr, data_len },
+                    },
+                }
+            }
+            resd_net_core::tcp_events::InternalEvent::Closed { conn, err } => {
+                resd_net_event_t {
+                    kind: resd_net_event_kind_t::RESD_NET_EVT_CLOSED,
+                    conn: *conn as u64,
+                    rx_hw_ts_ns: 0,
+                    enqueued_ts_ns: ts,
+                    u: resd_net_event_payload_t {
+                        closed: resd_net_event_error_t { err: *err },
+                    },
+                }
+            }
+            resd_net_core::tcp_events::InternalEvent::StateChange { conn, from, to } => {
+                resd_net_event_t {
+                    kind: resd_net_event_kind_t::RESD_NET_EVT_TCP_STATE_CHANGE,
+                    conn: *conn as u64,
+                    rx_hw_ts_ns: 0,
+                    enqueued_ts_ns: ts,
+                    u: resd_net_event_payload_t {
+                        tcp_state: resd_net_event_tcp_state_t {
+                            from_state: *from as u8, to_state: *to as u8,
+                        },
+                    },
+                }
+            }
+            resd_net_core::tcp_events::InternalEvent::Error { conn, err } => {
+                resd_net_event_t {
+                    kind: resd_net_event_kind_t::RESD_NET_EVT_ERROR,
+                    conn: *conn as u64,
+                    rx_hw_ts_ns: 0,
+                    enqueued_ts_ns: ts,
+                    u: resd_net_event_payload_t {
+                        error: resd_net_event_error_t { err: *err },
+                    },
+                }
+            }
+        };
+        unsafe {
+            std::ptr::write(events_out.add(filled as usize), event);
+        }
+        filled += 1;
+    });
+    filled as i32
 }
 
 #[no_mangle]
@@ -156,6 +234,77 @@ pub unsafe extern "C" fn resd_net_resolve_gateway_mac(
             0
         }
         Err(resd_net_core::Error::GatewayMacNotFound(_)) => -libc::ENOENT,
+        Err(_) => -libc::EIO,
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn resd_net_connect(
+    p: *mut resd_net_engine,
+    opts: *const resd_net_connect_opts_t,
+    out: *mut resd_net_conn_t,
+) -> i32 {
+    if p.is_null() || opts.is_null() || out.is_null() {
+        return -libc::EINVAL;
+    }
+    let Some(e) = engine_from_raw(p) else { return -libc::EINVAL; };
+    let opts = &*opts;
+    // peer_addr comes in network byte order; convert to host order.
+    let peer_ip = u32::from_be(opts.peer_addr);
+    let peer_port = u16::from_be(opts.peer_port);
+    let local_port = u16::from_be(opts.local_port);
+    match e.connect(peer_ip, peer_port, local_port) {
+        Ok(h) => {
+            *out = h as resd_net_conn_t;
+            0
+        }
+        Err(resd_net_core::Error::TooManyConns) => -libc::EMFILE,
+        Err(resd_net_core::Error::PeerUnreachable(_)) => -libc::EHOSTUNREACH,
+        Err(_) => -libc::EIO,
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn resd_net_send(
+    p: *mut resd_net_engine,
+    conn: resd_net_conn_t,
+    buf: *const u8,
+    len: u32,
+) -> i32 {
+    if p.is_null() {
+        return -libc::EINVAL;
+    }
+    if len > 0 && buf.is_null() {
+        return -libc::EINVAL;
+    }
+    let Some(e) = engine_from_raw(p) else { return -libc::EINVAL; };
+    let slice = if len == 0 {
+        &[][..]
+    } else {
+        std::slice::from_raw_parts(buf, len as usize)
+    };
+    match e.send_bytes(conn as u32, slice) {
+        Ok(n) => n as i32,
+        Err(resd_net_core::Error::InvalidConnHandle(_)) => -libc::ENOTCONN,
+        Err(resd_net_core::Error::SendBufferFull) => -libc::ENOMEM,
+        Err(_) => -libc::EIO,
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn resd_net_close(
+    p: *mut resd_net_engine,
+    conn: resd_net_conn_t,
+    _flags: u32,
+) -> i32 {
+    // FORCE_TW_SKIP flag is A6; ignore in A3.
+    if p.is_null() {
+        return -libc::EINVAL;
+    }
+    let Some(e) = engine_from_raw(p) else { return -libc::EINVAL; };
+    match e.close_conn(conn as u32) {
+        Ok(()) => 0,
+        Err(resd_net_core::Error::InvalidConnHandle(_)) => -libc::ENOTCONN,
         Err(_) => -libc::EIO,
     }
 }
@@ -233,5 +382,39 @@ mod tests {
         // 0.0.0.1 will not be in any /proc/net/arp.
         let rc = unsafe { resd_net_resolve_gateway_mac(0x0000_0001, mac.as_mut_ptr()) };
         assert_eq!(rc, -libc::ENOENT);
+    }
+
+    #[test]
+    fn connect_null_engine_returns_einval() {
+        let opts = resd_net_connect_opts_t {
+            peer_addr: 0x0100_0a0a, // 10.0.0.1 in NBO (doesn't matter)
+            peer_port: 5000u16.to_be(),
+            local_addr: 0,
+            local_port: 0,
+            connect_timeout_ms: 0,
+            idle_keepalive_sec: 0,
+        };
+        let mut out: u64 = 0;
+        let rc = unsafe { resd_net_connect(std::ptr::null_mut(), &opts, &mut out) };
+        assert_eq!(rc, -libc::EINVAL);
+    }
+
+    #[test]
+    fn send_null_engine_returns_einval() {
+        let rc = unsafe {
+            resd_net_send(
+                std::ptr::null_mut(),
+                1u64,
+                b"x".as_ptr(),
+                1,
+            )
+        };
+        assert_eq!(rc, -libc::EINVAL);
+    }
+
+    #[test]
+    fn close_null_engine_returns_einval() {
+        let rc = unsafe { resd_net_close(std::ptr::null_mut(), 1u64, 0) };
+        assert_eq!(rc, -libc::EINVAL);
     }
 }
