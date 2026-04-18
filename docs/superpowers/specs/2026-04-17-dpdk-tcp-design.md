@@ -470,6 +470,32 @@ Counter groups (Stage 1): `eth`, `ip`, `tcp`, `poll`. Examples in `eth`: `rx_pkt
 
 Hot-path writes are `store(val+1, Ordering::Relaxed)` on the owning lcore (zero cost on x86_64 vs. plain store). Cross-lcore snapshot readers use `load(Ordering::Relaxed)` — no torn reads. `Relaxed` is sufficient because counters are non-ordering observability data, not synchronization primitives. The alternative — "plain `u64` + `memcpy`" — is a data race by the Rust / C++ abstract machine and is rejected.
 
+### 9.1.1 Counter-addition policy
+
+Counters are not free. Every `fetch_add` on the hot path costs cycles (~8–12 cycles uncontended `lock xadd` on x86_64, plus store-buffer flush). On a 10 M segments/sec lcore that is ~3% of one core per extra hot-path counter.
+
+**Default policy — every counter addition must satisfy one of these:**
+
+1. **Slow-path-only.** Increments only on error, rare lifecycle events, or per-connection (not per-segment / per-burst / per-poll). No measurable cost; no gate required. This is the default and most counters should live here.
+
+2. **Hot-path, compile-time toggleable.** If a counter must fire on the hot path, it lands behind a cargo feature flag (default = off) and its justification is documented inline where the counter is declared. The justification must name the operational question the counter answers that cannot be answered from the existing slow-path counters, events, or externally-observable signals (PMU, pcap, NIC counters). Design the increment for minimum cost from the start: batch into a stack-local within the natural burst loop and emit one `fetch_add` per burst, not per segment.
+
+3. **Explicit exception.** A hot-path counter shipped unconditionally (no feature gate) requires a spec amendment citing the measured cost, the benchmark that confirms it fits within §11 budgets, and the reviewer sign-off. Do not ship unconditional hot-path counters by default.
+
+**Implication for new-counter PRs:** if the increment site is inside `tcp_input`, `tcp_output`, `engine::poll_once`, or any RX/TX burst loop, it is hot-path and rule 2 or 3 applies. Default counters-coverage audit (§10 A8) treats feature-gated counters as optional — the audit runs twice, once with default features and once with all observability features enabled, and each declared counter must be reachable in at least one of the two runs.
+
+**ABI stability:** the `#[cfg(feature = ...)]` gate applies to the **increment site**, not the struct field. Every counter field is always allocated and exposed via `resd_net_counters_t`. Feature-off builds still expose the field in the C ABI but leave it at zero. This keeps the C header stable across feature sets at the cost of ~8 bytes per counter, which is acceptable given counters are cacheline-grouped and sparse.
+
+**Canonical observability feature flags** (Stage 1):
+
+| Flag | Default | Gates (increment sites) | Rationale |
+|---|---|---|---|
+| `obs-byte-counters` | **OFF** | `tcp.tx_payload_bytes`, `tcp.rx_payload_bytes` | Per-segment byte accounting; ~3% hot-path cost without batching, <0.1% with per-burst stack-local accumulator. Ops value for trading desks (market-data vs. order byte budgets) is real but not universal; opt-in. |
+| `obs-poll-saturation` | **ON** | `poll.iters_with_rx_burst_max` | One extra `if/inc` per poll iteration; cost is essentially a branch since it fires only when `rx_burst` returns `max_burst`. Signals "we may be falling behind the NIC" and has no cheap alternative. Default on because the diagnostic value dominates the marginal cost; can be turned off for absolute-minimum-overhead builds via `--no-default-features`. |
+| `obs-stable-boundaries` | **OFF** | (API boundary symbols, §9.5) | Already-existing flag for eBPF uprobe attachment; listed here for completeness. |
+
+Each hot-path counter must be documented inline at its declaration with: (1) the feature flag that gates it, (2) the operational question it answers that no existing slow-path counter / event / PMU counter / NIC counter / pcap can answer, (3) the increment-batching pattern used on the hot path.
+
 ### 9.2 Timestamps on events
 
 Every `resd_net_event_t` carries:
