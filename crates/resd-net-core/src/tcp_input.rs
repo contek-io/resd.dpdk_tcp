@@ -356,6 +356,18 @@ fn handle_established(conn: &mut TcpConn, seg: &ParsedSegment) -> Outcome {
         }
     }
 
+    // A4: decode peer SACK blocks into the scoreboard (RFC 2018). SACK
+    // info is advisory — on full-array overflow `SackScoreboard::insert`
+    // drops the oldest block; the peer re-advertises on subsequent ACKs
+    // so the loss is self-correcting. A5 retransmit reads the board.
+    let mut sack_blocks_decoded = 0u32;
+    if conn.sack_enabled && parsed_opts.sack_block_count > 0 {
+        for block in &parsed_opts.sack_blocks[..parsed_opts.sack_block_count as usize] {
+            conn.sack_scoreboard.insert(*block);
+        }
+        sack_blocks_decoded = parsed_opts.sack_block_count as u32;
+    }
+
     // ACK processing — RFC 9293 §3.10.7.4, "ESTABLISHED STATE" ACK handling.
     if seq_lt(conn.snd_una, seg.ack) && seq_le(seg.ack, conn.snd_nxt) {
         let acked = seg.ack.wrapping_sub(conn.snd_una) as usize;
@@ -363,6 +375,9 @@ fn handle_established(conn: &mut TcpConn, seg: &ParsedSegment) -> Outcome {
             conn.snd.pending.pop_front();
         }
         conn.snd_una = seg.ack;
+        if conn.sack_enabled {
+            conn.sack_scoreboard.prune_below(conn.snd_una);
+        }
         // Update send window. Only accept advances from newer segments
         // per RFC 9293 §3.10.7.4 "SND.WL1 / SND.WL2" rules.
         if seq_lt(conn.snd_wl1, seg.seq)
@@ -448,7 +463,7 @@ fn handle_established(conn: &mut TcpConn, seg: &ParsedSegment) -> Outcome {
         buf_full_drop,
         reassembly_queued_bytes,
         reassembly_hole_filled,
-        // sack_blocks_decoded populated in Task 18
+        sack_blocks_decoded,
         ..Outcome::base()
     }
 }
@@ -1130,6 +1145,61 @@ mod tests {
         let out = dispatch(&mut c, &seg);
         assert!(out.bad_option);
         assert_eq!(out.delivered, 0);
+    }
+
+    #[test]
+    fn established_decodes_peer_sack_blocks_into_scoreboard() {
+        use crate::tcp_options::{SackBlock, TcpOpts};
+        let mut c = est_conn(1000, 5000, 1024);
+        c.sack_enabled = true;
+        c.snd.push(&[0u8; 20]);
+        c.snd_nxt = c.snd_una.wrapping_add(20);
+
+        let mut peer_opts = TcpOpts::default();
+        peer_opts.push_sack_block(SackBlock { left: 1005, right: 1010 });
+        peer_opts.push_sack_block(SackBlock { left: 1015, right: 1020 });
+        let mut buf = [0u8; 40];
+        let n = peer_opts.encode(&mut buf).unwrap();
+
+        let seg = ParsedSegment {
+            src_port: 5000, dst_port: 40000,
+            seq: 5001, ack: 1003,
+            flags: TCP_ACK, window: 65535,
+            header_len: 20 + n, payload: &[],
+            options: &buf[..n],
+        };
+        let out = dispatch(&mut c, &seg);
+        assert_eq!(out.sack_blocks_decoded, 2);
+        assert!(c.sack_scoreboard.is_sacked(1005));
+        assert!(c.sack_scoreboard.is_sacked(1018));
+        assert!(!c.sack_scoreboard.is_sacked(1003));
+    }
+
+    #[test]
+    fn established_prunes_scoreboard_below_snd_una() {
+        use crate::tcp_options::{SackBlock, TcpOpts};
+        let mut c = est_conn(1000, 5000, 1024);
+        c.sack_enabled = true;
+        c.sack_scoreboard.insert(SackBlock { left: 1005, right: 1010 });
+        c.sack_scoreboard.insert(SackBlock { left: 1020, right: 1030 });
+        c.snd.push(&[0u8; 30]);
+        c.snd_nxt = c.snd_una.wrapping_add(30);
+
+        let peer_opts = TcpOpts::default();
+        let mut buf = [0u8; 40];
+        let n = peer_opts.encode(&mut buf).unwrap();
+
+        let seg = ParsedSegment {
+            src_port: 5000, dst_port: 40000,
+            seq: 5001, ack: 1015,
+            flags: TCP_ACK, window: 65535,
+            header_len: 20 + n, payload: &[],
+            options: &buf[..n],
+        };
+        let _ = dispatch(&mut c, &seg);
+        assert_eq!(c.snd_una, 1015);
+        assert_eq!(c.sack_scoreboard.len(), 1);
+        assert_eq!(c.sack_scoreboard.blocks()[0].left, 1020);
     }
 
     #[test]
