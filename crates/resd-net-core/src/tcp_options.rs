@@ -537,12 +537,7 @@ mod tests {
         let mut bytes = [0u8; 2 + 8 * 4];
         bytes[0] = OPT_SACK;
         bytes[1] = (2 + 8 * 4) as u8;
-        let blocks = [
-            (100u32, 200u32),
-            (300, 400),
-            (500, 600),
-            (700, 800),
-        ];
+        let blocks = [(100u32, 200u32), (300, 400), (500, 600), (700, 800)];
         for (idx, (l, r)) in blocks.iter().enumerate() {
             let off = 2 + idx * 8;
             bytes[off..off + 4].copy_from_slice(&l.to_be_bytes());
