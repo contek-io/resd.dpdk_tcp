@@ -2156,7 +2156,7 @@ impl Engine {
             peer_mss,
             state,
             rcv_nxt,
-            rcv_wnd,
+            free_space_total,
             ws_shift_out,
             ts_enabled,
             ts_recent,
@@ -2173,7 +2173,7 @@ impl Engine {
                 c.peer_mss,
                 c.state,
                 c.rcv_nxt,
-                c.rcv_wnd,
+                c.recv.free_space_total(),
                 c.ws_shift_out,
                 c.ts_enabled,
                 c.ts_recent,
@@ -2199,8 +2199,11 @@ impl Engine {
 
         // F-4 RFC 7323 §2.3 / §2.2: SEG.WND on every non-SYN segment MUST
         // be right-shifted by Rcv.Wind.Shift. `ws_shift_out` is bounded at
-        // 14 by compute_ws_shift_for, so `>>` is safe.
-        let advertised_window = (rcv_wnd >> ws_shift_out).min(u16::MAX as u32) as u16;
+        // 14 by compute_ws_shift_for, so `>>` is safe. Task 25: advertise
+        // `recv.free_space_total()` (in-order + reorder capacity) to keep
+        // the invariant "advertised window <= actual room" once OOO
+        // segments accumulate; mirrors emit_ack's post-A4 I-8 fix.
+        let advertised_window = (free_space_total >> ws_shift_out).min(u16::MAX as u32) as u16;
 
         // Hot-path TCP-payload-byte accumulator. Per-burst-batched per
         // spec §9.1.1 rule 2: stack-local sum across the per-segment
@@ -2518,8 +2521,13 @@ impl Engine {
             let entry_len = entry.len;
             let data_mbuf_ptr = entry.mbuf.as_ptr();
             // Advertised window mirrors `send_bytes` (F-4 RFC 7323 §2.3):
-            // non-SYN segment ⇒ right-shift rcv_wnd by ws_shift_out.
-            let advertised_window = (conn.rcv_wnd >> conn.ws_shift_out).min(u16::MAX as u32) as u16;
+            // non-SYN segment ⇒ right-shift by ws_shift_out. Task 25:
+            // advertise `recv.free_space_total()` (in-order + reorder
+            // capacity) so retrans frames stay consistent with emit_ack
+            // and send_bytes — never overstating room past what the
+            // OOO-aware recv buffer can actually hold.
+            let advertised_window =
+                (conn.recv.free_space_total() >> conn.ws_shift_out).min(u16::MAX as u32) as u16;
             let ts_enabled = conn.ts_enabled;
             let ts_recent = conn.ts_recent;
             let rcv_nxt = conn.rcv_nxt;
