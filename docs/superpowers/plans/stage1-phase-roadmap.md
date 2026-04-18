@@ -119,7 +119,7 @@
   - `tx_sack_blocks` — SACK blocks encoded in an outbound ACK (fires only when we have recv-side gaps).
   - `rx_sack_blocks` — SACK blocks decoded from a peer ACK (fires only on peer-side loss).
 
-  Cross-phase slow-path additions (backfill what A3 scope didn't cover):
+  Cross-phase slow-path additions that fit naturally in A4's increment-site scope (backfill what A3 didn't cover + things A4's new paths pass through anyway):
   - `rx_bad_seq` — segment with seq outside `rcv_wnd`; silently dropped prior to this counter.
   - `rx_bad_ack` — ACK acking nothing new or acking future data; previously silent.
   - `rx_dup_ack` — duplicate ACK (baseline for A5 fast-retransmit consumer).
@@ -127,14 +127,14 @@
   - `rx_urgent_dropped` — URG flag segment; Stage 1 doesn't support URG, dropped.
   - `tx_zero_window` — we advertised `rwnd=0` (our recv buffer full).
   - `tx_window_update` — we emitted a pure window-update segment.
-  - `events_dropped_queue_full` — per-engine event FIFO overflow (spec §4.2).
-  - `events_error_enomem` — `RESD_NET_EVT_ERROR{err=ENOMEM}` emissions.
-  - `events_error_eperm_tw_required` — `RESD_NET_EVT_ERROR{err=EPERM_TW_REQUIRED}` emissions.
-  - `conn_timeout_syn_sent` — SYN_SENT timeout (no SYN-ACK arrived within `connect_timeout_ms`).
-  - `conn_time_wait_reaped` — TIME_WAIT deadline expired, connection reclaimed.
+  - `conn_time_wait_reaped` — TIME_WAIT deadline expired, connection reclaimed (A3's reaper has no counter).
   - `conn_table_full` — `resd_net_connect` rejected because flow table at `max_connections`.
 
-  All of the above increment in existing slow-path sites (error branches, rare-event handlers, per-connection lifecycle). None are on the per-segment or per-poll hot path. A8 counter-coverage audit adds scenarios for each so zero fields stay unreachable.
+  Explicitly **not** in A4 scope (owned by later phases — included here only as a note so nobody re-proposes them as A4 work):
+  - `events_dropped_queue_full` / `events_error_enomem` / `events_error_eperm_tw_required` — per-engine event FIFO + `RESD_NET_EVT_ERROR` emissions (**A6**: depends on A6's real event-queue overflow semantics, `ENOMEM` mempool-exhaustion path, `FORCE_TW_SKIP` + RFC 6191 guard).
+  - `conn_timeout_syn_sent` — SYN_SENT timeout (**A5**: depends on A5's real RTO timer + `connect_timeout_ms` enforcement).
+
+  All of the above A4-scope increments live in existing slow-path sites (error branches, rare-event handlers, per-connection lifecycle). None are on the per-segment or per-poll hot path. A8 counter-coverage audit adds scenarios for each so zero fields stay unreachable.
 
 - **Hot-path counters — compile-time gated per spec §9.1.1** (fields always allocated in the struct for C-ABI stability; `#[cfg(feature = ...)]` applies to the increment sites only):
 
