@@ -180,7 +180,18 @@ struct RESD_NET_ALIGNED(64) resd_net_tcp_counters_t {
   uint64_t conn_rst;
   uint64_t send_buf_full;
   uint64_t recv_buf_delivered;
-  uint64_t _pad[3];
+  uint64_t tx_syn;
+  uint64_t tx_ack;
+  uint64_t tx_data;
+  uint64_t tx_fin;
+  uint64_t tx_rst;
+  uint64_t rx_fin;
+  uint64_t rx_unmatched;
+  uint64_t rx_bad_csum;
+  uint64_t rx_bad_flags;
+  uint64_t rx_short;
+  uint64_t state_trans[11][11];
+  uint64_t _pad[4];
 };
 
 struct RESD_NET_ALIGNED(64) resd_net_poll_counters_t {
@@ -226,8 +237,8 @@ struct resd_net_engine *resd_net_engine_create(uint16_t lcore_id,
 void resd_net_engine_destroy(struct resd_net_engine *p);
 
 int32_t resd_net_poll(struct resd_net_engine *p,
-                      struct resd_net_event_t *_events_out,
-                      uint32_t _max_events,
+                      struct resd_net_event_t *events_out,
+                      uint32_t max_events,
                       uint64_t _timeout_ns);
 
 void resd_net_flush(struct resd_net_engine *_p);
@@ -243,6 +254,17 @@ const struct resd_net_counters_t *resd_net_counters(struct resd_net_engine *p);
  * -EINVAL on null out_mac.
  */
 int32_t resd_net_resolve_gateway_mac(uint32_t gateway_ip_host_order, uint8_t *out_mac);
+
+int32_t resd_net_connect(struct resd_net_engine *p,
+                         const struct resd_net_connect_opts_t *opts,
+                         resd_net_conn_t *out);
+
+int32_t resd_net_send(struct resd_net_engine *p,
+                      resd_net_conn_t conn,
+                      const uint8_t *buf,
+                      uint32_t len);
+
+int32_t resd_net_close(struct resd_net_engine *p, resd_net_conn_t conn, uint32_t _flags);
 
 #ifdef __cplusplus
 } // extern "C"
