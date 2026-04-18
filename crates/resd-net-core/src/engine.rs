@@ -537,11 +537,28 @@ impl Engine {
         inc(&self.counters.poll.iters_with_rx);
         add(&self.counters.eth.rx_pkts, n as u64);
 
+        // Hot-path TCP-payload-byte accumulator. Per-burst-batched per
+        // spec §9.1.1 rule 2: stack-local sum, single fetch_add after
+        // the burst drains. Compiled out entirely without the feature.
+        #[cfg(feature = "obs-byte-counters")]
+        let mut rx_bytes_acc: u64 = 0;
+
         for &m in &mbufs[..n] {
             let bytes = unsafe { crate::mbuf_data_slice(m) };
             add(&self.counters.eth.rx_bytes, bytes.len() as u64);
-            self.rx_frame(bytes);
+            let _accepted = self.rx_frame(bytes);
+            #[cfg(feature = "obs-byte-counters")]
+            {
+                rx_bytes_acc += _accepted as u64;
+            }
             unsafe { sys::resd_rte_pktmbuf_free(m) };
+        }
+
+        #[cfg(feature = "obs-byte-counters")]
+        {
+            if rx_bytes_acc > 0 {
+                add(&self.counters.tcp.rx_payload_bytes, rx_bytes_acc);
+            }
         }
 
         self.reap_time_wait();
@@ -587,13 +604,25 @@ impl Engine {
         n
     }
 
-    fn rx_frame(&self, bytes: &[u8]) {
+    /// Returns the count of TCP payload bytes accepted from this frame
+    /// (`outcome.delivered + outcome.reassembly_queued_bytes`). Always
+    /// computed; only consumed by the `obs-byte-counters` accumulator
+    /// in `poll_once`. LLVM elides the dead-store path when the feature
+    /// is off.
+    fn rx_frame(&self, bytes: &[u8]) -> u32 {
         use crate::counters::inc;
         match crate::l2::l2_decode(bytes, self.our_mac) {
-            Err(crate::l2::L2Drop::Short) => inc(&self.counters.eth.rx_drop_short),
-            Err(crate::l2::L2Drop::MissMac) => inc(&self.counters.eth.rx_drop_miss_mac),
+            Err(crate::l2::L2Drop::Short) => {
+                inc(&self.counters.eth.rx_drop_short);
+                0
+            }
+            Err(crate::l2::L2Drop::MissMac) => {
+                inc(&self.counters.eth.rx_drop_miss_mac);
+                0
+            }
             Err(crate::l2::L2Drop::UnknownEthertype) => {
-                inc(&self.counters.eth.rx_drop_unknown_ethertype)
+                inc(&self.counters.eth.rx_drop_unknown_ethertype);
+                0
             }
             Ok(l2) => {
                 let payload = &bytes[l2.payload_offset..];
@@ -601,6 +630,7 @@ impl Engine {
                     crate::l2::ETHERTYPE_ARP => {
                         inc(&self.counters.eth.rx_arp);
                         self.handle_arp(payload);
+                        0
                     }
                     crate::l2::ETHERTYPE_IPV4 => self.handle_ipv4(payload),
                     _ => unreachable!("l2_decode filters unsupported ethertypes"),
@@ -628,26 +658,54 @@ impl Engine {
         // static-gateway A2 we rely on the configured MAC and do not mutate.
     }
 
-    fn handle_ipv4(&self, payload: &[u8]) {
+    /// Returns TCP payload bytes accepted by the inner `tcp_input` (or 0
+    /// for non-TCP / decode-error paths). Used by `poll_once`'s
+    /// `obs-byte-counters` accumulator.
+    fn handle_ipv4(&self, payload: &[u8]) -> u32 {
         use crate::counters::inc;
         match crate::l3_ip::ip_decode(payload, self.cfg.local_ip, /*nic_csum_ok=*/ false) {
-            Err(crate::l3_ip::L3Drop::Short) => inc(&self.counters.ip.rx_drop_short),
-            Err(crate::l3_ip::L3Drop::BadVersion) => inc(&self.counters.ip.rx_drop_bad_version),
-            Err(crate::l3_ip::L3Drop::BadHeaderLen) => inc(&self.counters.ip.rx_drop_bad_hl),
-            Err(crate::l3_ip::L3Drop::BadTotalLen) => inc(&self.counters.ip.rx_drop_short),
-            Err(crate::l3_ip::L3Drop::CsumBad) => inc(&self.counters.ip.rx_csum_bad),
-            Err(crate::l3_ip::L3Drop::TtlZero) => inc(&self.counters.ip.rx_ttl_zero),
-            Err(crate::l3_ip::L3Drop::Fragment) => inc(&self.counters.ip.rx_frag),
-            Err(crate::l3_ip::L3Drop::NotOurs) => inc(&self.counters.ip.rx_drop_not_ours),
+            Err(crate::l3_ip::L3Drop::Short) => {
+                inc(&self.counters.ip.rx_drop_short);
+                0
+            }
+            Err(crate::l3_ip::L3Drop::BadVersion) => {
+                inc(&self.counters.ip.rx_drop_bad_version);
+                0
+            }
+            Err(crate::l3_ip::L3Drop::BadHeaderLen) => {
+                inc(&self.counters.ip.rx_drop_bad_hl);
+                0
+            }
+            Err(crate::l3_ip::L3Drop::BadTotalLen) => {
+                inc(&self.counters.ip.rx_drop_short);
+                0
+            }
+            Err(crate::l3_ip::L3Drop::CsumBad) => {
+                inc(&self.counters.ip.rx_csum_bad);
+                0
+            }
+            Err(crate::l3_ip::L3Drop::TtlZero) => {
+                inc(&self.counters.ip.rx_ttl_zero);
+                0
+            }
+            Err(crate::l3_ip::L3Drop::Fragment) => {
+                inc(&self.counters.ip.rx_frag);
+                0
+            }
+            Err(crate::l3_ip::L3Drop::NotOurs) => {
+                inc(&self.counters.ip.rx_drop_not_ours);
+                0
+            }
             Err(crate::l3_ip::L3Drop::UnsupportedProto) => {
-                inc(&self.counters.ip.rx_drop_unsupported_proto)
+                inc(&self.counters.ip.rx_drop_unsupported_proto);
+                0
             }
             Ok(ip) => {
                 let inner = &payload[ip.header_len..ip.total_len];
                 match ip.protocol {
                     crate::l3_ip::IPPROTO_TCP => {
                         inc(&self.counters.ip.rx_tcp);
-                        self.tcp_input(&ip, inner);
+                        self.tcp_input(&ip, inner)
                     }
                     crate::l3_ip::IPPROTO_ICMP => {
                         inc(&self.counters.ip.rx_icmp);
@@ -666,6 +724,7 @@ impl Engine {
                             }
                             OtherDropped | Malformed => {}
                         }
+                        0
                     }
                     _ => unreachable!("ip_decode filters unsupported protocols"),
                 }
@@ -675,7 +734,12 @@ impl Engine {
 
     /// Real TCP input path (A3). Parses the segment, finds the flow,
     /// dispatches to per-state handler, emits ACK/RST and events.
-    fn tcp_input(&self, ip: &crate::l3_ip::L3Decoded, tcp_bytes: &[u8]) {
+    ///
+    /// Returns the count of TCP payload bytes accepted by this segment
+    /// (`outcome.delivered + outcome.reassembly_queued_bytes`). Drops,
+    /// errors, and pure-ACK / control segments return 0. Used by the
+    /// `obs-byte-counters` accumulator in `poll_once`.
+    fn tcp_input(&self, ip: &crate::l3_ip::L3Decoded, tcp_bytes: &[u8]) -> u32 {
         use crate::counters::inc;
         use crate::tcp_input::{dispatch, parse_segment, tuple_from_segment, TxAction};
 
@@ -688,7 +752,7 @@ impl Engine {
                     crate::tcp_input::TcpParseError::Csum => inc(&self.counters.tcp.rx_bad_csum),
                     crate::tcp_input::TcpParseError::BadDataOffset => inc(&self.counters.tcp.rx_short),
                 }
-                return;
+                return 0;
             }
         };
 
@@ -698,7 +762,7 @@ impl Engine {
             // Unmatched: reply RST per spec §5.1 `reply_rst`.
             inc(&self.counters.tcp.rx_unmatched);
             self.send_rst_unmatched(&tuple, &parsed);
-            return;
+            return 0;
         };
 
         // Bump per-flag counters for observability before dispatch.
@@ -713,7 +777,7 @@ impl Engine {
 
         let outcome = {
             let mut ft = self.flow_table.borrow_mut();
-            let Some(conn) = ft.get_mut(handle) else { return; };
+            let Some(conn) = ft.get_mut(handle) else { return 0; };
             dispatch(conn, &parsed)
         };
 
@@ -800,6 +864,15 @@ impl Engine {
                 self.flow_table.borrow_mut().remove(handle);
             }
         }
+
+        // Hot-path TCP-payload-bytes total accepted by this segment:
+        // either delivered in-order (counted in `delivered`) or buffered
+        // for reassembly (counted in `reassembly_queued_bytes`). At most
+        // one of these is non-zero per segment. Drops (`buf_full_drop`,
+        // `ooo_drop` in A3) are NOT counted here — they're separately
+        // surfaced via `recv_buf_drops` / `rx_out_of_order`. Consumed by
+        // the `obs-byte-counters` accumulator in `poll_once`.
+        outcome.delivered + outcome.reassembly_queued_bytes
     }
 
     fn transition_conn(&self, handle: ConnHandle, to: TcpState) {
@@ -1192,6 +1265,13 @@ impl Engine {
         let mut accepted = 0u32;
         let mut cur_seq = seq_start;
 
+        // Hot-path TCP-payload-byte accumulator. Per-burst-batched per
+        // spec §9.1.1 rule 2: stack-local sum across the per-segment
+        // loop, single fetch_add at method exit. Compiled out entirely
+        // without the feature.
+        #[cfg(feature = "obs-byte-counters")]
+        let mut tx_bytes_acc: u64 = 0;
+
         let mut frame = vec![0u8; 1600];
         while remaining > 0 {
             let take = remaining.min(mss_cap as usize);
@@ -1222,6 +1302,10 @@ impl Engine {
                 break;
             }
             inc(&self.counters.tcp.tx_data);
+            #[cfg(feature = "obs-byte-counters")]
+            {
+                tx_bytes_acc += take as u64;
+            }
             offset += take;
             accepted += take as u32;
             cur_seq = cur_seq.wrapping_add(take as u32);
@@ -1244,6 +1328,16 @@ impl Engine {
         if accepted < bytes.len() as u32 {
             inc(&self.counters.tcp.send_buf_full);
         }
+
+        // Flush the per-call TX-payload-bytes accumulator. Single
+        // `fetch_add` regardless of segment count.
+        #[cfg(feature = "obs-byte-counters")]
+        {
+            if tx_bytes_acc > 0 {
+                crate::counters::add(&self.counters.tcp.tx_payload_bytes, tx_bytes_acc);
+            }
+        }
+
         Ok(accepted)
     }
 
