@@ -79,6 +79,22 @@ int main() {
     std::printf("eth.rx_arp: %llu\n",
         (unsigned long long)__atomic_load_n(&c->eth.rx_arp, __ATOMIC_RELAXED));
 
+    // Phase A3: print TCP counters to confirm ABI parity.
+    std::printf("tcp.tx_syn: %llu\n",
+        (unsigned long long)__atomic_load_n(&c->tcp.tx_syn, __ATOMIC_RELAXED));
+    std::printf("tcp.rx_syn_ack: %llu\n",
+        (unsigned long long)__atomic_load_n(&c->tcp.rx_syn_ack, __ATOMIC_RELAXED));
+    std::printf("tcp.tx_data: %llu\n",
+        (unsigned long long)__atomic_load_n(&c->tcp.tx_data, __ATOMIC_RELAXED));
+    std::printf("tcp.tx_fin: %llu\n",
+        (unsigned long long)__atomic_load_n(&c->tcp.tx_fin, __ATOMIC_RELAXED));
+    std::printf("tcp.rx_fin: %llu\n",
+        (unsigned long long)__atomic_load_n(&c->tcp.rx_fin, __ATOMIC_RELAXED));
+    std::printf("tcp.conn_open: %llu\n",
+        (unsigned long long)__atomic_load_n(&c->tcp.conn_open, __ATOMIC_RELAXED));
+    std::printf("tcp.conn_close: %llu\n",
+        (unsigned long long)__atomic_load_n(&c->tcp.conn_close, __ATOMIC_RELAXED));
+
     resd_net_engine_destroy(eng);
     return 0;
 }
