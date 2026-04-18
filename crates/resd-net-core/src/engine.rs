@@ -2251,6 +2251,7 @@ impl Engine {
                 if let Some(entry) = conn.snd_retrans.entries.get_mut(entry_index) {
                     entry.xmit_count = entry.xmit_count.saturating_add(1);
                     entry.xmit_ts_ns = crate::clock::now_ns();
+                    entry.lost = false;
                 }
             }
         }
