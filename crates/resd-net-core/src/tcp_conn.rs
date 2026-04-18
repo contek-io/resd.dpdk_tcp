@@ -165,6 +165,10 @@ pub struct TcpConn {
     /// ACK" rule. Cleared after consumption. `None` between triggers
     /// (in-order data + pure ACKs don't set it).
     pub last_sack_trigger: Option<(u32, u32)>,
+
+    /// A5: wheel-timer handles owned by this conn (RTO, TLP, SYN).
+    /// `close_conn` walks this list on close; spec §7.4.
+    pub timer_ids: Vec<crate::tcp_timer_wheel::TimerId>,
 }
 
 impl TcpConn {
@@ -207,6 +211,7 @@ impl TcpConn {
             time_wait_deadline_ns: None,
             last_advertised_wnd: None,
             last_sack_trigger: None,
+            timer_ids: Vec::new(),
         }
     }
 
@@ -319,5 +324,11 @@ mod tests {
         // Starts `None` on a fresh client connection.
         let c = TcpConn::new_client(tuple(), 1000, 1460, 1024, 2048);
         assert!(c.last_sack_trigger.is_none());
+    }
+
+    #[test]
+    fn new_client_timer_ids_starts_empty() {
+        let c = TcpConn::new_client(tuple(), 1, 1460, 1024, 2048);
+        assert!(c.timer_ids.is_empty());
     }
 }

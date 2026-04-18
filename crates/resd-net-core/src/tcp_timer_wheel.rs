@@ -37,6 +37,11 @@ pub struct TimerNode {
 
 pub struct TimerWheel {
     slots: Vec<Option<TimerNode>>,
+    /// Per-slot generation that survives the `Option::take` that
+    /// `advance`/`cascade` use to drain a slot back to the free_list.
+    /// Bumped on every slot reuse so TimerIds from the previous occupant
+    /// cannot match — `cancel(id)` returns false on a stale id post-reuse.
+    generations: Vec<u32>,
     free_list: Vec<u32>,
     buckets: [[Vec<u32>; BUCKETS]; LEVELS],
     cursors: [u16; LEVELS],
@@ -49,6 +54,7 @@ impl TimerWheel {
         const EMPTY_LEVEL: [Vec<u32>; BUCKETS] = [EMPTY_BUCKET; BUCKETS];
         Self {
             slots: Vec::with_capacity(initial_slot_capacity),
+            generations: Vec::with_capacity(initial_slot_capacity),
             free_list: Vec::new(),
             buckets: [EMPTY_LEVEL; LEVELS],
             cursors: [0; LEVELS],
@@ -62,18 +68,21 @@ impl TimerWheel {
         let bucket_idx = (self.cursors[level] as usize + bucket_off) % BUCKETS;
 
         let slot: u32 = match self.free_list.pop() {
-            Some(s) => s,
+            Some(s) => {
+                // Bump generation on reuse so outstanding TimerIds from
+                // the previous occupant of this slot cannot match.
+                self.generations[s as usize] = self.generations[s as usize].wrapping_add(1);
+                s
+            }
             None => {
                 let s = self.slots.len() as u32;
                 self.slots.push(None);
+                self.generations.push(0);
                 s
             }
         };
 
-        let gen = match &self.slots[slot as usize] {
-            Some(prev) => prev.generation.wrapping_add(1),
-            None => 0,
-        };
+        let gen = self.generations[slot as usize];
         node.generation = gen;
         node.cancelled = false;
         self.slots[slot as usize] = Some(node);
@@ -116,6 +125,22 @@ impl TimerWheel {
             }
         }
         fired
+    }
+
+    /// Tombstone-cancel a scheduled timer by TimerId. Returns true if a
+    /// live, matching timer was found and marked cancelled; false if the
+    /// slot is empty, the generation is stale (slot was reused), or the
+    /// timer was already cancelled. Cancelled timers are swept from their
+    /// bucket at fire-time without invoking the fire path.
+    pub fn cancel(&mut self, id: TimerId) -> bool {
+        let slot_idx = id.slot as usize;
+        match self.slots.get_mut(slot_idx) {
+            Some(Some(node)) if node.generation == id.generation && !node.cancelled => {
+                node.cancelled = true;
+                true
+            }
+            _ => false,
+        }
     }
 
     fn cascade(&mut self, level: usize) {
@@ -201,5 +226,27 @@ mod tests {
         let _long = w.add(0, node(3_000_000));
         assert_eq!(w.advance(300_000).len(), 1);
         assert_eq!(w.advance(3_000_000).len(), 1);
+    }
+
+    #[test]
+    fn cancel_tombstones_the_slot() {
+        let mut w = TimerWheel::new(8);
+        let id = w.add(0, node(100_000));
+        assert!(w.cancel(id));
+        let fired = w.advance(100_000);
+        assert_eq!(fired.len(), 0);
+        assert!(!w.cancel(id));
+    }
+
+    #[test]
+    fn cancel_stale_id_after_reuse_is_noop() {
+        let mut w = TimerWheel::new(8);
+        let id_a = w.add(0, node(100_000));
+        let _ = w.advance(100_000);
+        let id_b = w.add(100_000, node(200_000));
+        assert!(!w.cancel(id_a));
+        let fired = w.advance(200_000);
+        assert_eq!(fired.len(), 1);
+        assert_eq!(fired[0].0, id_b);
     }
 }
