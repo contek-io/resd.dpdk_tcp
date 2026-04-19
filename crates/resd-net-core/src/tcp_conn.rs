@@ -318,10 +318,21 @@ impl TcpConn {
             // `resd_net_connect` (or `connect_with_opts`) overrides the five
             // ABI-mirror fields with post-substitution values right after
             // inserting the conn into the flow table.
+            //
+            // A5.5 Task 11 fixup: default-init the two gate-relevant knobs
+            // (`tlp_pto_srtt_multiplier_x100`, `tlp_max_consecutive_probes`)
+            // to their A5-compatible constants so direct-construct paths
+            // (unit tests, future accept-side code) that never go through
+            // `connect_with_opts` still produce a working
+            // `tlp_arm_gate_passes()` budget check (a `0` budget would
+            // reject every arm). `connect_with_opts` still overwrites
+            // these with the post-substitution caller values — which are
+            // either the same defaults (zero-init caller) or validated
+            // user-supplied values.
             tlp_pto_min_floor_us: 0,
-            tlp_pto_srtt_multiplier_x100: 0,
+            tlp_pto_srtt_multiplier_x100: crate::tcp_tlp::DEFAULT_MULTIPLIER_X100,
             tlp_skip_flight_size_gate: false,
-            tlp_max_consecutive_probes: 0,
+            tlp_max_consecutive_probes: crate::tcp_tlp::DEFAULT_MAX_CONSECUTIVE_PROBES,
             tlp_skip_rtt_sample_gate: false,
             tlp_consecutive_probes_fired: 0,
             tlp_rtt_sample_seen_since_last_tlp: false,
@@ -571,13 +582,26 @@ mod tests {
     }
 
     // A5.5 Task 10: per-connect TLP tuning + runtime state + syn_tx_ts_ns.
+    //
+    // A5.5 Task 11 fixup: the two gate-relevant knobs
+    // (`tlp_pto_srtt_multiplier_x100`, `tlp_max_consecutive_probes`) are
+    // default-initialized to their A5-compatible constants so a
+    // direct-construct conn (bypassing `connect_with_opts`) has a working
+    // `tlp_arm_gate_passes()` budget. All other TLP fields remain
+    // zero/false/None (that still maps to A5 behavior).
     #[test]
-    fn a5_5_tlp_tuning_fields_zero_init_on_new_client() {
+    fn a5_5_tlp_tuning_fields_default_init_on_new_client() {
         let c = TcpConn::new_client(tuple(), 1, 1460, 1024, 2048, 5000, 5000, 1_000_000);
         assert_eq!(c.tlp_pto_min_floor_us, 0);
-        assert_eq!(c.tlp_pto_srtt_multiplier_x100, 0);
+        assert_eq!(
+            c.tlp_pto_srtt_multiplier_x100,
+            crate::tcp_tlp::DEFAULT_MULTIPLIER_X100
+        );
         assert!(!c.tlp_skip_flight_size_gate);
-        assert_eq!(c.tlp_max_consecutive_probes, 0);
+        assert_eq!(
+            c.tlp_max_consecutive_probes,
+            crate::tcp_tlp::DEFAULT_MAX_CONSECUTIVE_PROBES
+        );
         assert!(!c.tlp_skip_rtt_sample_gate);
         assert_eq!(c.tlp_consecutive_probes_fired, 0);
         assert!(!c.tlp_rtt_sample_seen_since_last_tlp);
