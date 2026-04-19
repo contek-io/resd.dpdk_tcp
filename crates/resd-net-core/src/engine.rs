@@ -603,15 +603,16 @@ impl Engine {
         // port.
         let mut driver_name = [0u8; 32];
         if !dev_info.driver_name.is_null() {
-            unsafe {
-                let src = dev_info.driver_name as *const u8;
-                for i in 0..31 {
-                    let b = *src.add(i);
-                    if b == 0 {
-                        break;
-                    }
-                    driver_name[i] = b;
+            let src = dev_info.driver_name as *const u8;
+            for (i, slot) in driver_name.iter_mut().take(31).enumerate() {
+                // SAFETY: src is a non-null NUL-terminated C string from the
+                // PMD; we walk at most 31 bytes and stop on NUL, so we never
+                // read past the end of a well-formed driver name.
+                let b = unsafe { *src.add(i) };
+                if b == 0 {
+                    break;
                 }
+                *slot = b;
             }
         }
 
