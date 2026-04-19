@@ -349,6 +349,62 @@ impl TcpConn {
         }
     }
 
+    /// A5.5 Task 11: RFC 8985 §7 + spec §3.4 multi-probe gate. Returns
+    /// true iff a TLP probe should be armed now given per-conn state +
+    /// knobs. Called by both arm-on-ACK (Task 11) and arm-on-send
+    /// (Task 15).
+    #[inline]
+    pub fn tlp_arm_gate_passes(&self) -> bool {
+        if self.snd_retrans.is_empty() {
+            return false;
+        }
+        if self.tlp_timer_id.is_some() {
+            return false;
+        }
+        if self.tlp_consecutive_probes_fired >= self.tlp_max_consecutive_probes {
+            return false;
+        }
+        if !self.tlp_skip_rtt_sample_gate && !self.tlp_rtt_sample_seen_since_last_tlp {
+            return false;
+        }
+        true
+    }
+
+    /// A5.5 Task 11: record probe emission + bump budget + clear
+    /// sample-seen. Slot overwrite is most-recent-wins (mod 5) per
+    /// spec §3.4; bounded memory under a burst of probes.
+    #[inline]
+    pub fn on_tlp_probe_fired(&mut self, seq: u32, len: u16, tx_ts_ns: u64) {
+        let slot = self.tlp_recent_probes_next_slot as usize;
+        self.tlp_recent_probes[slot] = Some(RecentProbe {
+            seq,
+            len,
+            tx_ts_ns,
+            attributed: false,
+        });
+        self.tlp_recent_probes_next_slot = ((slot + 1) % self.tlp_recent_probes.len()) as u8;
+        self.tlp_consecutive_probes_fired = self.tlp_consecutive_probes_fired.saturating_add(1);
+        self.tlp_rtt_sample_seen_since_last_tlp = false;
+    }
+
+    /// A5.5 Task 11: called from the ACK path when an RTT sample is
+    /// absorbed. Resets the TLP budget + sets `sample-seen`, satisfying
+    /// the RFC 8985 §7.4 gate.
+    #[inline]
+    pub fn on_rtt_sample_tlp_hook(&mut self) {
+        self.tlp_consecutive_probes_fired = 0;
+        self.tlp_rtt_sample_seen_since_last_tlp = true;
+    }
+
+    /// A5.5 Task 11: called from the ACK path when `snd_una` advances
+    /// (new-data cum-ACK) without an RTT sample. Resets the TLP budget
+    /// only; does NOT flip `sample-seen` (that remains gated on an
+    /// actual RTT sample).
+    #[inline]
+    pub fn on_new_data_ack_tlp_hook(&mut self) {
+        self.tlp_consecutive_probes_fired = 0;
+    }
+
     pub fn four_tuple(&self) -> FourTuple {
         self.four_tuple
     }
@@ -565,7 +621,7 @@ mod a5_5_stats_tests {
         }
     }
 
-    fn make_test_conn() -> TcpConn {
+    pub(super) fn make_test_conn() -> TcpConn {
         TcpConn::new_client(tuple(), 0, 1460, 1024, 2048, 5000, 5000, 1_000_000)
     }
 
@@ -598,5 +654,149 @@ mod a5_5_stats_tests {
         let s = c.stats(64);
         assert_eq!(s.send_buf_bytes_pending, 128);
         assert_eq!(s.send_buf_bytes_free, 0);
+    }
+}
+
+#[cfg(test)]
+mod a5_5_tlp_hook_tests {
+    use super::a5_5_stats_tests::make_test_conn;
+    use crate::tcp_retrans::RetransEntry;
+
+    fn prime_retrans(c: &mut super::TcpConn, seq: u32, len: u16) {
+        c.snd_retrans.push_after_tx(RetransEntry {
+            seq,
+            len,
+            mbuf: crate::mempool::Mbuf::null_for_test(),
+            first_tx_ts_ns: 0,
+            xmit_count: 1,
+            sacked: false,
+            lost: false,
+            xmit_ts_ns: 0,
+        });
+    }
+
+    #[test]
+    fn tlp_arm_gate_rejects_when_retrans_empty() {
+        let mut c = make_test_conn();
+        c.tlp_max_consecutive_probes = 3;
+        c.tlp_rtt_sample_seen_since_last_tlp = true;
+        assert!(!c.tlp_arm_gate_passes());
+    }
+
+    #[test]
+    fn tlp_arm_gate_rejects_when_timer_already_armed() {
+        let mut c = make_test_conn();
+        prime_retrans(&mut c, 1000, 512);
+        c.tlp_max_consecutive_probes = 3;
+        c.tlp_rtt_sample_seen_since_last_tlp = true;
+        c.tlp_timer_id = Some(crate::tcp_timer_wheel::TimerId {
+            slot: 1,
+            generation: 0,
+        });
+        assert!(!c.tlp_arm_gate_passes());
+    }
+
+    #[test]
+    fn tlp_arm_gates_reject_when_budget_exhausted() {
+        let mut c = make_test_conn();
+        prime_retrans(&mut c, 1000, 512);
+        c.tlp_max_consecutive_probes = 3;
+        c.tlp_consecutive_probes_fired = 3;
+        c.tlp_rtt_sample_seen_since_last_tlp = true;
+        assert!(!c.tlp_arm_gate_passes());
+    }
+
+    #[test]
+    fn tlp_arm_gates_pass_when_under_budget_and_sample_seen() {
+        let mut c = make_test_conn();
+        prime_retrans(&mut c, 1000, 512);
+        c.tlp_max_consecutive_probes = 3;
+        c.tlp_consecutive_probes_fired = 1;
+        c.tlp_rtt_sample_seen_since_last_tlp = true;
+        assert!(c.tlp_arm_gate_passes());
+    }
+
+    #[test]
+    fn tlp_arm_gate_rejects_without_rtt_sample_seen_when_not_skipped() {
+        let mut c = make_test_conn();
+        prime_retrans(&mut c, 1000, 512);
+        c.tlp_skip_rtt_sample_gate = false;
+        c.tlp_rtt_sample_seen_since_last_tlp = false;
+        c.tlp_max_consecutive_probes = 3;
+        c.tlp_consecutive_probes_fired = 0;
+        assert!(!c.tlp_arm_gate_passes());
+    }
+
+    #[test]
+    fn tlp_arm_gate_bypasses_rtt_sample_check_when_skip_flag_set() {
+        let mut c = make_test_conn();
+        prime_retrans(&mut c, 1000, 512);
+        c.tlp_skip_rtt_sample_gate = true;
+        c.tlp_rtt_sample_seen_since_last_tlp = false;
+        c.tlp_max_consecutive_probes = 3;
+        c.tlp_consecutive_probes_fired = 0;
+        assert!(c.tlp_arm_gate_passes());
+    }
+
+    #[test]
+    fn on_tlp_fire_records_probe_bumps_counter_clears_flag() {
+        let mut c = make_test_conn();
+        c.tlp_consecutive_probes_fired = 0;
+        c.tlp_rtt_sample_seen_since_last_tlp = true;
+
+        c.on_tlp_probe_fired(1000, 512, 12_345);
+
+        assert_eq!(c.tlp_consecutive_probes_fired, 1);
+        assert!(!c.tlp_rtt_sample_seen_since_last_tlp);
+        assert!(c.tlp_recent_probes[0].is_some());
+        let probe = c.tlp_recent_probes[0].unwrap();
+        assert_eq!(probe.seq, 1000);
+        assert_eq!(probe.len, 512);
+        assert_eq!(probe.tx_ts_ns, 12_345);
+        assert!(!probe.attributed);
+        assert_eq!(c.tlp_recent_probes_next_slot, 1);
+    }
+
+    #[test]
+    fn on_tlp_fire_wraps_ring_at_slot_5() {
+        let mut c = make_test_conn();
+        for i in 0..6u32 {
+            c.on_tlp_probe_fired(i, 1, i as u64);
+        }
+        assert_eq!(c.tlp_recent_probes_next_slot, 1);
+        assert_eq!(c.tlp_recent_probes[0].unwrap().seq, 5);
+        assert_eq!(c.tlp_recent_probes[1].unwrap().seq, 1);
+    }
+
+    #[test]
+    fn on_tlp_fire_budget_saturates_at_u8_max() {
+        let mut c = make_test_conn();
+        c.tlp_consecutive_probes_fired = u8::MAX;
+        c.on_tlp_probe_fired(0, 1, 0);
+        assert_eq!(c.tlp_consecutive_probes_fired, u8::MAX);
+    }
+
+    #[test]
+    fn on_rtt_sample_tlp_hook_resets_budget_and_sets_sample_seen() {
+        let mut c = make_test_conn();
+        c.tlp_consecutive_probes_fired = 3;
+        c.tlp_rtt_sample_seen_since_last_tlp = false;
+
+        c.on_rtt_sample_tlp_hook();
+
+        assert_eq!(c.tlp_consecutive_probes_fired, 0);
+        assert!(c.tlp_rtt_sample_seen_since_last_tlp);
+    }
+
+    #[test]
+    fn on_new_data_ack_tlp_hook_resets_budget_only() {
+        let mut c = make_test_conn();
+        c.tlp_consecutive_probes_fired = 3;
+        c.tlp_rtt_sample_seen_since_last_tlp = false;
+
+        c.on_new_data_ack_tlp_hook();
+
+        assert_eq!(c.tlp_consecutive_probes_fired, 0);
+        assert!(!c.tlp_rtt_sample_seen_since_last_tlp);
     }
 }

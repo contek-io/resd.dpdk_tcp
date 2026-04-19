@@ -308,6 +308,8 @@ pub struct resd_net_tcp_counters_t {
     pub rto_no_backoff_active: u64,
     pub rx_ws_shift_clamped: u64,
     pub rx_dsack: u64,
+    /// A5.5 Task 11/12 — see core counters.rs for the full field doc.
+    pub tx_tlp_spurious: u64,
     pub _pad: [u64; 1],
 }
 #[repr(C, align(64))]

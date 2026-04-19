@@ -243,6 +243,10 @@ struct RESD_NET_ALIGNED(64) resd_net_tcp_counters_t {
   uint64_t rto_no_backoff_active;
   uint64_t rx_ws_shift_clamped;
   uint64_t rx_dsack;
+  /**
+   * A5.5 Task 11/12 — see core counters.rs for the full field doc.
+   */
+  uint64_t tx_tlp_spurious;
   uint64_t _pad[1];
 };
 

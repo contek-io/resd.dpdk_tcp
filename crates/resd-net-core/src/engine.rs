@@ -1016,6 +1016,25 @@ impl Engine {
             self.retransmit(handle, probe_idx);
             crate::counters::inc(&self.counters.tcp.tx_tlp);
 
+            // A5.5 Task 11: record the probe in the recent-probes ring,
+            // bump the consecutive-probes budget, and clear sample-seen
+            // so the next arm waits for a fresh RTT sample (unless
+            // `tlp_skip_rtt_sample_gate` is set). Read seq + len from
+            // the retransmitted entry.
+            let probe_info = {
+                let ft = self.flow_table.borrow();
+                ft.get(handle)
+                    .and_then(|c| c.snd_retrans.entries.get(probe_idx))
+                    .map(|e| (e.seq, e.len))
+            };
+            if let Some((probe_seq, probe_len)) = probe_info {
+                let now_ns = crate::clock::now_ns();
+                let mut ft = self.flow_table.borrow_mut();
+                if let Some(c) = ft.get_mut(handle) {
+                    c.on_tlp_probe_fired(probe_seq, probe_len, now_ns);
+                }
+            }
+
             // A5 Task 20: per-packet forensic emission, gated by
             // `tcp_per_packet_events`. Order: TcpRetrans (the probe
             // segment) then TcpLossDetected{cause: Tlp}. Read seq +
@@ -1675,16 +1694,19 @@ impl Engine {
             }
         }
 
-        // A5 Task 17: TLP schedule (RFC 8985 §7.2). Arm a probe timer at
-        // `now + PTO` when snd_retrans is non-empty AND no TLP is already
-        // pending. PTO = max(2·SRTT, tcp_min_rto_us); falls back to
-        // tcp_min_rto_us when the RTT estimator has no sample yet. Task
-        // 21 plumbs the floor through engine config. Runs after the Task
-        // 11 prune so we don't arm a probe on a queue that just emptied.
+        // A5 Task 17 / A5.5 Task 11: TLP schedule (RFC 8985 §7.2 + spec
+        // §3.4). Arm a probe timer at `now + PTO` when `tlp_arm_gate_passes`
+        // — i.e. snd_retrans non-empty, no TLP already pending, under the
+        // per-conn consecutive-probe budget, and an RTT sample has been
+        // absorbed since the last TLP (unless opted-out). PTO is computed
+        // from the per-connect TlpConfig; falls back to the configured
+        // floor when the RTT estimator has no sample yet. Runs after the
+        // Task 11 prune so we don't arm a probe on a queue that just
+        // emptied.
         let tlp_arm = {
             let ft = self.flow_table.borrow();
             ft.get(handle)
-                .map(|c| !c.snd_retrans.is_empty() && c.tlp_timer_id.is_none())
+                .map(|c| c.tlp_arm_gate_passes())
                 .unwrap_or(false)
         };
         if tlp_arm {

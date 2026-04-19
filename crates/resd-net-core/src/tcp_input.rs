@@ -574,6 +574,9 @@ fn handle_established(conn: &mut TcpConn, seg: &ParsedSegment) -> Outcome {
             conn.rtt_est.sample(rtt);
             conn.rack.update_min_rtt(rtt);
             rtt_sample_taken = true;
+            // A5.5 Task 11: RTT sample absorbed → reset TLP budget + set
+            // sample-seen (satisfies RFC 8985 §7.4 gate).
+            conn.on_rtt_sample_tlp_hook();
         } else if let Some(front) = conn.snd_retrans.front() {
             let front_end = front.seq.wrapping_add(front.len as u32);
             if front.xmit_count == 1 && seq_le(front_end, conn.snd_una) {
@@ -582,8 +585,16 @@ fn handle_established(conn: &mut TcpConn, seg: &ParsedSegment) -> Outcome {
                     conn.rtt_est.sample(rtt);
                     conn.rack.update_min_rtt(rtt);
                     rtt_sample_taken = true;
+                    // A5.5 Task 11: same hook on the Karn's-fallback branch.
+                    conn.on_rtt_sample_tlp_hook();
                 }
             }
+        }
+        if !rtt_sample_taken {
+            // A5.5 Task 11: new-data cum-ACK without an RTT sample → still
+            // reset the TLP budget; do NOT flip sample-seen (that remains
+            // gated on an actual RTT sample).
+            conn.on_new_data_ack_tlp_hook();
         }
 
         if conn.sack_enabled {

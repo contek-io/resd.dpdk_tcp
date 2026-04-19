@@ -137,6 +137,9 @@ pub struct TcpCounters {
     pub rx_ws_shift_clamped: AtomicU64,
     /// Task 16: DSACK observed (RFC 2883; visibility only).
     pub rx_dsack: AtomicU64,
+    /// A5.5 Task 11/12: TLP probe retroactively classified as spurious via
+    /// DSACK (RFC 8985 §7.4 / spec §3.4). Declared here; wired in Task 12.
+    pub tx_tlp_spurious: AtomicU64,
     _pad: [u64; 1],
 }
 
@@ -453,5 +456,11 @@ mod a5_5_tests {
         let c = Counters::new();
         assert_eq!(c.obs.events_dropped.load(Ordering::Relaxed), 0);
         assert_eq!(c.obs.events_queue_high_water.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn tlp_counters_tx_tlp_spurious_exists_and_zero_initialized() {
+        let c = Counters::new();
+        assert_eq!(c.tcp.tx_tlp_spurious.load(Ordering::Relaxed), 0);
     }
 }
