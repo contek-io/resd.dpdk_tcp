@@ -1,6 +1,10 @@
 //! RFC 8985 RACK state + loss detection.
 //! Consumed by the Task 15 RACK detect-lost pass in `tcp_input.rs`.
 
+use std::collections::VecDeque;
+
+use crate::tcp_retrans::RetransEntry;
+
 #[derive(Debug, Clone, Default)]
 pub struct RackState {
     /// RFC 8985 §6.1 RACK.xmit_ts — latest transmit timestamp of any
@@ -84,6 +88,47 @@ pub fn compute_reo_wnd_us(rack_aggressive: bool, min_rtt_us: u32, srtt_us: Optio
     }
 }
 
+/// RFC 8985 §6.3 `RACK_mark_losses_on_RTO`. Returns indexes of entries
+/// that are newly lost under the §6.3 formula; caller flips the `lost`
+/// flag and feeds the list to the retransmit loop.
+///
+/// An entry `e` is lost iff:
+/// - `e` is NOT sacked, NOT already lost, AND still in flight
+///   (`e.end_seq > snd_una`), AND
+/// - `e.seq == snd_una` (the front entry always retransmits) OR
+///   `e.xmit_us + RACK.rtt + RACK.reo_wnd <= now_us` (age expired).
+///
+/// `rtt_us` maps to `rtt_est.srtt_us().unwrap_or(rack.min_rtt_us)` at
+/// the call site — RFC 8985 calls this `RACK.rtt`, but we do not carry
+/// a dedicated `rack.rtt_us` field. Saturating arithmetic keeps the
+/// age check sound across the monotonic-clock wraparound boundary
+/// (u32 µs wraps ~71 min).
+pub fn rack_mark_losses_on_rto(
+    entries: &VecDeque<RetransEntry>,
+    snd_una: u32,
+    rtt_us: u32,
+    reo_wnd_us: u32,
+    now_us: u32,
+) -> Vec<u16> {
+    let mut out = Vec::new();
+    for (i, e) in entries.iter().enumerate() {
+        if e.sacked || e.lost {
+            continue;
+        }
+        let end_seq = e.seq.wrapping_add(e.len as u32);
+        if crate::tcp_seq::seq_le(end_seq, snd_una) {
+            // Already cum-ACKed; prune_below will drop it shortly.
+            continue;
+        }
+        let xmit_us = (e.xmit_ts_ns / 1_000) as u32;
+        let age_expired = xmit_us.saturating_add(rtt_us).saturating_add(reo_wnd_us) <= now_us;
+        if e.seq == snd_una || age_expired {
+            out.push(i as u16);
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -153,5 +198,100 @@ mod tests {
         assert_eq!(r.min_rtt_us, 100);
         r.update_min_rtt(50); // smaller — taken
         assert_eq!(r.min_rtt_us, 50);
+    }
+
+    // ---- RFC 8985 §6.3 RACK_mark_losses_on_RTO helper tests ----
+
+    /// Build a `RetransEntry` for the pure-helper tests. `xmit_ts_ns`
+    /// feeds the age formula; `sacked`/`lost` flags drive the skip
+    /// rules. The null `Mbuf` is never dereferenced by the helper.
+    fn make_entry(seq: u32, len: u16, xmit_ts_ns: u64, sacked: bool, lost: bool) -> RetransEntry {
+        RetransEntry {
+            seq,
+            len,
+            mbuf: crate::mempool::Mbuf::null_for_test(),
+            first_tx_ts_ns: xmit_ts_ns,
+            xmit_count: 1,
+            sacked,
+            lost,
+            xmit_ts_ns,
+        }
+    }
+
+    fn deque(v: Vec<RetransEntry>) -> VecDeque<RetransEntry> {
+        VecDeque::from(v)
+    }
+
+    #[test]
+    fn rack_rto_marks_front_entry_at_snd_una() {
+        // Front entry (seq == snd_una) is always marked lost regardless
+        // of age — §6.3's "fire retrans for the front unacked" clause.
+        let entries = deque(vec![make_entry(100, 50, u64::MAX, false, false)]);
+        let lost = rack_mark_losses_on_rto(&entries, 100, 50_000, 1_000, 0);
+        assert_eq!(lost, vec![0]);
+    }
+
+    #[test]
+    fn rack_rto_marks_aged_out_entries() {
+        // xmit_us=1_000 (from xmit_ts_ns=1_000_000 ns), rtt=50_000,
+        // reo_wnd=1_000, now=52_100 → 1_000 + 50_000 + 1_000 = 52_000
+        // ≤ 52_100 → lost. snd_una differs from entry.seq to isolate
+        // the age clause.
+        let entries = deque(vec![make_entry(100, 50, 1_000_000, false, false)]);
+        let lost = rack_mark_losses_on_rto(&entries, 50, 50_000, 1_000, 52_100);
+        assert_eq!(lost, vec![0]);
+    }
+
+    #[test]
+    fn rack_rto_skips_sacked_entries() {
+        // Sacked entry — skipped even at seq == snd_una and ancient age.
+        let entries = deque(vec![make_entry(100, 50, 0, true, false)]);
+        let lost = rack_mark_losses_on_rto(&entries, 100, 50_000, 1_000, 1_000_000);
+        assert!(lost.is_empty());
+    }
+
+    #[test]
+    fn rack_rto_skips_already_lost_entries() {
+        // Already-lost entry — skipped so we don't double-mark.
+        let entries = deque(vec![make_entry(100, 50, 0, false, true)]);
+        let lost = rack_mark_losses_on_rto(&entries, 100, 50_000, 1_000, 1_000_000);
+        assert!(lost.is_empty());
+    }
+
+    #[test]
+    fn rack_rto_skips_cum_acked_entries() {
+        // Entry range is [100, 150); snd_una=200 has advanced past 150.
+        // Not in flight — prune_below handles it; helper must not touch.
+        let entries = deque(vec![make_entry(100, 50, 0, false, false)]);
+        let lost = rack_mark_losses_on_rto(&entries, 200, 50_000, 1_000, 1_000_000);
+        assert!(lost.is_empty());
+    }
+
+    #[test]
+    fn rack_rto_multi_segment_marks_all_eligible() {
+        // Five back-to-back segments, all unacked, all past the age
+        // window (xmit_us=1_000, now_us=1_100_000 → age well beyond
+        // rtt+reo_wnd). All five must be marked; this is the A5 fix
+        // that stops tail recovery from dribbling one-segment-per-ACK.
+        let entries = deque(vec![
+            make_entry(100, 50, 1_000_000, false, false),
+            make_entry(150, 50, 1_000_000, false, false),
+            make_entry(200, 50, 1_000_000, false, false),
+            make_entry(250, 50, 1_000_000, false, false),
+            make_entry(300, 50, 1_000_000, false, false),
+        ]);
+        let lost = rack_mark_losses_on_rto(&entries, 100, 50_000, 1_000, 1_100_000);
+        assert_eq!(lost, vec![0, 1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn rack_rto_fresh_entries_not_aged_out_not_marked() {
+        // Entry xmitted 1µs ago (xmit_us=49_999, now_us=50_000) —
+        // age=1, rtt=50_000, reo_wnd=1_000 → 49_999 + 50_000 + 1_000
+        // = 100_999, not ≤ 50_000. snd_una differs from entry.seq so
+        // the front-entry clause is also inert. Must NOT be marked.
+        let entries = deque(vec![make_entry(150, 50, 49_999_000, false, false)]);
+        let lost = rack_mark_losses_on_rto(&entries, 100, 50_000, 1_000, 50_000);
+        assert!(lost.is_empty());
     }
 }

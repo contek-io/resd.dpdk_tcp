@@ -881,37 +881,105 @@ impl Engine {
             return;
         }
 
-        // Phase 3: retransmit the front in-flight entry.
-        self.retransmit(handle, 0);
+        // A5.5 Task 14 (AD-17): RFC 8985 §6.3 `RACK_mark_losses_on_RTO`
+        // pass. Walks `snd_retrans` and collects every entry matching
+        // the §6.3 formula (front-at-snd.una OR age-expired, minus
+        // sacked / already-lost / cum-acked). Retransmitting ALL of
+        // them in this pass (instead of just the front, as A5 Task 12
+        // did) closes the tail-recovery dribble where subsequent ACKs
+        // were driving one-seg-per-ACK retrans; a single RTO fire now
+        // restores the full lost burst in one shot. Fallback: if the
+        // helper returns empty (should not happen since the front
+        // always matches the `seq == snd_una` clause when snd_retrans
+        // is non-empty), fall back to A5 front-only retransmit to
+        // avoid regression.
+        let lost_indexes = {
+            let ft = self.flow_table.borrow();
+            let Some(c) = ft.get(handle) else { return };
+            let rtt_us = c.rtt_est.srtt_us().unwrap_or(c.rack.min_rtt_us);
+            let reo_wnd = c.rack.reo_wnd_us;
+            let now_us = (crate::clock::now_ns() / 1_000) as u32;
+            crate::tcp_rack::rack_mark_losses_on_rto(
+                &c.snd_retrans.entries,
+                c.snd_una,
+                rtt_us,
+                reo_wnd,
+                now_us,
+            )
+        };
+        {
+            let mut ft = self.flow_table.borrow_mut();
+            if let Some(c) = ft.get_mut(handle) {
+                for &idx in &lost_indexes {
+                    if let Some(e) = c.snd_retrans.entries.get_mut(idx as usize) {
+                        e.lost = true;
+                    }
+                }
+            }
+        }
+
+        // Phase 3: retransmit every §6.3-eligible in-flight entry.
+        // `retransmit()` bumps `tx_retrans` per call (N total), and
+        // clears `entry.lost` on success so sub-sequent RACK-detect
+        // passes don't see stale flags. `tx_rto` bumps exactly once
+        // per fire — preserves A5 one-RTO-fire-counter semantics
+        // (one `tx_rto` + N `tx_retrans`).
+        if lost_indexes.is_empty() {
+            // Defensive fallback — helper should always pick the front.
+            self.retransmit(handle, 0);
+        } else {
+            for &idx in &lost_indexes {
+                self.retransmit(handle, idx as usize);
+            }
+        }
         crate::counters::inc(&self.counters.tcp.tx_rto);
 
         // Task 20: forensic per-packet event emission, gated by
-        // `tcp_per_packet_events`. Order: TcpRetrans (the segment we
-        // just retransmitted) then TcpLossDetected{cause: Rto} (declares
-        // why). Placed BEFORE the max-retrans-count check so the final
-        // RTO that triggers ETIMEDOUT still emits its per-packet trail
-        // for forensic reconstruction. Both borrows are narrowly scoped
-        // so no nested RefCell overlap with the subsequent backoff /
-        // re-arm phases.
+        // `tcp_per_packet_events`. One `TcpRetrans` per retransmitted
+        // entry (N total); one `TcpLossDetected{cause: Rto}` per fire
+        // (the cause belongs to the RTO itself, not per-segment).
+        // Placed BEFORE the max-retrans-count check so the final RTO
+        // that triggers ETIMEDOUT still emits its per-packet trail for
+        // forensic reconstruction. Borrows stay narrowly scoped so no
+        // nested RefCell overlap with the subsequent backoff / re-arm
+        // phases.
         if self.cfg.tcp_per_packet_events {
-            let (seq, rtx_count) = {
-                let ft = self.flow_table.borrow();
-                ft.get(handle)
-                    .and_then(|c| c.snd_retrans.front())
-                    .map(|e| (e.seq, e.xmit_count as u32))
-                    .unwrap_or((0, 0))
-            };
             let emitted_ts_ns = crate::clock::now_ns();
+            let retrans_snapshots: Vec<(u32, u32)> = {
+                let ft = self.flow_table.borrow();
+                let c = match ft.get(handle) {
+                    Some(c) => c,
+                    None => return,
+                };
+                if lost_indexes.is_empty() {
+                    c.snd_retrans
+                        .front()
+                        .map(|e| vec![(e.seq, e.xmit_count as u32)])
+                        .unwrap_or_default()
+                } else {
+                    lost_indexes
+                        .iter()
+                        .filter_map(|&i| {
+                            c.snd_retrans
+                                .entries
+                                .get(i as usize)
+                                .map(|e| (e.seq, e.xmit_count as u32))
+                        })
+                        .collect()
+                }
+            };
             let mut ev = self.events.borrow_mut();
-            ev.push(
-                InternalEvent::TcpRetrans {
-                    conn: handle,
-                    seq,
-                    rtx_count,
-                    emitted_ts_ns,
-                },
-                &self.counters,
-            );
+            for (seq, rtx_count) in retrans_snapshots {
+                ev.push(
+                    InternalEvent::TcpRetrans {
+                        conn: handle,
+                        seq,
+                        rtx_count,
+                        emitted_ts_ns,
+                    },
+                    &self.counters,
+                );
+            }
             ev.push(
                 InternalEvent::TcpLossDetected {
                     conn: handle,
