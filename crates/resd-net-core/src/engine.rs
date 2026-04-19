@@ -3548,34 +3548,45 @@ impl Engine {
                     self.tx_cksum_offload_active,
                 );
             }
-            // Bump refcount BEFORE tx_burst: after the call, the driver
-            // holds one ref (freed on TX-completion) and we hold one ref
-            // that lives in `snd_retrans` until Task 11's ACK-prune path.
-            // On tx_burst failure neither owner takes the mbuf, so we free
-            // it twice below (each call decrements refcount by 1).
+            // Bump refcount BEFORE the ring push: after `drain_tx_pending_data`
+            // calls tx_burst, the driver holds one ref (freed on TX-completion)
+            // and we hold one ref that lives in `snd_retrans` until the
+            // ACK-prune path retires it. A6 Task 12 moved the burst call out
+            // of this loop into `drain_tx_pending_data`; on partial-fill the
+            // drain frees unsent tail mbufs and bumps `tx_drop_full_ring`, so
+            // the inline failure-cleanup that used to live here is gone.
             unsafe { sys::resd_rte_mbuf_refcnt_update(m, 1) };
 
-            let mut pkts = [m];
-            let sent = unsafe {
-                sys::resd_rte_eth_tx_burst(
-                    self.cfg.port_id,
-                    self.cfg.tx_queue_id,
-                    pkts.as_mut_ptr(),
-                    1,
-                )
-            } as usize;
-            if sent != 1 {
-                // Driver did not take the mbuf — free both refs (2 → 1 → 0).
-                unsafe { sys::resd_rte_pktmbuf_free(m) };
-                unsafe { sys::resd_rte_pktmbuf_free(m) };
-                inc(&self.counters.eth.tx_drop_full_ring);
-                if accepted == 0 {
-                    return Err(Error::SendBufferFull);
+            // A6 (spec §3.2): push onto the batch ring instead of
+            // per-segment tx_burst(1). Drain-and-retry on ring full so
+            // a single send never stalls on a saturated ring.
+            let pushed_ok = {
+                let mut ring = self.tx_pending_data.borrow_mut();
+                if ring.len() < ring.capacity() {
+                    // Safety: `m` is non-null (checked above by the
+                    // alloc path); NonNull::new_unchecked avoids a
+                    // second null-check on the hot path.
+                    ring.push(unsafe { std::ptr::NonNull::new_unchecked(m) });
+                    true
+                } else {
+                    false
                 }
-                break;
+            };
+            if !pushed_ok {
+                // Ring at capacity. Drain it, then push this mbuf.
+                // Borrow sequence: the `ring` borrow was dropped at the
+                // end of the scope above, so drain_tx_pending_data can
+                // take its own borrow_mut. The re-borrow below is safe
+                // because drain releases its borrow before returning.
+                self.drain_tx_pending_data();
+                let mut ring = self.tx_pending_data.borrow_mut();
+                ring.push(unsafe { std::ptr::NonNull::new_unchecked(m) });
             }
+            // eth.tx_bytes accounts accepted bytes — keep per-segment.
+            // eth.tx_pkts is now incremented by drain_tx_pending_data
+            // after the actual burst (Task 5). A pushed-but-unsent mbuf
+            // counts as tx_drop_full_ring in the drain path.
             crate::counters::add(&self.counters.eth.tx_bytes, n as u64);
-            inc(&self.counters.eth.tx_pkts);
             inc(&self.counters.tcp.tx_data);
             #[cfg(feature = "obs-byte-counters")]
             {
@@ -3656,6 +3667,13 @@ impl Engine {
         }
         if accepted < bytes.len() as u32 {
             inc(&self.counters.tcp.send_buf_full);
+            // A6 (spec §3.3): signal for WRITABLE hysteresis (Task 16).
+            // The ACK-prune path in tcp_input.rs watches this bit + fires
+            // a single WRITABLE event once in_flight <= send_buffer_bytes / 2.
+            let mut ft = self.flow_table.borrow_mut();
+            if let Some(c) = ft.get_mut(handle) {
+                c.send_refused_pending = true;
+            }
         }
 
         // Flush the per-call TX-payload-bytes accumulator. Single
@@ -4203,6 +4221,24 @@ mod tests {
         fn _check(e: &Engine, h: crate::flow_table::ConnHandle) {
             let _: Result<u32, crate::Error> = e.send_bytes(h, b"x");
         }
+    }
+
+    // A6 Task 12: compile-only signature check that `send_bytes` still
+    // returns Result<u32, Error> and that the `send_refused_pending`
+    // field is readable on a TcpConn looked up via `flow_table()`. Full
+    // end-to-end coverage (short-accept → bit set → WRITABLE fires on
+    // ACK-prune) lives in Task 21's TAP integration.
+    #[test]
+    fn send_bytes_sets_send_refused_pending_on_short_accept() {
+        // Compile-only signature check. Full end-to-end in Task 21.
+        fn _compile_only(e: &Engine, handle: crate::flow_table::ConnHandle) {
+            let _: Result<u32, crate::Error> = e.send_bytes(handle, b"x");
+            let ft = e.flow_table();
+            if let Some(c) = ft.get(handle) {
+                let _ = c.send_refused_pending;
+            }
+        }
+        let _ = _compile_only;
     }
 
     #[test]
