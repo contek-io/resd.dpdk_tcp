@@ -144,6 +144,133 @@ pub unsafe extern "C" fn resd_net_engine_destroy(p: *mut resd_net_engine) {
     // Drop runs Engine's Drop impl.
 }
 
+/// Pure translation: `InternalEvent` → `resd_net_event_t`. The caller
+/// resolves the `Readable` variant's (data_ptr, data_len) via the engine's
+/// flow table and passes it in; for every other variant the tuple is
+/// ignored. `enqueued_ts_ns` on the returned event is read from the
+/// variant's `emitted_ts_ns` field — sampled at push time inside the
+/// engine (A5.5 Task 1), not at drain time. Split out so the "drain copies
+/// through, not re-samples" contract is unit-testable without an EAL-backed
+/// Engine or a mock clock.
+fn build_event_from_internal(
+    ev: &resd_net_core::tcp_events::InternalEvent,
+    readable_view: (*const u8, u32),
+) -> resd_net_event_t {
+    use resd_net_core::tcp_events::{InternalEvent, LossCause};
+    let emitted = match ev {
+        InternalEvent::Connected { emitted_ts_ns, .. }
+        | InternalEvent::Readable { emitted_ts_ns, .. }
+        | InternalEvent::Closed { emitted_ts_ns, .. }
+        | InternalEvent::StateChange { emitted_ts_ns, .. }
+        | InternalEvent::Error { emitted_ts_ns, .. }
+        | InternalEvent::TcpRetrans { emitted_ts_ns, .. }
+        | InternalEvent::TcpLossDetected { emitted_ts_ns, .. } => *emitted_ts_ns,
+    };
+    match ev {
+        InternalEvent::Connected {
+            conn, rx_hw_ts_ns, ..
+        } => resd_net_event_t {
+            kind: resd_net_event_kind_t::RESD_NET_EVT_CONNECTED,
+            conn: *conn as u64,
+            rx_hw_ts_ns: *rx_hw_ts_ns,
+            enqueued_ts_ns: emitted,
+            u: resd_net_event_payload_t { _pad: [0u8; 16] },
+        },
+        InternalEvent::Readable {
+            conn,
+            byte_len,
+            rx_hw_ts_ns,
+            ..
+        } => resd_net_event_t {
+            kind: resd_net_event_kind_t::RESD_NET_EVT_READABLE,
+            conn: *conn as u64,
+            rx_hw_ts_ns: *rx_hw_ts_ns,
+            enqueued_ts_ns: emitted,
+            u: resd_net_event_payload_t {
+                readable: resd_net_event_readable_t {
+                    data: readable_view.0,
+                    data_len: *byte_len,
+                },
+            },
+        },
+        InternalEvent::Closed { conn, err, .. } => resd_net_event_t {
+            kind: resd_net_event_kind_t::RESD_NET_EVT_CLOSED,
+            conn: *conn as u64,
+            rx_hw_ts_ns: 0,
+            enqueued_ts_ns: emitted,
+            u: resd_net_event_payload_t {
+                closed: resd_net_event_error_t { err: *err },
+            },
+        },
+        InternalEvent::StateChange {
+            conn, from, to, ..
+        } => resd_net_event_t {
+            kind: resd_net_event_kind_t::RESD_NET_EVT_TCP_STATE_CHANGE,
+            conn: *conn as u64,
+            rx_hw_ts_ns: 0,
+            enqueued_ts_ns: emitted,
+            u: resd_net_event_payload_t {
+                tcp_state: resd_net_event_tcp_state_t {
+                    from_state: *from as u8,
+                    to_state: *to as u8,
+                },
+            },
+        },
+        InternalEvent::Error { conn, err, .. } => resd_net_event_t {
+            kind: resd_net_event_kind_t::RESD_NET_EVT_ERROR,
+            conn: *conn as u64,
+            rx_hw_ts_ns: 0,
+            enqueued_ts_ns: emitted,
+            u: resd_net_event_payload_t {
+                error: resd_net_event_error_t { err: *err },
+            },
+        },
+        // A5 Task 20: per-packet retransmit observability. Emitted
+        // (only) when `tcp_per_packet_events=true`; carries the
+        // just-retransmitted segment's seq + post-retrans xmit_count.
+        InternalEvent::TcpRetrans {
+            conn,
+            seq,
+            rtx_count,
+            ..
+        } => resd_net_event_t {
+            kind: resd_net_event_kind_t::RESD_NET_EVT_TCP_RETRANS,
+            conn: *conn as u64,
+            rx_hw_ts_ns: 0,
+            enqueued_ts_ns: emitted,
+            u: resd_net_event_payload_t {
+                tcp_retrans: resd_net_event_tcp_retrans_t {
+                    seq: *seq,
+                    rtx_count: *rtx_count,
+                },
+            },
+        },
+        // A5 Task 20: loss-detector observability. `trigger` encodes
+        // `LossCause` as `Rack=0`, `Tlp=1`, `Rto=2` (matching enum
+        // order). `first_seq` is left 0 here — the paired TcpRetrans
+        // event that precedes each TcpLossDetected carries the seq.
+        InternalEvent::TcpLossDetected { conn, cause, .. } => {
+            let trigger: u8 = match cause {
+                LossCause::Rack => 0,
+                LossCause::Tlp => 1,
+                LossCause::Rto => 2,
+            };
+            resd_net_event_t {
+                kind: resd_net_event_kind_t::RESD_NET_EVT_TCP_LOSS_DETECTED,
+                conn: *conn as u64,
+                rx_hw_ts_ns: 0,
+                enqueued_ts_ns: emitted,
+                u: resd_net_event_payload_t {
+                    tcp_loss: resd_net_event_tcp_loss_t {
+                        first_seq: 0,
+                        trigger,
+                    },
+                },
+            }
+        }
+    }
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn resd_net_poll(
     p: *mut resd_net_engine,
@@ -160,131 +287,28 @@ pub unsafe extern "C" fn resd_net_poll(
     }
     let mut filled: u32 = 0;
     e.drain_events(max_events, |ev, engine| {
-        let ts = resd_net_core::clock::now_ns();
-        // Build the event value fully before writing it to events_out, so
-        // we never read a possibly-uninitialized `kind` discriminant.
-        let event: resd_net_event_t = match ev {
-            resd_net_core::tcp_events::InternalEvent::Connected {
-                conn,
-                rx_hw_ts_ns,
-                ..
-            } => {
-                resd_net_event_t {
-                    kind: resd_net_event_kind_t::RESD_NET_EVT_CONNECTED,
-                    conn: *conn as u64,
-                    rx_hw_ts_ns: *rx_hw_ts_ns,
-                    enqueued_ts_ns: ts,
-                    u: resd_net_event_payload_t { _pad: [0u8; 16] },
-                }
-            }
+        // Resolve the `Readable` variant's data-view pointer into the
+        // connection's last_read_buf (Task 19 fix for multi-segment polls).
+        // Non-Readable variants ignore the tuple.
+        let readable_view: (*const u8, u32) = match ev {
             resd_net_core::tcp_events::InternalEvent::Readable {
-                conn,
-                byte_offset,
-                byte_len,
-                rx_hw_ts_ns,
-                ..
+                conn, byte_offset, byte_len, ..
             } => {
-                // Build the borrowed-view pointer into the connection's
-                // last_read_buf at the event's byte_offset (Task 19 fix
-                // for multi-segment polls).
                 let ft = engine.flow_table();
-                let (data_ptr, data_len) = match ft.get(*conn) {
+                match ft.get(*conn) {
                     Some(c) => {
                         let off = *byte_offset as usize;
                         let ptr = unsafe { c.recv.last_read_buf.as_ptr().add(off) };
                         (ptr, *byte_len)
                     }
                     None => (std::ptr::null(), 0),
-                };
-                resd_net_event_t {
-                    kind: resd_net_event_kind_t::RESD_NET_EVT_READABLE,
-                    conn: *conn as u64,
-                    rx_hw_ts_ns: *rx_hw_ts_ns,
-                    enqueued_ts_ns: ts,
-                    u: resd_net_event_payload_t {
-                        readable: resd_net_event_readable_t {
-                            data: data_ptr,
-                            data_len,
-                        },
-                    },
                 }
             }
-            resd_net_core::tcp_events::InternalEvent::Closed { conn, err, .. } => resd_net_event_t {
-                kind: resd_net_event_kind_t::RESD_NET_EVT_CLOSED,
-                conn: *conn as u64,
-                rx_hw_ts_ns: 0,
-                enqueued_ts_ns: ts,
-                u: resd_net_event_payload_t {
-                    closed: resd_net_event_error_t { err: *err },
-                },
-            },
-            resd_net_core::tcp_events::InternalEvent::StateChange { conn, from, to, .. } => {
-                resd_net_event_t {
-                    kind: resd_net_event_kind_t::RESD_NET_EVT_TCP_STATE_CHANGE,
-                    conn: *conn as u64,
-                    rx_hw_ts_ns: 0,
-                    enqueued_ts_ns: ts,
-                    u: resd_net_event_payload_t {
-                        tcp_state: resd_net_event_tcp_state_t {
-                            from_state: *from as u8,
-                            to_state: *to as u8,
-                        },
-                    },
-                }
-            }
-            resd_net_core::tcp_events::InternalEvent::Error { conn, err, .. } => resd_net_event_t {
-                kind: resd_net_event_kind_t::RESD_NET_EVT_ERROR,
-                conn: *conn as u64,
-                rx_hw_ts_ns: 0,
-                enqueued_ts_ns: ts,
-                u: resd_net_event_payload_t {
-                    error: resd_net_event_error_t { err: *err },
-                },
-            },
-            // A5 Task 20: per-packet retransmit observability. Emitted
-            // (only) when `tcp_per_packet_events=true`; carries the
-            // just-retransmitted segment's seq + post-retrans xmit_count.
-            resd_net_core::tcp_events::InternalEvent::TcpRetrans {
-                conn,
-                seq,
-                rtx_count,
-                ..
-            } => resd_net_event_t {
-                kind: resd_net_event_kind_t::RESD_NET_EVT_TCP_RETRANS,
-                conn: *conn as u64,
-                rx_hw_ts_ns: 0,
-                enqueued_ts_ns: ts,
-                u: resd_net_event_payload_t {
-                    tcp_retrans: resd_net_event_tcp_retrans_t {
-                        seq: *seq,
-                        rtx_count: *rtx_count,
-                    },
-                },
-            },
-            // A5 Task 20: loss-detector observability. `trigger` encodes
-            // `LossCause` as `Rack=0`, `Tlp=1`, `Rto=2` (matching enum
-            // order). `first_seq` is left 0 here — the paired TcpRetrans
-            // event that precedes each TcpLossDetected carries the seq.
-            resd_net_core::tcp_events::InternalEvent::TcpLossDetected { conn, cause, .. } => {
-                let trigger: u8 = match cause {
-                    resd_net_core::tcp_events::LossCause::Rack => 0,
-                    resd_net_core::tcp_events::LossCause::Tlp => 1,
-                    resd_net_core::tcp_events::LossCause::Rto => 2,
-                };
-                resd_net_event_t {
-                    kind: resd_net_event_kind_t::RESD_NET_EVT_TCP_LOSS_DETECTED,
-                    conn: *conn as u64,
-                    rx_hw_ts_ns: 0,
-                    enqueued_ts_ns: ts,
-                    u: resd_net_event_payload_t {
-                        tcp_loss: resd_net_event_tcp_loss_t {
-                            first_seq: 0,
-                            trigger,
-                        },
-                    },
-                }
-            }
+            _ => (std::ptr::null(), 0),
         };
+        // Build the event value fully before writing it to events_out, so
+        // we never read a possibly-uninitialized `kind` discriminant.
+        let event = build_event_from_internal(ev, readable_view);
         unsafe {
             std::ptr::write(events_out.add(filled as usize), event);
         }
@@ -520,5 +544,70 @@ mod tests {
     fn close_null_engine_returns_einval() {
         let rc = unsafe { resd_net_close(std::ptr::null_mut(), 1u64, 0) };
         assert_eq!(rc, -libc::EINVAL);
+    }
+
+    // A5.5 Task 2: drain path must read `emitted_ts_ns` through from the
+    // InternalEvent variant, NOT re-sample the clock at drain time. Proving
+    // this end-to-end via `resd_net_poll` would need a mock-clock engine
+    // (which doesn't exist; DPDK/EAL-backed engines can't be built in a unit
+    // test). Instead we exercise the pure translation helper with an
+    // `emitted_ts_ns` value that could never match the drain-time clock
+    // sample, and assert it flows through to `resd_net_event_t`.
+    #[test]
+    fn drain_reads_emitted_ts_ns_through_not_drain_clock() {
+        use resd_net_core::flow_table::ConnHandle;
+        use resd_net_core::tcp_events::{InternalEvent, LossCause};
+        use resd_net_core::tcp_state::TcpState;
+
+        const EMITTED: u64 = 12345;
+        let cases: Vec<InternalEvent> = vec![
+            InternalEvent::Connected {
+                conn: ConnHandle::default(),
+                rx_hw_ts_ns: 0,
+                emitted_ts_ns: EMITTED,
+            },
+            InternalEvent::Readable {
+                conn: ConnHandle::default(),
+                byte_offset: 0,
+                byte_len: 0,
+                rx_hw_ts_ns: 0,
+                emitted_ts_ns: EMITTED,
+            },
+            InternalEvent::Closed {
+                conn: ConnHandle::default(),
+                err: 0,
+                emitted_ts_ns: EMITTED,
+            },
+            InternalEvent::StateChange {
+                conn: ConnHandle::default(),
+                from: TcpState::SynSent,
+                to: TcpState::Established,
+                emitted_ts_ns: EMITTED,
+            },
+            InternalEvent::Error {
+                conn: ConnHandle::default(),
+                err: -1,
+                emitted_ts_ns: EMITTED,
+            },
+            InternalEvent::TcpRetrans {
+                conn: ConnHandle::default(),
+                seq: 0,
+                rtx_count: 1,
+                emitted_ts_ns: EMITTED,
+            },
+            InternalEvent::TcpLossDetected {
+                conn: ConnHandle::default(),
+                cause: LossCause::Rack,
+                emitted_ts_ns: EMITTED,
+            },
+        ];
+        for ev in &cases {
+            let out = build_event_from_internal(ev, (std::ptr::null(), 0));
+            assert_eq!(
+                out.enqueued_ts_ns, EMITTED,
+                "variant {:?} failed to copy emitted_ts_ns through",
+                ev
+            );
+        }
     }
 }

@@ -138,6 +138,12 @@ pub struct resd_net_event_t {
     pub kind: resd_net_event_kind_t,
     pub conn: resd_net_conn_t,
     pub rx_hw_ts_ns: u64,
+    /// ns timestamp (engine monotonic clock) sampled at event emission
+    /// inside the stack. Unrelated to `rx_hw_ts_ns`. For packet-triggered
+    /// events, emission time is when the stack processed the triggering
+    /// packet, not when the NIC received it — use `rx_hw_ts_ns` for
+    /// NIC-arrival time. For timer-triggered events (RTO fire, RACK / TLP
+    /// loss-detected), emission time is the fire instant.
     pub enqueued_ts_ns: u64,
     pub u: resd_net_event_payload_t,
 }
