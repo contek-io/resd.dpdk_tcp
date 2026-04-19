@@ -11,16 +11,16 @@ use std::ptr;
 
 /// A6 (spec §3.5): latency preset — all existing config fields honored
 /// as-written (post zero-sentinel substitution).
-pub const PRESET_LATENCY: u8 = 0;
+pub const RESD_NET_PRESET_LATENCY: u8 = 0;
 /// A6 (spec §3.5): RFC-compliance preset — overrides five fields per
 /// parent spec §4: `tcp_nagle`, `tcp_delayed_ack`, `cc_mode`,
 /// `tcp_min_rto_us`, `tcp_initial_rto_us`.
-pub const PRESET_RFC_COMPLIANCE: u8 = 1;
+pub const RESD_NET_PRESET_RFC_COMPLIANCE: u8 = 1;
 
 /// A6 (spec §3.5): apply a preset to a core `EngineConfig` after the
 /// zero-sentinel substitution pass. The preset override is stronger
 /// than defaults — any explicit caller values for the five preset
-/// fields are overwritten when `preset == PRESET_RFC_COMPLIANCE`.
+/// fields are overwritten when `preset == RESD_NET_PRESET_RFC_COMPLIANCE`.
 ///
 /// Returns `Err(())` for unknown presets (>= 2); `resd_net_engine_create`
 /// surfaces that as a null-pointer return to the C caller.
@@ -29,8 +29,8 @@ pub fn apply_preset(
     core_cfg: &mut resd_net_core::engine::EngineConfig,
 ) -> Result<(), ()> {
     match preset {
-        PRESET_LATENCY => Ok(()),
-        PRESET_RFC_COMPLIANCE => {
+        RESD_NET_PRESET_LATENCY => Ok(()),
+        RESD_NET_PRESET_RFC_COMPLIANCE => {
             core_cfg.tcp_nagle = true;
             core_cfg.tcp_delayed_ack = true;
             core_cfg.cc_mode = 1; // Reno
@@ -160,12 +160,12 @@ pub unsafe extern "C" fn resd_net_engine_create(
         tcp_msl_ms: msl,
         tcp_nagle: cfg.tcp_nagle,
         // A6 Task 9 (spec §3.5): ABI-to-core pass-through. Pre-preset
-        // value honored when `preset == PRESET_LATENCY`; `apply_preset`
-        // below overwrites to `true` when `preset == PRESET_RFC_COMPLIANCE`.
+        // value honored when `preset == RESD_NET_PRESET_LATENCY`; `apply_preset`
+        // below overwrites to `true` when `preset == RESD_NET_PRESET_RFC_COMPLIANCE`.
         tcp_delayed_ack: cfg.tcp_delayed_ack,
         // A6 Task 9 (spec §3.5): ABI-to-core pass-through. Pre-preset
-        // value honored when `preset == PRESET_LATENCY`; `apply_preset`
-        // overwrites to `1` (Reno) when `preset == PRESET_RFC_COMPLIANCE`.
+        // value honored when `preset == RESD_NET_PRESET_LATENCY`; `apply_preset`
+        // overwrites to `1` (Reno) when `preset == RESD_NET_PRESET_RFC_COMPLIANCE`.
         cc_mode: cfg.cc_mode,
         tcp_min_rto_us: min_rto_us,
         tcp_initial_rto_us: initial_rto_us,
@@ -855,8 +855,8 @@ mod tests {
     // lets us exercise the preset path without an EAL-backed Engine.
     #[test]
     fn preset_rfc_compliance_is_known_constant() {
-        assert_eq!(PRESET_LATENCY, 0);
-        assert_eq!(PRESET_RFC_COMPLIANCE, 1);
+        assert_eq!(RESD_NET_PRESET_LATENCY, 0);
+        assert_eq!(RESD_NET_PRESET_RFC_COMPLIANCE, 1);
     }
 
     #[test]

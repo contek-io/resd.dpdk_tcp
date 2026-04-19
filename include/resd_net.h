@@ -21,14 +21,14 @@
  * A6 (spec §3.5): latency preset — all existing config fields honored
  * as-written (post zero-sentinel substitution).
  */
-#define PRESET_LATENCY 0
+#define RESD_NET_PRESET_LATENCY 0
 
 /**
  * A6 (spec §3.5): RFC-compliance preset — overrides five fields per
  * parent spec §4: `tcp_nagle`, `tcp_delayed_ack`, `cc_mode`,
  * `tcp_min_rto_us`, `tcp_initial_rto_us`.
  */
-#define PRESET_RFC_COMPLIANCE 1
+#define RESD_NET_PRESET_RFC_COMPLIANCE 1
 
 /**
  * Close flags — bitmask for resd_net_close.
