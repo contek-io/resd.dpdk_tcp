@@ -3881,9 +3881,13 @@ impl Engine {
     /// Retransmit the entry at `entry_index` in `conn.snd_retrans`. Allocates
     /// a fresh header mbuf from `tx_hdr_mempool`, writes L2+L3+TCP headers via
     /// `build_retrans_header`, bumps the held data mbuf's refcount, chains
-    /// header → data via `rte_pktmbuf_chain`, and TXes. On chain-failure or
-    /// alloc-failure, cleans up mbuf references atomically; on TX-ring-full,
-    /// `rte_pktmbuf_free(head)` frees the whole chain per DPDK semantics.
+    /// header → data via `rte_pktmbuf_chain`, and pushes onto the batch
+    /// `tx_pending_data` ring (spec §3.2 — drained by
+    /// `drain_tx_pending_data` per Task 5). On chain-failure or alloc-failure,
+    /// cleans up mbuf references atomically and emits `InternalEvent::Error`
+    /// with `err=-ENOMEM` per occurrence (spec §3.6 Site 2); on TX-ring-full
+    /// at drain time, the drain walks the chain via `rte_pktmbuf_free(head)`
+    /// per DPDK semantics and bumps `eth.tx_drop_full_ring`.
     ///
     /// Bumps `xmit_count` + `xmit_ts_ns` on the entry and `tcp.tx_retrans` on
     /// success. Does NOT decide whether to retransmit — that's the caller's
@@ -3955,6 +3959,19 @@ impl Engine {
         let hdr_mbuf = unsafe { sys::resd_rte_pktmbuf_alloc(self.tx_hdr_mempool.as_ptr()) };
         if hdr_mbuf.is_null() {
             inc(&self.counters.eth.tx_drop_nomem);
+            // A6 (spec §3.6 Site 2): surface retransmit ENOMEM as an
+            // Error event per occurrence — callers don't see the inline
+            // tx_drop_nomem bump unless they poll the counter.
+            let emitted_ts_ns = crate::clock::now_ns();
+            let mut ev = self.events.borrow_mut();
+            ev.push(
+                InternalEvent::Error {
+                    conn: conn_handle,
+                    err: -libc::ENOMEM,
+                    emitted_ts_ns,
+                },
+                &self.counters,
+            );
             return;
         }
 
@@ -4020,12 +4037,37 @@ impl Engine {
             // Header-too-small is impossible for 128-byte scratch; keep explicit.
             unsafe { sys::resd_rte_pktmbuf_free(hdr_mbuf) };
             inc(&self.counters.eth.tx_drop_nomem);
+            // A6 (spec §3.6 Site 2): Error event per occurrence on
+            // retransmit ENOMEM path — header-build failure is treated
+            // as no-memory for the caller-visible surface.
+            let emitted_ts_ns = crate::clock::now_ns();
+            let mut ev = self.events.borrow_mut();
+            ev.push(
+                InternalEvent::Error {
+                    conn: conn_handle,
+                    err: -libc::ENOMEM,
+                    emitted_ts_ns,
+                },
+                &self.counters,
+            );
             return;
         };
         let dst = unsafe { sys::resd_rte_pktmbuf_append(hdr_mbuf, hdr_n as u16) };
         if dst.is_null() {
             unsafe { sys::resd_rte_pktmbuf_free(hdr_mbuf) };
             inc(&self.counters.eth.tx_drop_nomem);
+            // A6 (spec §3.6 Site 2): Error event per occurrence on
+            // retransmit ENOMEM path — append-null means no data-room.
+            let emitted_ts_ns = crate::clock::now_ns();
+            let mut ev = self.events.borrow_mut();
+            ev.push(
+                InternalEvent::Error {
+                    conn: conn_handle,
+                    err: -libc::ENOMEM,
+                    emitted_ts_ns,
+                },
+                &self.counters,
+            );
             return;
         }
         // Safety: `dst` points to `hdr_n` writable bytes inside hdr_mbuf.
@@ -4067,21 +4109,45 @@ impl Engine {
             unsafe { sys::resd_rte_pktmbuf_free(hdr_mbuf) };
             unsafe { sys::resd_rte_mbuf_refcnt_update(data_mbuf_ptr, -1) };
             inc(&self.counters.eth.tx_drop_nomem);
+            // A6 (spec §3.6 Site 2): Error event per occurrence on
+            // retransmit ENOMEM path — chain-fail surfaces as ENOMEM
+            // to the caller alongside the tx_drop_nomem bump.
+            let emitted_ts_ns = crate::clock::now_ns();
+            let mut ev = self.events.borrow_mut();
+            ev.push(
+                InternalEvent::Error {
+                    conn: conn_handle,
+                    err: -libc::ENOMEM,
+                    emitted_ts_ns,
+                },
+                &self.counters,
+            );
             return;
         }
 
-        // Phase 5: TX the chained mbuf.
-        let mut bufs = [hdr_mbuf];
-        let sent = unsafe {
-            sys::resd_rte_eth_tx_burst(self.cfg.port_id, self.cfg.tx_queue_id, bufs.as_mut_ptr(), 1)
-        } as usize;
-        if sent == 0 {
-            // TX ring full. `rte_pktmbuf_free(hdr_mbuf)` walks the chain
-            // and drops the data-mbuf refcount we bumped in Phase 4 as
-            // part of the standard chain-free path — do NOT double-free.
-            unsafe { sys::resd_rte_pktmbuf_free(hdr_mbuf) };
-            inc(&self.counters.eth.tx_drop_full_ring);
-            return;
+        // Phase 5: push retransmit frame onto the same batch ring as
+        // new-data sends so retries flow through one burst alongside.
+        // A6 (spec §3.2): ring-full drains and retries. `drain_tx_pending_data`
+        // owns `eth.tx_pkts` + `eth.tx_drop_full_ring` bookkeeping (Task 5),
+        // and on partial-fill it frees unsent mbufs — walking the chain
+        // drops the data-mbuf refcount we bumped in Phase 4.
+        let pushed_ok = {
+            let mut ring = self.tx_pending_data.borrow_mut();
+            if ring.len() < ring.capacity() {
+                // Safety: `hdr_mbuf` is non-null (checked in Phase 2);
+                // NonNull::new_unchecked avoids a second null-check.
+                ring.push(unsafe { std::ptr::NonNull::new_unchecked(hdr_mbuf) });
+                true
+            } else {
+                false
+            }
+        };
+        if !pushed_ok {
+            // Ring at capacity. Drain it, then push this mbuf. The drain
+            // releases its borrow before returning, so the re-borrow is safe.
+            self.drain_tx_pending_data();
+            let mut ring = self.tx_pending_data.borrow_mut();
+            ring.push(unsafe { std::ptr::NonNull::new_unchecked(hdr_mbuf) });
         }
 
         // Phase 6: update per-entry state + bump counters. Re-borrow the
@@ -4096,8 +4162,10 @@ impl Engine {
                 }
             }
         }
+        // Per-retransmit-occurrence counter — NOT per-tx-burst. `eth.tx_pkts`
+        // is owned by `drain_tx_pending_data` (Task 5); `eth.tx_bytes` stays
+        // per-segment to mirror `send_bytes` accepted-byte accounting.
         inc(&self.counters.tcp.tx_retrans);
-        inc(&self.counters.eth.tx_pkts);
         crate::counters::add(
             &self.counters.eth.tx_bytes,
             (hdr_n + entry_len as usize) as u64,
