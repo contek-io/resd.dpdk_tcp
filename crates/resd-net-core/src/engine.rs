@@ -292,6 +292,24 @@ pub struct Engine {
     // is compiled), the NIC-provided Toeplitz hash replaces the software
     // SipHash for the RX flow-table bucket pick. See spec §8.2.
     rss_hash_offload_active: bool,
+    /// Offset (in bytes) from the start of rte_mbuf where the NIC-provided
+    /// hardware RX timestamp lives. Populated at engine_create via
+    /// rte_mbuf_dynfield_lookup("rte_dynfield_timestamp"). `None` when
+    /// the PMD does not register the dynfield (expected on ENA — spec §10.5).
+    /// Spec §10.1. `allow(dead_code)` drops when Task 11 wires the
+    /// `hw_rx_ts_ns` accessor into the RX event-emission call sites.
+    #[cfg(feature = "hw-offload-rx-timestamp")]
+    #[allow(dead_code)]
+    rx_ts_offset: Option<i32>,
+    /// Bitmask in ol_flags that indicates a valid RX timestamp on this
+    /// mbuf. Populated via rte_mbuf_dynflag_lookup("rte_dynflag_rx_timestamp")
+    /// → the returned bit position translated to (1 << bit_pos). `None` when
+    /// the flag isn't registered. Expected `None` on ENA (spec §10.5).
+    /// `allow(dead_code)` drops when Task 11 wires the accessor into the
+    /// RX event-emission call sites.
+    #[cfg(feature = "hw-offload-rx-timestamp")]
+    #[allow(dead_code)]
+    rx_ts_flag_mask: Option<u64>,
     /// Driver name captured at bring-up; used by Task 12's LLQ verification
     /// to short-circuit non-ENA drivers. See spec §5.
     #[allow(dead_code)]
@@ -565,6 +583,46 @@ impl Engine {
             Self::program_rss_reta_single_queue(cfg.port_id, &dev_info_post)?;
         }
 
+        // A-HW Task 10: RX timestamp dynfield/dynflag lookup. Runs after
+        // rte_eth_dev_start so any PMD that registers the dynfield lazily
+        // on start-up has had its chance. Both lookups are expected to
+        // fail on ENA (PMD does not register the dynfield — spec §10.5);
+        // this is the documented steady state and the one-shot counter
+        // bump records it for observability. Under the `hw-offload-rx-timestamp`
+        // feature, the resulting `Option<i32>` / `Option<u64>` pair feeds
+        // `Engine::hw_rx_ts_ns(mbuf)` which Task 11 threads through to
+        // the RX event emission sites.
+        #[cfg(feature = "hw-offload-rx-timestamp")]
+        let (rx_ts_offset, rx_ts_flag_mask) = {
+            use std::sync::atomic::Ordering;
+            let off_rc = unsafe {
+                sys::rte_mbuf_dynfield_lookup(
+                    c"rte_dynfield_timestamp".as_ptr(),
+                    std::ptr::null_mut(),
+                )
+            };
+            let flag_bit = unsafe {
+                sys::rte_mbuf_dynflag_lookup(
+                    c"rte_dynflag_rx_timestamp".as_ptr(),
+                    std::ptr::null_mut(),
+                )
+            };
+            let offset = if off_rc >= 0 { Some(off_rc) } else { None };
+            let mask = if flag_bit >= 0 { Some(1u64 << flag_bit) } else { None };
+            if offset.is_none() || mask.is_none() {
+                counters
+                    .eth
+                    .offload_missing_rx_timestamp
+                    .fetch_add(1, Ordering::Relaxed);
+                eprintln!(
+                    "resd_net: RX timestamp dynfield/dynflag unavailable on port {} \
+                     (ENA steady state — see spec §10.5)",
+                    cfg.port_id
+                );
+            }
+            (offset, mask)
+        };
+
         // Read NIC MAC via the shim. `rte_ether_addr` is a 6-byte packed struct.
         let mut mac_addr: sys::rte_ether_addr = unsafe { std::mem::zeroed() };
         let rc = unsafe { sys::resd_rte_eth_macaddr_get(cfg.port_id, &mut mac_addr) };
@@ -595,6 +653,10 @@ impl Engine {
             tx_cksum_offload_active: outcome.tx_cksum_offload_active,
             rx_cksum_offload_active: outcome.rx_cksum_offload_active,
             rss_hash_offload_active: outcome.rss_hash_offload_active,
+            #[cfg(feature = "hw-offload-rx-timestamp")]
+            rx_ts_offset,
+            #[cfg(feature = "hw-offload-rx-timestamp")]
+            rx_ts_flag_mask,
             driver_name: outcome.driver_name,
             cfg,
         })
@@ -847,6 +909,57 @@ impl Engine {
             rss_hash_offload_active,
             driver_name,
         })
+    }
+
+    /// Read the NIC-provided hardware RX timestamp from an mbuf. Returns
+    /// 0 when (a) the feature is compile-off, (b) either the dynfield or
+    /// dynflag lookup returned negative at engine_create, or (c) the
+    /// mbuf's ol_flags do not indicate a valid timestamp. Spec §10.2.
+    ///
+    /// Hot-path cost when feature is on + both lookups succeeded: one
+    /// branch on `ol_flags & mask` plus one `uint64_t` load from the
+    /// dynfield offset. Feature off: compile-time 0.
+    ///
+    /// # Safety
+    /// `mbuf` must be a valid pointer to a live `rte_mbuf`. In the hot
+    /// path this is satisfied by the ownership rules around
+    /// `rte_eth_rx_burst`. On ENA the function always returns 0 because
+    /// the dynfield/dynflag are unregistered (spec §10.5), so the unsafe
+    /// field read is never reached in Stage 1.
+    #[cfg(feature = "hw-offload-rx-timestamp")]
+    #[inline(always)]
+    #[allow(dead_code)]
+    pub(crate) unsafe fn hw_rx_ts_ns(&self, mbuf: *const sys::rte_mbuf) -> u64 {
+        match (self.rx_ts_offset, self.rx_ts_flag_mask) {
+            (Some(off), Some(mask)) => {
+                // SAFETY: caller guarantees mbuf points to a live rte_mbuf;
+                // the shim reads ol_flags directly (bindgen cannot expose
+                // the field because of the packed anonymous unions).
+                let ol_flags = unsafe { sys::resd_rte_mbuf_get_ol_flags(mbuf) };
+                if ol_flags & mask != 0 {
+                    // SAFETY: `off` came from rte_mbuf_dynfield_lookup →
+                    // the dynfield registrar guarantees `off..off+8` lies
+                    // within the mbuf, and the field width is u64.
+                    unsafe { sys::resd_rte_mbuf_read_dynfield_u64(mbuf, off) }
+                } else {
+                    0
+                }
+            }
+            _ => 0,
+        }
+    }
+
+    /// Feature-off stub: always returns 0. See spec §10.4.
+    ///
+    /// # Safety
+    /// Stub accepts any pointer; it never dereferences. Kept `unsafe`
+    /// so the signature matches the feature-on variant and call sites
+    /// don't need `#[cfg]`-gated call syntax.
+    #[cfg(not(feature = "hw-offload-rx-timestamp"))]
+    #[inline(always)]
+    #[allow(dead_code)]
+    pub(crate) const unsafe fn hw_rx_ts_ns(&self, _mbuf: *const sys::rte_mbuf) -> u64 {
+        0
     }
 
     /// After `rte_eth_dev_start`, program the RSS indirection table so

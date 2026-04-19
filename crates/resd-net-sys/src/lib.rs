@@ -59,5 +59,8 @@ mod tests {
         let _f: unsafe extern "C" fn(*const rte_mbuf) -> u16 = resd_rte_mbuf_get_l4_len;
         // A-HW Task 9: RSS hash accessor shim symbol.
         let _g: unsafe extern "C" fn(*const rte_mbuf) -> u32 = resd_rte_mbuf_get_rss_hash;
+        // A-HW Task 10: RX timestamp dynfield read shim symbol.
+        let _h: unsafe extern "C" fn(*const rte_mbuf, i32) -> u64 =
+            resd_rte_mbuf_read_dynfield_u64;
     }
 }

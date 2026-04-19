@@ -59,3 +59,14 @@ uint16_t resd_rte_mbuf_get_l4_len(const struct rte_mbuf *m);
  * Toeplitz hash through this shim and passes it to the flow_table
  * bucket selector. */
 uint32_t resd_rte_mbuf_get_rss_hash(const struct rte_mbuf *m);
+
+/* A-HW Task 10: NIC-provided RX timestamp dynfield reader.
+ * The PMD-registered timestamp dynfield is stored at a dynamic offset
+ * (in bytes, returned by rte_mbuf_dynfield_lookup("rte_dynfield_timestamp"))
+ * from the start of rte_mbuf. The field width is uint64_t. Since
+ * struct rte_mbuf is opaque to the Rust bindings (packed anonymous
+ * unions defeat bindgen's layout engine), we expose the field load as
+ * a real C function. Only called from the RX hot path when both the
+ * dynfield AND the corresponding dynflag lookup succeeded at
+ * engine_create — ENA never reaches this path (spec §10.5). */
+uint64_t resd_rte_mbuf_read_dynfield_u64(const struct rte_mbuf *m, int32_t offset);

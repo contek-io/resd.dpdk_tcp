@@ -122,3 +122,18 @@ uint16_t resd_rte_mbuf_get_l4_len(const struct rte_mbuf *m) {
 uint32_t resd_rte_mbuf_get_rss_hash(const struct rte_mbuf *m) {
     return m->hash.rss;
 }
+
+/* A-HW Task 10: NIC-provided RX timestamp dynfield reader.
+ *
+ * The dynamic field offset comes from
+ * rte_mbuf_dynfield_lookup("rte_dynfield_timestamp") at engine_create.
+ * Reading it in Rust would require raw pointer arithmetic on the
+ * opaque mbuf; doing the arithmetic in C is type-checked at compile
+ * time (char* byte indexing + uint64_t load) and the one-liner keeps
+ * the unsafe surface minimal on the Rust side.
+ *
+ * Only called when both the dynfield AND the dynflag lookup succeeded
+ * (see Engine::hw_rx_ts_ns); ENA never reaches this path per spec §10.5. */
+uint64_t resd_rte_mbuf_read_dynfield_u64(const struct rte_mbuf *m, int32_t offset) {
+    return *(const uint64_t *)((const char *)m + offset);
+}
