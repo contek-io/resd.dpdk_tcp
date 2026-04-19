@@ -46,6 +46,13 @@ impl SendRetrans {
         self.entries.len()
     }
 
+    /// FlightSize per RFC 8985 §7 — count of unacked, unsacked segments.
+    /// TLP's PTO uses this to decide whether to apply the FlightSize==1
+    /// +max(WCDelAckT, SRTT/4) penalty (§7.2).
+    pub fn flight_size(&self) -> usize {
+        self.entries.iter().filter(|e| !e.sacked).count()
+    }
+
     /// Push a newly TX'd segment. Caller must have already incremented the
     /// mbuf refcount so the held ref is valid.
     pub fn push_after_tx(&mut self, entry: RetransEntry) {

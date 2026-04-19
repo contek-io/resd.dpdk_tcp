@@ -1670,12 +1670,17 @@ impl Engine {
                 .unwrap_or(false)
         };
         if tlp_arm {
-            let (srtt, now_ns) = {
+            let (srtt, flight_size, now_ns) = {
                 let ft = self.flow_table.borrow();
                 let srtt = ft.get(handle).and_then(|c| c.rtt_est.srtt_us());
-                (srtt, crate::clock::now_ns())
+                let flight_size = ft
+                    .get(handle)
+                    .map(|c| c.snd_retrans.flight_size() as u32)
+                    .unwrap_or(0);
+                (srtt, flight_size, crate::clock::now_ns())
             };
-            let pto_us = crate::tcp_tlp::pto_us(srtt, self.cfg.tcp_min_rto_us);
+            let tlp_cfg = crate::tcp_tlp::TlpConfig::a5_compat(self.cfg.tcp_min_rto_us);
+            let pto_us = crate::tcp_tlp::pto_us(srtt, &tlp_cfg, flight_size);
             let fire_at_ns = now_ns + (pto_us as u64 * 1_000);
             let id = self.timer_wheel.borrow_mut().add(
                 now_ns,
