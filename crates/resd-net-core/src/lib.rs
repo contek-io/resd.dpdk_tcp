@@ -4,6 +4,7 @@
 pub mod arp;
 pub mod clock;
 pub mod counters;
+pub mod dpdk_consts;
 pub mod engine;
 pub mod error;
 pub mod flow_table;

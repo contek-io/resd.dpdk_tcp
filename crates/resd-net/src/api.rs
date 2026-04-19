@@ -226,7 +226,20 @@ pub struct resd_net_eth_counters_t {
     pub rx_drop_unknown_ethertype: u64,
     pub rx_arp: u64,
     pub tx_arp: u64,
-    pub _pad: [u64; 4],
+    // A-HW additions — mirror of resd_net_core::counters::EthCounters.
+    // Slow-path, always allocated regardless of feature flags.
+    pub offload_missing_rx_cksum_ipv4: u64,
+    pub offload_missing_rx_cksum_tcp: u64,
+    pub offload_missing_rx_cksum_udp: u64,
+    pub offload_missing_tx_cksum_ipv4: u64,
+    pub offload_missing_tx_cksum_tcp: u64,
+    pub offload_missing_tx_cksum_udp: u64,
+    pub offload_missing_mbuf_fast_free: u64,
+    pub offload_missing_rss_hash: u64,
+    pub offload_missing_llq: u64,
+    pub offload_missing_rx_timestamp: u64,
+    pub rx_drop_cksum_bad: u64,
+    pub _pad: [u64; 9],
 }
 #[repr(C, align(64))]
 pub struct resd_net_ip_counters_t {

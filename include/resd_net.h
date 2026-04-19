@@ -163,7 +163,18 @@ struct RESD_NET_ALIGNED(64) resd_net_eth_counters_t {
   uint64_t rx_drop_unknown_ethertype;
   uint64_t rx_arp;
   uint64_t tx_arp;
-  uint64_t _pad[4];
+  uint64_t offload_missing_rx_cksum_ipv4;
+  uint64_t offload_missing_rx_cksum_tcp;
+  uint64_t offload_missing_rx_cksum_udp;
+  uint64_t offload_missing_tx_cksum_ipv4;
+  uint64_t offload_missing_tx_cksum_tcp;
+  uint64_t offload_missing_tx_cksum_udp;
+  uint64_t offload_missing_mbuf_fast_free;
+  uint64_t offload_missing_rss_hash;
+  uint64_t offload_missing_llq;
+  uint64_t offload_missing_rx_timestamp;
+  uint64_t rx_drop_cksum_bad;
+  uint64_t _pad[9];
 };
 
 struct RESD_NET_ALIGNED(64) resd_net_ip_counters_t {

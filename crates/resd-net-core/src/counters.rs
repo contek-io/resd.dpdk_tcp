@@ -18,7 +18,29 @@ pub struct EthCounters {
     pub rx_drop_unknown_ethertype: AtomicU64,
     pub rx_arp: AtomicU64,
     pub tx_arp: AtomicU64,
-    _pad: [u64; 4],
+    // A-HW additions — all slow-path per spec §9.1.1. Fields always
+    // allocated regardless of feature flags (C-ABI stability). See
+    // docs/superpowers/specs/2026-04-19-stage1-phase-a-hw-ena-offload-design.md §11.
+    /// Offload advertised-request-mismatch counters (one-shot at bring-up).
+    pub offload_missing_rx_cksum_ipv4: AtomicU64,
+    pub offload_missing_rx_cksum_tcp: AtomicU64,
+    pub offload_missing_rx_cksum_udp: AtomicU64,
+    pub offload_missing_tx_cksum_ipv4: AtomicU64,
+    pub offload_missing_tx_cksum_tcp: AtomicU64,
+    pub offload_missing_tx_cksum_udp: AtomicU64,
+    pub offload_missing_mbuf_fast_free: AtomicU64,
+    pub offload_missing_rss_hash: AtomicU64,
+    /// Fires only when driver is net_ena AND LLQ advertised-but-not-activated.
+    /// Expected 0 on ENA with default enable_llq=1. Feature-off builds never bump.
+    pub offload_missing_llq: AtomicU64,
+    /// Expected 1 on ENA (documented steady state — ENA does not register
+    /// the rte_dynfield_timestamp dynfield). 0 on mlx5/ice/future-gen ENA.
+    pub offload_missing_rx_timestamp: AtomicU64,
+    /// Per-packet drop counter for RX segments the NIC classified as
+    /// RTE_MBUF_F_RX_IP_CKSUM_BAD or RTE_MBUF_F_RX_L4_CKSUM_BAD. Expected 0
+    /// on well-formed traffic. Not an offload-missing counter.
+    pub rx_drop_cksum_bad: AtomicU64,
+    _pad: [AtomicU64; 9],
 }
 
 #[repr(C, align(64))]
