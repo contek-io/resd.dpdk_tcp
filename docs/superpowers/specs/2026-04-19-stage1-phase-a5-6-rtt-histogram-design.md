@@ -1,11 +1,10 @@
 # Phase A5.6 — Per-connection RTT histogram (Design Spec)
 
-**Status:** draft for plan-writing; does NOT amend A5.5 which is already executing.
+**Status:** ABSORBED INTO A6. This file is retained as design-input for the A6 brainstorm — A6's own spec subsumes the content here. Do not start a standalone A5.6 phase; the RTT histogram work lands under A6's branch, plan, review gate, and tag.
 **Parent spec:** `docs/superpowers/specs/2026-04-17-dpdk-tcp-design.md`.
-**Sibling:** `docs/superpowers/specs/2026-04-18-stage1-phase-a5-5-event-log-forensics-design.md` (A5.5 adds SRTT/RTTVAR/min_RTT scalar getter; A5.6 adds time-windowed distribution shape).
-**Roadmap row:** `docs/superpowers/plans/stage1-phase-roadmap.md` — A5.6.
-**Branch:** `phase-a5.6` (off `phase-a5-5-complete` tag).
-**Ships:** `phase-a5-6-complete` tag gated on mTCP + RFC review reports (both expected trivial — observability-only, no wire behavior).
+**Absorbed into:** `docs/superpowers/specs/2026-04-19-stage1-phase-a6-public-api-completeness-design.md` (authored during A6 brainstorm).
+**Sibling (shipped):** `docs/superpowers/specs/2026-04-18-stage1-phase-a5-5-event-log-forensics-design.md` (A5.5 scalar `stats()` getter; A6 adds time-windowed distribution shape via the content below).
+**Roadmap row:** `docs/superpowers/plans/stage1-phase-roadmap.md` — A6 (merged; former A5.6 row removed).
 
 ---
 
