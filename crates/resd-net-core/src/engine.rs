@@ -42,6 +42,34 @@ pub fn validate_and_default_histogram_edges(
     Ok(*edges)
 }
 
+/// A6 (spec §3.1): pack internal `TimerId{slot, generation}` to the
+/// `u64` exposed as `resd_net_timer_id_t`. Upper 32 = slot; lower 32 =
+/// generation. Caller treats as opaque but knows the upper half changes
+/// on slot reuse.
+#[inline]
+pub fn pack_timer_id(id: crate::tcp_timer_wheel::TimerId) -> u64 {
+    ((id.slot as u64) << 32) | (id.generation as u64)
+}
+
+/// A6 (spec §3.1): unpack `resd_net_timer_id_t` back to the wheel's
+/// internal representation.
+#[inline]
+pub fn unpack_timer_id(packed: u64) -> crate::tcp_timer_wheel::TimerId {
+    crate::tcp_timer_wheel::TimerId {
+        slot: (packed >> 32) as u32,
+        generation: (packed & 0xFFFF_FFFF) as u32,
+    }
+}
+
+/// A6 (spec §3.1): round `deadline_ns` UP to the next wheel tick
+/// boundary. `deadline_ns = 0` stays zero (fires on next poll).
+/// Past deadlines also fire on next poll.
+#[inline]
+pub fn align_up_to_tick_ns(deadline_ns: u64) -> u64 {
+    const T: u64 = crate::tcp_timer_wheel::TICK_NS;
+    deadline_ns.div_ceil(T).saturating_mul(T)
+}
+
 /// RFC 7323 §2.3: pick the Window Scale shift so that `(u16::MAX << ws)`
 /// covers our full recv buffer. Bounded at 14 per the RFC's cap. Called
 /// once at `Engine::connect` time to advertise WS in our SYN; the same
@@ -1615,6 +1643,36 @@ impl Engine {
         self.drain_tx_pending_data();
     }
 
+    /// A6 (spec §3.1): schedule a public API timer. Returns the wheel's
+    /// TimerId; the ABI layer (Task 17) packs it to u64 for the caller.
+    /// `deadline_ns` rounds up to the next 10 µs tick. Past deadlines
+    /// fire on the next poll.
+    pub fn public_timer_add(&self, deadline_ns: u64, user_data: u64)
+        -> crate::tcp_timer_wheel::TimerId
+    {
+        let now_ns = crate::clock::now_ns();
+        let fire_at_ns = align_up_to_tick_ns(deadline_ns);
+        self.timer_wheel.borrow_mut().add(
+            now_ns,
+            crate::tcp_timer_wheel::TimerNode {
+                fire_at_ns,
+                owner_handle: 0,  // public timers not tied to a conn
+                kind: crate::tcp_timer_wheel::TimerKind::ApiPublic,
+                user_data,
+                generation: 0,
+                cancelled: false,
+            },
+        )
+    }
+
+    /// A6 (spec §3.1): cancel a public API timer via wheel tombstone.
+    /// Returns true if a live node was found and cancelled; false
+    /// otherwise (slot empty, generation stale from reuse, or timer
+    /// already cancelled/fired).
+    pub fn public_timer_cancel(&self, id: crate::tcp_timer_wheel::TimerId) -> bool {
+        self.timer_wheel.borrow_mut().cancel(id)
+    }
+
     /// A5 Task 12: advance the timer wheel to `now_ns` and dispatch fired
     /// timers by kind. `advance()` returns an owned `Vec`, so the
     /// `timer_wheel` borrow ends at the semicolon — per-timer handlers are
@@ -1636,7 +1694,16 @@ impl Engine {
                     self.on_syn_retrans_fire(node.owner_handle, id);
                 }
                 crate::tcp_timer_wheel::TimerKind::ApiPublic => {
-                    // Wired in A6 public timer API. Silent no-op for now.
+                    let mut ev = self.events.borrow_mut();
+                    ev.push(
+                        InternalEvent::ApiTimer {
+                            timer_id: id,
+                            user_data: node.user_data,
+                            emitted_ts_ns: crate::clock::now_ns(),
+                        },
+                        &self.counters,
+                    );
+                    crate::counters::inc(&self.counters.tcp.tx_api_timers_fired);
                 }
             }
         }
@@ -4641,6 +4708,34 @@ mod tests {
             e.check_and_emit_rx_enomem();
         }
         let _ = _compile_only;
+    }
+
+    #[test]
+    fn public_timer_add_cancel_signature_exists() {
+        fn _compile_only(e: &Engine) {
+            let id = e.public_timer_add(0, 0);
+            let _: bool = e.public_timer_cancel(id);
+        }
+        let _ = _compile_only;
+    }
+
+    #[test]
+    fn public_timer_id_packing_roundtrip() {
+        let id = crate::tcp_timer_wheel::TimerId { slot: 0xAABB_CCDD, generation: 0x1122_3344 };
+        let packed = crate::engine::pack_timer_id(id);
+        assert_eq!(packed, 0xAABB_CCDD_1122_3344);
+        let unpacked = crate::engine::unpack_timer_id(packed);
+        assert_eq!(unpacked.slot, 0xAABB_CCDD);
+        assert_eq!(unpacked.generation, 0x1122_3344);
+    }
+
+    #[test]
+    fn align_up_to_tick_zero_and_boundary() {
+        assert_eq!(crate::engine::align_up_to_tick_ns(0), 0);
+        assert_eq!(crate::engine::align_up_to_tick_ns(1), 10_000);
+        assert_eq!(crate::engine::align_up_to_tick_ns(10_000), 10_000);
+        assert_eq!(crate::engine::align_up_to_tick_ns(10_001), 20_000);
+        assert_eq!(crate::engine::align_up_to_tick_ns(19_999), 20_000);
     }
 }
 
