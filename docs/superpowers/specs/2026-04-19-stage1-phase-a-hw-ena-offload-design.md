@@ -46,8 +46,8 @@ Out of scope (Section 15 restates):
 
 | Module | Change |
 |---|---|
-| `engine.rs` | Port-config rewrite at current lines 422–450 (dev_info query + offload AND + RSS `rss_conf` + reta program + MULTI_SEGS preserve + startup banner); LLQ log-scrape + activation-verify block gated on `hw-verify-llq`; RX-timestamp dynfield+dynflag lookup at `engine_create` gated on `hw-offload-rx-timestamp` (new engine-state fields under `#[cfg]`); always-inline `hw_rx_ts_ns` accessor (const-zero variant when feature off); bring-up-time `offload_missing_*` / `offload_missing_rx_timestamp` / `offload_missing_llq` counter-bump calls. |
-| `tcp_events.rs` | Line 164 (RX event construction) — replace hardcoded `rx_hw_ts_ns: 0` with `engine.hw_rx_ts_ns(mbuf)`. Verify during impl whether internal event struct needs to carry the mbuf pointer that far, or whether the timestamp must be read at decode-time and threaded through the event struct (leaning threaded-through — cleaner ownership). |
+| `engine.rs` | Port-config rewrite at current lines 422–450 (dev_info query + offload AND + RSS `rss_conf` + reta program + MULTI_SEGS preserve + startup banner); LLQ log-scrape + activation-verify block gated on `hw-verify-llq`; RX-timestamp dynfield+dynflag lookup at `engine_create` gated on `hw-offload-rx-timestamp` (new engine-state fields under `#[cfg]`); always-inline `hw_rx_ts_ns` accessor (const-zero variant when feature off); bring-up-time `offload_missing_*` / `offload_missing_rx_timestamp` / `offload_missing_llq` counter-bump calls. Two RX-origin event sites consume the accessor: line 1842 (`InternalEvent::Connected` after SYN-ACK parse) and line 2205 (`InternalEvent::Readable` in `deliver_readable`). Timestamp is captured at the RX-decode boundary (where the mbuf is still available) and threaded through the internal per-packet state to both emission sites — `deliver_readable` no longer has the mbuf pointer at line 2205, so the value must be carried in, not read. |
+| `tcp_events.rs` | No production-code change. The `InternalEvent::Connected { ..., rx_hw_ts_ns, ... }` and `InternalEvent::Readable { ..., rx_hw_ts_ns, ... }` enum variants already carry the field (A5.5 added it); A-HW just changes the engine sites that construct them. Line 164 is inside a unit-test fixture (`#[cfg(test)] mod tests`) — stays at `rx_hw_ts_ns: 0`. |
 | `tcp_output.rs` | `#[cfg(feature = "hw-offload-tx-cksum")]` branch: on engines with `tx_cksum_offload_active == true`, set `mbuf.ol_flags |= RTE_MBUF_F_TX_IPV4 | RTE_MBUF_F_TX_IP_CKSUM | RTE_MBUF_F_TX_TCP_CKSUM`; set `l2_len = 14`, `l3_len = 20`, `l4_len = tcp_hdr_len`; write only the 12-byte pseudo-header checksum into the TCP cksum field; IPv4 header cksum field = 0. Runtime-fallback branch (when `tx_cksum_offload_active == false`) stays with the current software full-fold. `#[cfg(not)]` build compiles away the offload branch entirely. |
 | `l3_ip.rs` | Expose a new `tcp_pseudo_header_checksum(src_ip, dst_ip, tcp_seg_len)` helper for the pseudo-header-only path; RX path gains an `ol_flags`-inspection branch under `#[cfg(feature = "hw-offload-rx-cksum")]` that folds `RTE_MBUF_F_RX_IP_CKSUM_*` / `RTE_MBUF_F_RX_L4_CKSUM_*` into the existing `check_header`. |
 | `tcp_input.rs` | Upstream caller of `l3_ip::check_header` — inherit the RX cksum path change; a single per-packet `BAD` branch bumps `eth.rx_drop_cksum_bad` + drops. |
@@ -316,11 +316,20 @@ const fn hw_rx_ts_ns(_mbuf: *const sys::rte_mbuf) -> u64 { 0 }
 
 Hot-path cost when feature is on: one conditional + one `u64` load. When feature is off: zero — the call is a const folded to 0.
 
-### 10.3 Call site
+### 10.3 Call sites
 
-The single real RX-originated event site is `tcp_events.rs:164`. Replace hardcoded `rx_hw_ts_ns: 0` with `engine.hw_rx_ts_ns(mbuf)`. Implementation detail to resolve during the plan-writing pass: whether the mbuf pointer is already available at line 164, or whether the timestamp must be read earlier at the RX decode boundary and threaded through the internal event struct. Leaning threaded-through for clean ownership — the internal event struct gains a `rx_hw_ts_ns: u64` field (already present on the public event forwarding struct at `lib.rs:179`).
+Two RX-originated event sites hardcode `rx_hw_ts_ns: 0` in production code today:
 
-Other `rx_hw_ts_ns: 0` sites (`engine.rs:1844, 2209`; `lib.rs:203, 212, 224, 241, 263, 712, 719`) are non-RX-originated events (timer fires, state changes, synthesized ARP exchange events). They stay 0 by definition; the accessor is not called from those sites.
+- **`engine.rs:1842`** — `InternalEvent::Connected` emitted after the SYN-ACK parse in the main RX handler. The parsed segment's originating mbuf is available in local scope at the emit site; a direct `self.hw_rx_ts_ns(mbuf)` call reads the NIC timestamp at this point.
+- **`engine.rs:2205`** — `InternalEvent::Readable` emitted inside `deliver_readable(&self, handle, delivered: u32)`. The originating mbuf is NOT in scope here — data has already been moved from the mbuf into `conn.recv.bytes` VecDeque by the time this function is called. Therefore the `hw_rx_ts_ns` value must be captured at the RX-decode boundary (where the mbuf is live) and passed through as a new parameter to `deliver_readable(&self, handle, delivered, hw_rx_ts_ns)`.
+
+The internal `InternalEvent::Connected` / `InternalEvent::Readable` enum variants already carry the `rx_hw_ts_ns: u64` field (A5.5 introduced it on the forwarder side). Only the two engine-side sites above need their hardcoded `0` replaced with the threaded-through value.
+
+Other `rx_hw_ts_ns: 0` sites that stay unchanged:
+- `tcp_events.rs:164` — unit-test fixture inside `#[cfg(test)] mod tests`, not production code.
+- `crates/resd-net/src/lib.rs:175-191` — public-event forwarder, already threads from the internal event variant, no hardcoded zero.
+- `crates/resd-net/src/lib.rs:203, 212, 224, 241, 263, 712, 719` — non-RX-origin events (timer fires, state changes, synthesized ARP exchange events). They stay 0 by definition; the accessor is not called from those sites.
+- `crates/resd-net-core/tests/*.rs` — test fixtures, unchanged.
 
 ### 10.4 Feature-off branch
 
