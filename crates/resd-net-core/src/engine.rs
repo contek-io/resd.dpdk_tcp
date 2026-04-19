@@ -566,11 +566,39 @@ impl Engine {
             }));
         }
 
+        // A-HW Task 12: LLQ activation verification via PMD-log-scrape.
+        // Install an fmemopen-backed capture of DPDK's log stream for
+        // the duration of `rte_eth_dev_start`, then scan the captured
+        // buffer for ENA's activation / failure markers after the call
+        // returns. Feature-off compiles the capture + scan away entirely.
+        // See spec §5 and crate::llq_verify for marker pinning.
+        #[cfg(feature = "hw-verify-llq")]
+        let log_capture = crate::llq_verify::start_log_capture()?;
+
         let rc = unsafe { sys::rte_eth_dev_start(cfg.port_id) };
         if rc < 0 {
+            #[cfg(feature = "hw-verify-llq")]
+            {
+                // Restore the log stream + free the memstream even on
+                // failure — otherwise DPDK keeps writing into a stack
+                // buffer we're about to drop. Ignore the result; start
+                // already failed, so scanning is moot.
+                let _ = crate::llq_verify::finish_log_capture(log_capture);
+            }
             return Err(Error::PortStart(cfg.port_id, unsafe {
                 sys::resd_rte_errno()
             }));
+        }
+
+        #[cfg(feature = "hw-verify-llq")]
+        {
+            let captured = crate::llq_verify::finish_log_capture(log_capture)?;
+            crate::llq_verify::verify_llq_activation(
+                cfg.port_id,
+                &outcome.driver_name,
+                &captured,
+                &counters,
+            )?;
         }
 
         // A-HW: RSS reta program. No-op when feature off OR when

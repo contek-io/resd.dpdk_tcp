@@ -12,6 +12,8 @@ pub mod icmp;
 pub mod iss;
 pub mod l2;
 pub mod l3_ip;
+#[cfg(feature = "hw-verify-llq")]
+pub mod llq_verify;
 pub mod mempool;
 pub mod siphash24;
 pub mod tcp_conn;
