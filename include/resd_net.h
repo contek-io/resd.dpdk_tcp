@@ -468,7 +468,28 @@ int32_t resd_net_send(struct resd_net_engine *p,
                       const uint8_t *buf,
                       uint32_t len);
 
-int32_t resd_net_close(struct resd_net_engine *p, resd_net_conn_t conn, uint32_t _flags);
+/**
+ * A6 (spec §5.4, §3.4): close a connection, honoring the `flags` bitmask.
+ *
+ * Defined flags:
+ * * `RESD_NET_CLOSE_FORCE_TW_SKIP` — request to skip 2×MSL TIME_WAIT.
+ *   Honored only when the connection negotiated timestamps
+ *   (`c.ts_enabled == true`) at close time — the combination of PAWS
+ *   on the peer (RFC 7323 §5) + monotonic ISS on our side (RFC 6528,
+ *   spec §6.5) is the client-side analog of RFC 6191's protections.
+ *   When the prerequisite is not met, the flag is silently dropped
+ *   and a `RESD_NET_EVT_ERROR{err=-EPERM}` is emitted for visibility;
+ *   the normal FIN + 2×MSL TIME_WAIT sequence proceeds.
+ *
+ * Undefined flag bits are reserved for future extension and silently
+ * ignored.
+ *
+ * Returns 0 on successful close initiation (FIN emitted), or:
+ *   -EINVAL  engine is NULL
+ *   -ENOTCONN  conn is not a live handle
+ *   -EIO  internal error (TX path or flow-table)
+ */
+int32_t resd_net_close(struct resd_net_engine *p, resd_net_conn_t conn, uint32_t flags);
 
 /**
  * A6 (spec §5.3): schedule a one-shot timer. `deadline_ns` is in the
