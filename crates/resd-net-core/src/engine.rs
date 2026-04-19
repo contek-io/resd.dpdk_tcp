@@ -2244,8 +2244,16 @@ impl Engine {
                     let Some(c) = ft.get(*h) else {
                         return false;
                     };
+                    // A6 Task 11: `force_tw_skip` (set by
+                    // `close_conn_with_flags` in Task 10 when `ts_enabled`
+                    // is true) short-circuits the 2×MSL wait so the
+                    // connection reaps on the next tick regardless of
+                    // `time_wait_deadline_ns`. Observability parity
+                    // preserved — the close path below still emits the
+                    // same StateChange + Closed events.
                     c.state == TcpState::TimeWait
-                        && c.time_wait_deadline_ns.is_some_and(|d| now >= d)
+                        && (c.force_tw_skip
+                            || c.time_wait_deadline_ns.is_some_and(|d| now >= d))
                 })
                 .collect()
         };
@@ -4808,6 +4816,67 @@ mod tests {
         assert_eq!(crate::engine::align_up_to_tick_ns(10_000), 10_000);
         assert_eq!(crate::engine::align_up_to_tick_ns(10_001), 20_000);
         assert_eq!(crate::engine::align_up_to_tick_ns(19_999), 20_000);
+    }
+
+    /// A6 Task 11: `reap_time_wait`'s candidate predicate must reap a
+    /// TIME_WAIT conn whose `force_tw_skip` flag is set even when the
+    /// 2×MSL deadline is still in the future. The flag is seeded by
+    /// `close_conn_with_flags` in Task 10 when `ts_enabled` is true.
+    #[test]
+    fn force_tw_skip_short_circuits_reap() {
+        use crate::flow_table::{FlowTable, FourTuple};
+        use crate::tcp_state::TcpState;
+
+        let mut ft = FlowTable::new(8);
+        let tuple_a = FourTuple {
+            local_ip: 1,
+            local_port: 40000,
+            peer_ip: 2,
+            peer_port: 5000,
+        };
+        let tuple_b = FourTuple {
+            local_ip: 1,
+            local_port: 40001,
+            peer_ip: 2,
+            peer_port: 5001,
+        };
+        let h_a = ft
+            .insert(crate::tcp_conn::TcpConn::new_client(
+                tuple_a, 0, 1460, 1024, 2048, 5_000, 5_000, 1_000_000,
+            ))
+            .unwrap();
+        let h_b = ft
+            .insert(crate::tcp_conn::TcpConn::new_client(
+                tuple_b, 0, 1460, 1024, 2048, 5_000, 5_000, 1_000_000,
+            ))
+            .unwrap();
+        // conn A: TIME_WAIT + force_tw_skip=true  → should reap
+        // conn B: TIME_WAIT + deadline in future → should NOT reap
+        let now: u64 = 1_000_000_000;
+        if let Some(c) = ft.get_mut(h_a) {
+            c.state = TcpState::TimeWait;
+            c.force_tw_skip = true;
+            c.time_wait_deadline_ns = Some(now + 60_000_000_000);
+        }
+        if let Some(c) = ft.get_mut(h_b) {
+            c.state = TcpState::TimeWait;
+            c.force_tw_skip = false;
+            c.time_wait_deadline_ns = Some(now + 60_000_000_000);
+        }
+        // Replicate the candidate-filter predicate from reap_time_wait:
+        let candidates: Vec<_> = ft
+            .iter_handles()
+            .filter(|h| {
+                let Some(c) = ft.get(*h) else {
+                    return false;
+                };
+                c.state == TcpState::TimeWait
+                    && (c.force_tw_skip
+                        || c.time_wait_deadline_ns.is_some_and(|d| now >= d))
+            })
+            .collect();
+        assert_eq!(candidates.len(), 1, "only A reaps under short-circuit");
+        assert_eq!(candidates[0], h_a);
     }
 }
 
