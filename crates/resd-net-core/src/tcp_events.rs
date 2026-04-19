@@ -3,7 +3,9 @@
 //! `events_out[]` array.
 
 use std::collections::VecDeque;
+use std::sync::atomic::Ordering;
 
+use crate::counters::Counters;
 use crate::flow_table::ConnHandle;
 use crate::tcp_state::TcpState;
 
@@ -85,17 +87,48 @@ pub enum InternalEvent {
 
 pub struct EventQueue {
     q: VecDeque<InternalEvent>,
+    soft_cap: usize,
 }
 
 impl EventQueue {
+    /// Minimum queue cap. Prevents pathological configs from producing
+    /// a queue smaller than one realistic poll burst worth of events.
+    pub const MIN_SOFT_CAP: usize = 64;
+
+    /// Default cap per spec §3.2 — 4096 events × ~32 B/event ≈ 128 KiB per engine.
+    pub const DEFAULT_SOFT_CAP: usize = 4096;
+
     pub fn new() -> Self {
+        Self::with_cap(Self::DEFAULT_SOFT_CAP)
+    }
+
+    pub fn with_cap(cap: usize) -> Self {
+        assert!(
+            cap >= Self::MIN_SOFT_CAP,
+            "EventQueue::with_cap: cap {} below MIN_SOFT_CAP {}",
+            cap,
+            Self::MIN_SOFT_CAP
+        );
         Self {
-            q: VecDeque::with_capacity(64),
+            q: VecDeque::with_capacity(cap.min(Self::DEFAULT_SOFT_CAP)),
+            soft_cap: cap,
         }
     }
 
-    pub fn push(&mut self, ev: InternalEvent) {
+    /// Push an event. If the queue is at `soft_cap`, drop the oldest entry
+    /// and increment `obs.events_dropped`. Always latches `obs.events_queue_high_water`
+    /// to max observed depth.
+    pub fn push(&mut self, ev: InternalEvent, counters: &Counters) {
+        if self.q.len() >= self.soft_cap {
+            let _ = self.q.pop_front();
+            counters.obs.events_dropped.fetch_add(1, Ordering::Relaxed);
+        }
         self.q.push_back(ev);
+        let depth = self.q.len() as u64;
+        counters
+            .obs
+            .events_queue_high_water
+            .fetch_max(depth, Ordering::Relaxed);
     }
 
     pub fn pop(&mut self) -> Option<InternalEvent> {
@@ -123,17 +156,24 @@ mod tests {
 
     #[test]
     fn fifo_ordering() {
+        let counters = Counters::new();
         let mut q = EventQueue::new();
-        q.push(InternalEvent::Connected {
-            conn: 1,
-            rx_hw_ts_ns: 0,
-            emitted_ts_ns: 0,
-        });
-        q.push(InternalEvent::Closed {
-            conn: 1,
-            err: 0,
-            emitted_ts_ns: 0,
-        });
+        q.push(
+            InternalEvent::Connected {
+                conn: 1,
+                rx_hw_ts_ns: 0,
+                emitted_ts_ns: 0,
+            },
+            &counters,
+        );
+        q.push(
+            InternalEvent::Closed {
+                conn: 1,
+                err: 0,
+                emitted_ts_ns: 0,
+            },
+            &counters,
+        );
         match q.pop() {
             Some(InternalEvent::Connected { conn, .. }) => assert_eq!(conn, 1),
             other => panic!("expected Connected, got {other:?}"),
@@ -144,13 +184,17 @@ mod tests {
 
     #[test]
     fn len_tracks_outstanding() {
+        let counters = Counters::new();
         let mut q = EventQueue::new();
         assert!(q.is_empty());
-        q.push(InternalEvent::Error {
-            conn: 1,
-            err: -5,
-            emitted_ts_ns: 0,
-        });
+        q.push(
+            InternalEvent::Error {
+                conn: 1,
+                err: -5,
+                emitted_ts_ns: 0,
+            },
+            &counters,
+        );
         assert_eq!(q.len(), 1);
         let _ = q.pop();
         assert!(q.is_empty());

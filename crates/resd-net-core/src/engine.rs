@@ -487,7 +487,7 @@ impl Engine {
             pmtu: RefCell::new(PmtuTable::new()),
             last_garp_ns: RefCell::new(0),
             flow_table: RefCell::new(FlowTable::new(cfg.max_connections)),
-            events: RefCell::new(EventQueue::new()),
+            events: RefCell::new(EventQueue::with_cap(EventQueue::DEFAULT_SOFT_CAP)),
             iss_gen: IssGen::new(),
             // RFC 6056 ephemeral port hint range: start at 49152.
             last_ephemeral_port: Cell::new(49151),
@@ -854,17 +854,23 @@ impl Engine {
             };
             let emitted_ts_ns = crate::clock::now_ns();
             let mut ev = self.events.borrow_mut();
-            ev.push(InternalEvent::TcpRetrans {
-                conn: handle,
-                seq,
-                rtx_count,
-                emitted_ts_ns,
-            });
-            ev.push(InternalEvent::TcpLossDetected {
-                conn: handle,
-                cause: crate::tcp_events::LossCause::Rto,
-                emitted_ts_ns,
-            });
+            ev.push(
+                InternalEvent::TcpRetrans {
+                    conn: handle,
+                    seq,
+                    rtx_count,
+                    emitted_ts_ns,
+                },
+                &self.counters,
+            );
+            ev.push(
+                InternalEvent::TcpLossDetected {
+                    conn: handle,
+                    cause: crate::tcp_events::LossCause::Rto,
+                    emitted_ts_ns,
+                },
+                &self.counters,
+            );
         }
 
         // Task 13: max-retrans-count check. `retransmit()` above bumped
@@ -995,17 +1001,23 @@ impl Engine {
                 };
                 let emitted_ts_ns = crate::clock::now_ns();
                 let mut ev = self.events.borrow_mut();
-                ev.push(InternalEvent::TcpRetrans {
-                    conn: handle,
-                    seq,
-                    rtx_count,
-                    emitted_ts_ns,
-                });
-                ev.push(InternalEvent::TcpLossDetected {
-                    conn: handle,
-                    cause: crate::tcp_events::LossCause::Tlp,
-                    emitted_ts_ns,
-                });
+                ev.push(
+                    InternalEvent::TcpRetrans {
+                        conn: handle,
+                        seq,
+                        rtx_count,
+                        emitted_ts_ns,
+                    },
+                    &self.counters,
+                );
+                ev.push(
+                    InternalEvent::TcpLossDetected {
+                        conn: handle,
+                        cause: crate::tcp_events::LossCause::Tlp,
+                        emitted_ts_ns,
+                    },
+                    &self.counters,
+                );
             }
         }
     }
@@ -1173,16 +1185,22 @@ impl Engine {
         {
             let emitted_ts_ns = crate::clock::now_ns();
             let mut ev = self.events.borrow_mut();
-            ev.push(InternalEvent::Error {
-                conn: handle,
-                err: -libc::ETIMEDOUT,
-                emitted_ts_ns,
-            });
-            ev.push(InternalEvent::Closed {
-                conn: handle,
-                err: -libc::ETIMEDOUT,
-                emitted_ts_ns,
-            });
+            ev.push(
+                InternalEvent::Error {
+                    conn: handle,
+                    err: -libc::ETIMEDOUT,
+                    emitted_ts_ns,
+                },
+                &self.counters,
+            );
+            ev.push(
+                InternalEvent::Closed {
+                    conn: handle,
+                    err: -libc::ETIMEDOUT,
+                    emitted_ts_ns,
+                },
+                &self.counters,
+            );
         }
         // Phase 6: remove from flow_table.
         self.flow_table.borrow_mut().remove(handle);
@@ -1208,11 +1226,14 @@ impl Engine {
         };
         for h in candidates {
             self.transition_conn(h, TcpState::Closed);
-            self.events.borrow_mut().push(InternalEvent::Closed {
-                conn: h,
-                err: 0,
-                emitted_ts_ns: crate::clock::now_ns(),
-            });
+            self.events.borrow_mut().push(
+                InternalEvent::Closed {
+                    conn: h,
+                    err: 0,
+                    emitted_ts_ns: crate::clock::now_ns(),
+                },
+                &self.counters,
+            );
             crate::counters::inc(&self.counters.tcp.conn_close);
             // A4 cross-phase backfill: TIME_WAIT deadline expired.
             crate::counters::inc(&self.counters.tcp.conn_time_wait_reaped);
@@ -1489,17 +1510,23 @@ impl Engine {
                     };
                     let emitted_ts_ns = crate::clock::now_ns();
                     let mut ev = self.events.borrow_mut();
-                    ev.push(InternalEvent::TcpRetrans {
-                        conn: handle,
-                        seq,
-                        rtx_count,
-                        emitted_ts_ns,
-                    });
-                    ev.push(InternalEvent::TcpLossDetected {
-                        conn: handle,
-                        cause: crate::tcp_events::LossCause::Rack,
-                        emitted_ts_ns,
-                    });
+                    ev.push(
+                        InternalEvent::TcpRetrans {
+                            conn: handle,
+                            seq,
+                            rtx_count,
+                            emitted_ts_ns,
+                        },
+                        &self.counters,
+                    );
+                    ev.push(
+                        InternalEvent::TcpLossDetected {
+                            conn: handle,
+                            cause: crate::tcp_events::LossCause::Rack,
+                            emitted_ts_ns,
+                        },
+                        &self.counters,
+                    );
                 }
             }
         }
@@ -1701,11 +1728,14 @@ impl Engine {
         }
 
         if outcome.connected {
-            self.events.borrow_mut().push(InternalEvent::Connected {
-                conn: handle,
-                rx_hw_ts_ns: 0,
-                emitted_ts_ns: crate::clock::now_ns(),
-            });
+            self.events.borrow_mut().push(
+                InternalEvent::Connected {
+                    conn: handle,
+                    rx_hw_ts_ns: 0,
+                    emitted_ts_ns: crate::clock::now_ns(),
+                },
+                &self.counters,
+            );
             inc(&self.counters.tcp.conn_open);
         }
 
@@ -1721,11 +1751,14 @@ impl Engine {
         }
 
         if outcome.closed {
-            self.events.borrow_mut().push(InternalEvent::Closed {
-                conn: handle,
-                err: 0,
-                emitted_ts_ns: crate::clock::now_ns(),
-            });
+            self.events.borrow_mut().push(
+                InternalEvent::Closed {
+                    conn: handle,
+                    err: 0,
+                    emitted_ts_ns: crate::clock::now_ns(),
+                },
+                &self.counters,
+            );
             inc(&self.counters.tcp.conn_close);
             // Bump conn_rst when the close was caused by RST (either
             // inbound RST received, or we're sending one via the SYN_SENT
@@ -1801,12 +1834,15 @@ impl Engine {
         }
         drop(ft);
         inc(&self.counters.tcp.state_trans[from as usize][to as usize]);
-        self.events.borrow_mut().push(InternalEvent::StateChange {
-            conn: handle,
-            from,
-            to,
-            emitted_ts_ns: crate::clock::now_ns(),
-        });
+        self.events.borrow_mut().push(
+            InternalEvent::StateChange {
+                conn: handle,
+                from,
+                to,
+                emitted_ts_ns: crate::clock::now_ns(),
+            },
+            &self.counters,
+        );
     }
 
     /// Emit a bare ACK for `handle`. Post-handshake ACKs carry the full
@@ -2055,13 +2091,16 @@ impl Engine {
         }
         drop(ft);
         add(&self.counters.tcp.recv_buf_delivered, delivered as u64);
-        self.events.borrow_mut().push(InternalEvent::Readable {
-            conn: handle,
-            byte_offset,
-            byte_len: delivered,
-            rx_hw_ts_ns: 0,
-            emitted_ts_ns: crate::clock::now_ns(),
-        });
+        self.events.borrow_mut().push(
+            InternalEvent::Readable {
+                conn: handle,
+                byte_offset,
+                byte_len: delivered,
+                rx_hw_ts_ns: 0,
+                emitted_ts_ns: crate::clock::now_ns(),
+            },
+            &self.counters,
+        );
     }
 
     /// Open a new client-side connection. Emits a single SYN and
