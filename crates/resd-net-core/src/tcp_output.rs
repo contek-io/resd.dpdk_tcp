@@ -212,6 +212,24 @@ fn tcp_checksum_split(
     internet_checksum(&buf)
 }
 
+/// Pseudo-header-only TCP checksum per RFC 9293 §3.1. Used by A-HW's
+/// TX offload path: software writes ONLY the 12-byte pseudo-header
+/// fold into the TCP cksum field; the PMD folds in TCP header +
+/// payload at wire time when `RTE_MBUF_F_TX_TCP_CKSUM` is set.
+///
+/// `tcp_seg_len` is the pseudo-header `tcp_length` field: the sum of
+/// header-bytes and payload-bytes on the wire. For a 20-byte TCP header
+/// with N bytes payload, tcp_seg_len = 20 + N.
+pub fn tcp_pseudo_header_checksum(src_ip: u32, dst_ip: u32, tcp_seg_len: u32) -> u16 {
+    let mut buf = [0u8; 12];
+    buf[0..4].copy_from_slice(&src_ip.to_be_bytes());
+    buf[4..8].copy_from_slice(&dst_ip.to_be_bytes());
+    buf[8] = 0;
+    buf[9] = IPPROTO_TCP;
+    buf[10..12].copy_from_slice(&(tcp_seg_len as u16).to_be_bytes());
+    internet_checksum(&buf)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -378,5 +396,25 @@ mod tests {
         };
         let mut out = [0u8; 30];
         assert!(build_retrans_header(&seg, b"payload", &mut out).is_none());
+    }
+
+    #[test]
+    fn pseudo_header_only_cksum_matches_manual_fold() {
+        use crate::l3_ip::internet_checksum;
+        let src_ip: u32 = 0x0a000001;
+        let dst_ip: u32 = 0x0a000002;
+        let tcp_seg_len: u32 = 40;
+
+        let mut pseudo = Vec::with_capacity(12);
+        pseudo.extend_from_slice(&src_ip.to_be_bytes());
+        pseudo.extend_from_slice(&dst_ip.to_be_bytes());
+        pseudo.push(0);
+        pseudo.push(crate::l3_ip::IPPROTO_TCP);
+        pseudo.extend_from_slice(&(tcp_seg_len as u16).to_be_bytes());
+        let manual = internet_checksum(&pseudo);
+
+        let helper = tcp_pseudo_header_checksum(src_ip, dst_ip, tcp_seg_len);
+        assert_eq!(helper, manual,
+            "tcp_pseudo_header_checksum must match manual fold of the 12-byte pseudo-header");
     }
 }
