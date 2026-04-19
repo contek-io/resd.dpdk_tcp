@@ -431,6 +431,12 @@ fn apply_tcp_input_counters(
     if outcome.paws_rejected {
         inc(&counters.rx_paws_rejected);
     }
+    if outcome.ts_recent_expired {
+        // A6 Task 14 (spec §3.7): RFC 7323 §5.5 24-day `TS.Recent` lazy
+        // expiration fired at the PAWS gate. Slow-path — essentially
+        // never increments on healthy traffic.
+        inc(&counters.ts_recent_expired);
+    }
     if outcome.bad_option {
         inc(&counters.rx_bad_option);
     }

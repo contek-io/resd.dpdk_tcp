@@ -12,6 +12,11 @@ use crate::tcp_conn::TcpConn;
 use crate::tcp_output::{TCP_ACK, TCP_FIN, TCP_RST, TCP_SYN, TCP_URG};
 use crate::tcp_state::TcpState;
 
+/// A6 (spec §3.7): RFC 7323 §5.5 24-day `TS.Recent` expiration window
+/// in nanoseconds. Applied lazily at the PAWS gate — no timer, no
+/// hot-path cost on fresh connections.
+const TS_RECENT_EXPIRY_NS: u64 = 24 * 86_400 * 1_000_000_000;
+
 #[derive(Debug, Clone, Copy)]
 pub struct ParsedSegment<'a> {
     pub src_port: u16,
@@ -139,6 +144,11 @@ pub struct Outcome {
     /// A4: true iff a PAWS check rejected this segment. Engine bumps
     /// `tcp.rx_paws_rejected` when true.
     pub paws_rejected: bool,
+    /// A6 Task 14 (spec §3.7): true iff the RFC 7323 §5.5 24-day
+    /// `TS.Recent` lazy expiration fired on this segment. Engine bumps
+    /// `tcp.ts_recent_expired` when true. Slow-path — fires at most
+    /// once per 24-day-plus idle event per conn.
+    pub ts_recent_expired: bool,
     /// A4: true iff the option decoder rejected a malformed option on
     /// this segment. Engine bumps `tcp.rx_bad_option` when true.
     pub bad_option: bool,
@@ -208,6 +218,7 @@ impl Outcome {
             reassembly_queued_bytes: 0,
             reassembly_hole_filled: 0,
             paws_rejected: false,
+            ts_recent_expired: false,
             bad_option: false,
             sack_blocks_decoded: 0,
             bad_seq: false,
@@ -348,6 +359,10 @@ fn handle_syn_sent(conn: &mut TcpConn, seg: &ParsedSegment) -> Outcome {
     if let Some((tsval, _tsecr)) = parsed_opts.timestamps {
         conn.ts_enabled = true;
         conn.ts_recent = tsval;
+        // A6 Task 14: every `ts_recent` write sets `ts_recent_age` so the
+        // RFC 7323 §5.5 24-day lazy expiration (PAWS gate) has accurate
+        // idle tracking from the first TS exchange onward.
+        conn.ts_recent_age = crate::clock::now_ns();
     } else {
         conn.ts_enabled = false;
     }
@@ -489,6 +504,7 @@ fn handle_established(conn: &mut TcpConn, seg: &ParsedSegment) -> Outcome {
 
     // PAWS (RFC 7323 §5) — only when TS is negotiated. Missing TS on a
     // TS-enabled conn is RFC 7323 §3.2 MUST-24 violation.
+    let mut ts_recent_expired = false;
     if conn.ts_enabled {
         match parsed_opts.timestamps {
             None => {
@@ -500,7 +516,22 @@ fn handle_established(conn: &mut TcpConn, seg: &ParsedSegment) -> Outcome {
                 };
             }
             Some((ts_val, _ts_ecr)) => {
-                if crate::tcp_seq::seq_lt(ts_val, conn.ts_recent) {
+                // A6 Task 14 (spec §3.7): RFC 7323 §5.5 24-day `TS.Recent`
+                // lazy expiration. If the connection has been idle for more
+                // than 24 days, treat `TS.Recent` as absent for this segment:
+                // adopt `ts_val`, reset the age clock, and skip the PAWS
+                // drop compare. Sentinel `ts_recent_age == 0` is "never
+                // touched" (fresh conn pre-first-TS-update) — not expired.
+                // Zero hot-path cost on fresh conns; no timer wheel needed.
+                let now_ns = crate::clock::now_ns();
+                let idle_ns = now_ns.saturating_sub(conn.ts_recent_age);
+                let paws_skip_this_seg =
+                    conn.ts_recent_age != 0 && idle_ns > TS_RECENT_EXPIRY_NS;
+                if paws_skip_this_seg {
+                    conn.ts_recent = ts_val;
+                    conn.ts_recent_age = now_ns;
+                    ts_recent_expired = true;
+                } else if crate::tcp_seq::seq_lt(ts_val, conn.ts_recent) {
                     return Outcome {
                         tx: TxAction::Ack,
                         paws_rejected: true,
@@ -509,9 +540,13 @@ fn handle_established(conn: &mut TcpConn, seg: &ParsedSegment) -> Outcome {
                     };
                 }
                 // RFC 7323 §4.3 MUST-25: only update ts_recent on a
-                // segment whose seq is at or before rcv_nxt.
-                if crate::tcp_seq::seq_le(seg.seq, conn.rcv_nxt) {
+                // segment whose seq is at or before rcv_nxt. Also update
+                // `ts_recent_age` whenever `ts_recent` is written so the
+                // §5.5 24-day idle check above has accurate age data
+                // (A6 Task 14 contract).
+                if !paws_skip_this_seg && crate::tcp_seq::seq_le(seg.seq, conn.rcv_nxt) {
                     conn.ts_recent = ts_val;
+                    conn.ts_recent_age = now_ns;
                 }
             }
         }
@@ -802,6 +837,7 @@ fn handle_established(conn: &mut TcpConn, seg: &ParsedSegment) -> Outcome {
         rack_lost_indexes,
         rx_dsack_count,
         tx_tlp_spurious_count,
+        ts_recent_expired,
         ..Outcome::base()
     }
 }
