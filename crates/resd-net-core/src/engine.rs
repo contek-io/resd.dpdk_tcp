@@ -852,15 +852,18 @@ impl Engine {
                     .map(|e| (e.seq, e.xmit_count as u32))
                     .unwrap_or((0, 0))
             };
+            let emitted_ts_ns = crate::clock::now_ns();
             let mut ev = self.events.borrow_mut();
             ev.push(InternalEvent::TcpRetrans {
                 conn: handle,
                 seq,
                 rtx_count,
+                emitted_ts_ns,
             });
             ev.push(InternalEvent::TcpLossDetected {
                 conn: handle,
                 cause: crate::tcp_events::LossCause::Rto,
+                emitted_ts_ns,
             });
         }
 
@@ -990,15 +993,18 @@ impl Engine {
                         .map(|e| (e.seq, e.xmit_count as u32))
                         .unwrap_or((0, 0))
                 };
+                let emitted_ts_ns = crate::clock::now_ns();
                 let mut ev = self.events.borrow_mut();
                 ev.push(InternalEvent::TcpRetrans {
                     conn: handle,
                     seq,
                     rtx_count,
+                    emitted_ts_ns,
                 });
                 ev.push(InternalEvent::TcpLossDetected {
                     conn: handle,
                     cause: crate::tcp_events::LossCause::Tlp,
+                    emitted_ts_ns,
                 });
             }
         }
@@ -1165,14 +1171,17 @@ impl Engine {
         // Error/Closed in the event queue, matching the ordering used
         // elsewhere when a transition accompanies terminal events.
         {
+            let emitted_ts_ns = crate::clock::now_ns();
             let mut ev = self.events.borrow_mut();
             ev.push(InternalEvent::Error {
                 conn: handle,
                 err: -libc::ETIMEDOUT,
+                emitted_ts_ns,
             });
             ev.push(InternalEvent::Closed {
                 conn: handle,
                 err: -libc::ETIMEDOUT,
+                emitted_ts_ns,
             });
         }
         // Phase 6: remove from flow_table.
@@ -1199,9 +1208,11 @@ impl Engine {
         };
         for h in candidates {
             self.transition_conn(h, TcpState::Closed);
-            self.events
-                .borrow_mut()
-                .push(InternalEvent::Closed { conn: h, err: 0 });
+            self.events.borrow_mut().push(InternalEvent::Closed {
+                conn: h,
+                err: 0,
+                emitted_ts_ns: crate::clock::now_ns(),
+            });
             crate::counters::inc(&self.counters.tcp.conn_close);
             // A4 cross-phase backfill: TIME_WAIT deadline expired.
             crate::counters::inc(&self.counters.tcp.conn_time_wait_reaped);
@@ -1476,15 +1487,18 @@ impl Engine {
                             .map(|e| (e.seq, e.xmit_count as u32))
                             .unwrap_or((0, 0))
                     };
+                    let emitted_ts_ns = crate::clock::now_ns();
                     let mut ev = self.events.borrow_mut();
                     ev.push(InternalEvent::TcpRetrans {
                         conn: handle,
                         seq,
                         rtx_count,
+                        emitted_ts_ns,
                     });
                     ev.push(InternalEvent::TcpLossDetected {
                         conn: handle,
                         cause: crate::tcp_events::LossCause::Rack,
+                        emitted_ts_ns,
                     });
                 }
             }
@@ -1690,6 +1704,7 @@ impl Engine {
             self.events.borrow_mut().push(InternalEvent::Connected {
                 conn: handle,
                 rx_hw_ts_ns: 0,
+                emitted_ts_ns: crate::clock::now_ns(),
             });
             inc(&self.counters.tcp.conn_open);
         }
@@ -1709,6 +1724,7 @@ impl Engine {
             self.events.borrow_mut().push(InternalEvent::Closed {
                 conn: handle,
                 err: 0,
+                emitted_ts_ns: crate::clock::now_ns(),
             });
             inc(&self.counters.tcp.conn_close);
             // Bump conn_rst when the close was caused by RST (either
@@ -1789,6 +1805,7 @@ impl Engine {
             conn: handle,
             from,
             to,
+            emitted_ts_ns: crate::clock::now_ns(),
         });
     }
 
@@ -2043,6 +2060,7 @@ impl Engine {
             byte_offset,
             byte_len: delivered,
             rx_hw_ts_ns: 0,
+            emitted_ts_ns: crate::clock::now_ns(),
         });
     }
 

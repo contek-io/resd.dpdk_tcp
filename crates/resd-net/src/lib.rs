@@ -164,7 +164,11 @@ pub unsafe extern "C" fn resd_net_poll(
         // Build the event value fully before writing it to events_out, so
         // we never read a possibly-uninitialized `kind` discriminant.
         let event: resd_net_event_t = match ev {
-            resd_net_core::tcp_events::InternalEvent::Connected { conn, rx_hw_ts_ns } => {
+            resd_net_core::tcp_events::InternalEvent::Connected {
+                conn,
+                rx_hw_ts_ns,
+                ..
+            } => {
                 resd_net_event_t {
                     kind: resd_net_event_kind_t::RESD_NET_EVT_CONNECTED,
                     conn: *conn as u64,
@@ -178,6 +182,7 @@ pub unsafe extern "C" fn resd_net_poll(
                 byte_offset,
                 byte_len,
                 rx_hw_ts_ns,
+                ..
             } => {
                 // Build the borrowed-view pointer into the connection's
                 // last_read_buf at the event's byte_offset (Task 19 fix
@@ -204,7 +209,7 @@ pub unsafe extern "C" fn resd_net_poll(
                     },
                 }
             }
-            resd_net_core::tcp_events::InternalEvent::Closed { conn, err } => resd_net_event_t {
+            resd_net_core::tcp_events::InternalEvent::Closed { conn, err, .. } => resd_net_event_t {
                 kind: resd_net_event_kind_t::RESD_NET_EVT_CLOSED,
                 conn: *conn as u64,
                 rx_hw_ts_ns: 0,
@@ -213,7 +218,7 @@ pub unsafe extern "C" fn resd_net_poll(
                     closed: resd_net_event_error_t { err: *err },
                 },
             },
-            resd_net_core::tcp_events::InternalEvent::StateChange { conn, from, to } => {
+            resd_net_core::tcp_events::InternalEvent::StateChange { conn, from, to, .. } => {
                 resd_net_event_t {
                     kind: resd_net_event_kind_t::RESD_NET_EVT_TCP_STATE_CHANGE,
                     conn: *conn as u64,
@@ -227,7 +232,7 @@ pub unsafe extern "C" fn resd_net_poll(
                     },
                 }
             }
-            resd_net_core::tcp_events::InternalEvent::Error { conn, err } => resd_net_event_t {
+            resd_net_core::tcp_events::InternalEvent::Error { conn, err, .. } => resd_net_event_t {
                 kind: resd_net_event_kind_t::RESD_NET_EVT_ERROR,
                 conn: *conn as u64,
                 rx_hw_ts_ns: 0,
@@ -243,6 +248,7 @@ pub unsafe extern "C" fn resd_net_poll(
                 conn,
                 seq,
                 rtx_count,
+                ..
             } => resd_net_event_t {
                 kind: resd_net_event_kind_t::RESD_NET_EVT_TCP_RETRANS,
                 conn: *conn as u64,
@@ -259,7 +265,7 @@ pub unsafe extern "C" fn resd_net_poll(
             // `LossCause` as `Rack=0`, `Tlp=1`, `Rto=2` (matching enum
             // order). `first_seq` is left 0 here — the paired TcpRetrans
             // event that precedes each TcpLossDetected carries the seq.
-            resd_net_core::tcp_events::InternalEvent::TcpLossDetected { conn, cause } => {
+            resd_net_core::tcp_events::InternalEvent::TcpLossDetected { conn, cause, .. } => {
                 let trigger: u8 = match cause {
                     resd_net_core::tcp_events::LossCause::Rack => 0,
                     resd_net_core::tcp_events::LossCause::Tlp => 1,
