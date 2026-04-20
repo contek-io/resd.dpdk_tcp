@@ -3534,6 +3534,9 @@ impl Engine {
     /// dispatch is flushed from the in-order VecDeque before the
     /// next ACK re-advertises free_space"). A6.6 retires the
     /// VecDeque entirely.
+    ///
+    /// Clippy's `too_many_arguments` default threshold is 7 (counting
+    /// `&self`); this fn has 8, so the allow is required.
     #[allow(clippy::too_many_arguments)]
     fn deliver_readable(
         &self,
@@ -3554,12 +3557,11 @@ impl Engine {
             // (we bump only when we push the handle), so no action
             // there.
             for d in drained_mbufs {
-                // SAFETY: queue handed off exactly one refcount per
-                // entry; wrapping in MbufHandle transfers that to the
-                // handle which drops it via refcnt_update(-1).
-                unsafe {
-                    let _ = crate::mempool::MbufHandle::from_raw(d.mbuf);
-                }
+                // Consume the refcount handoff into a handle and drop
+                // it immediately so `refcnt_update(-1)` fires exactly
+                // once. `into_handle()` disarms the DrainedMbuf Drop
+                // so we don't double-decrement.
+                let _ = d.into_handle();
             }
             return;
         };
@@ -3594,19 +3596,21 @@ impl Engine {
 
         // Drained portion from the reorder queue: one handle + one
         // event per entry. Each entry already carries a refcount
-        // handed off from the queue — just wrap it.
+        // handed off from the queue — `into_handle()` moves that count
+        // into an `MbufHandle` and disarms `DrainedMbuf::Drop` so the
+        // decrement happens exactly once (at handle Drop time).
         for d in drained_mbufs {
-            // SAFETY: queue transferred one refcount to this entry;
-            // `from_raw` takes ownership of that count.
-            let handle_mbuf = unsafe { crate::mempool::MbufHandle::from_raw(d.mbuf) };
+            let payload_offset = d.offset as u32;
+            let payload_len = d.len as u32;
+            let handle_mbuf = d.into_handle();
             let mbuf_idx = conn.recv.last_read_mbufs.len() as u32;
             conn.recv.last_read_mbufs.push(handle_mbuf);
             self.events.borrow_mut().push(
                 InternalEvent::Readable {
                     conn: handle,
                     mbuf_idx,
-                    payload_offset: d.offset as u32,
-                    payload_len: d.len as u32,
+                    payload_offset,
+                    payload_len,
                     rx_hw_ts_ns,
                     emitted_ts_ns: crate::clock::now_ns(),
                 },

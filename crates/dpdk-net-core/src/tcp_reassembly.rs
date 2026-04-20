@@ -79,6 +79,41 @@ pub struct DrainedMbuf {
 // `Mbuf` / `Mempool`.
 unsafe impl Send for DrainedMbuf {}
 
+impl Drop for DrainedMbuf {
+    /// A6.5 Task 8 leak-safety: if a DrainedMbuf is dropped without
+    /// being consumed (e.g., via `into_handle()`), release its
+    /// refcount handoff. Consuming the handoff into an MbufHandle
+    /// disarms this Drop via `std::mem::forget`.
+    fn drop(&mut self) {
+        // SAFETY: the queue handed this entry exactly one refcount
+        // unit at drain time (see `drain_contiguous_from_mbuf`). The
+        // pointer remained live across that handoff. If we reach Drop
+        // the caller never consumed the entry, so we release that
+        // refcount here to keep the accounting balanced.
+        unsafe {
+            sys::resd_rte_mbuf_refcnt_update(self.mbuf.as_ptr(), -1);
+        }
+    }
+}
+
+impl DrainedMbuf {
+    /// A6.5 Task 8: consume the refcount handoff into an MbufHandle
+    /// without double-decrement. Intended use:
+    /// ```ignore
+    /// for d in outcome.drained_mbufs.drain(..) {
+    ///     let handle = d.into_handle();
+    ///     conn.recv.last_read_mbufs.push(handle);
+    /// }
+    /// ```
+    pub fn into_handle(self) -> crate::mempool::MbufHandle {
+        let p = self.mbuf;
+        std::mem::forget(self); // disarm Drop
+        // SAFETY: the queue handed us one refcount; forget(self) prevents
+        // our Drop from dropping it; MbufHandle now owns it.
+        unsafe { crate::mempool::MbufHandle::from_raw(p) }
+    }
+}
+
 impl OooSegment {
     pub fn seq(&self) -> u32 {
         match self {

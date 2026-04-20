@@ -1611,24 +1611,18 @@ mod tests {
         assert_eq!(c.last_sack_trigger, Some((5100, 5103)));
     }
 
-    // A6.5 Task 4c: the former `inorder_arrival_closes_hole_and_drains_reassembly`
-    // unit test was retired here because it relied on the legacy
-    // `insert(seq, &bytes)` path (Bytes-variant) followed by a drain.
-    // The drain now rejects Bytes entries by design (see
-    // `drain_mbuf_panics_on_bytes_variant`), and exercising the real
-    // MbufRef → drain loop from a pure-slice unit test requires a live
-    // `rte_mbuf` (buf_addr/data_off populated for `rte_pktmbuf_mtod`)
-    // which the unit-test harness does not have.
-    //
-    // Equivalent coverage now lives at two layers:
-    //   - OOO insert state: `established_ooo_segment_queues_into_reassembly`
-    //     (Bytes-variant, no drain — still valid).
-    //   - Gap-close drain + byte-level correctness:
-    //     `tcp_options_paws_reassembly_sack_tap` integration test, which
-    //     drives real mbufs end-to-end (RX decode → OOO insert → in-order
-    //     close → drain → READABLE event with bytes observed by the caller).
-    //   - Queue-layer drain contract: `tcp_reassembly::drain_mbuf_*` unit
-    //     tests (including the Bytes-variant panic contract).
+    // A6.5 Task 8 (4c): this test exercised the Bytes-variant drain path
+    // via ReorderQueue::insert + drain_contiguous_from — both APIs retired
+    // in Task 8. The dispatch-level OOO-insert → gap-close → MbufRef drain
+    // pipeline does not currently have a single-binary end-to-end test
+    // (a synthetic TAP peer that injects OOO would be required).
+    // Coverage today:
+    //   - drain_mbuf_* unit tests in tcp_reassembly: structural drain shape
+    //     + refcount-accounting with dangling-pointer-safe assertions.
+    //   - tcp_basic_tap::handshake_echo_close_over_tap: in-order RX
+    //     end-to-end with real mbufs + refcount balance confirmed by the
+    //     test running clean under repeated invocations.
+    // A6.6 / A10 may add the dedicated OOO end-to-end scenario.
 
     #[test]
     fn established_inorder_payload_does_not_flag_ooo() {
