@@ -416,6 +416,11 @@ pub struct Engine {
     /// to short-circuit non-ENA drivers. See spec §5.
     #[allow(dead_code)]
     driver_name: [u8; 32],
+    /// A-HW+ Task 5 — resolved ENA xstat name → ID map. Built once at
+    /// engine_create via `ena_xstats::resolve_xstat_ids`. On non-ENA
+    /// PMDs every slot is `None` and `scrape_xstats` is a cheap no-op.
+    /// Slow-path only; not on any hot path.
+    xstat_map: crate::ena_xstats::XstatMap,
 }
 
 /// A4: map an `Outcome` to per-segment `TcpCounters` bumps. Pure slow-path
@@ -811,6 +816,10 @@ impl Engine {
         // bindgen names the field `addr_bytes` on rte_ether_addr.
         let our_mac = mac_addr.addr_bytes;
 
+        // A-HW+ Task 5: resolve ENA xstat name→ID map once at
+        // engine_create. Scraped later per-call via `scrape_xstats`.
+        let xstat_map = crate::ena_xstats::resolve_xstat_ids(cfg.port_id);
+
         Ok(Self {
             counters,
             _rx_mempool: rx_mempool,
@@ -837,6 +846,7 @@ impl Engine {
             #[cfg(feature = "hw-offload-rx-timestamp")]
             rx_ts_flag_mask,
             driver_name: outcome.driver_name,
+            xstat_map,
             rtt_histogram_edges,
             cfg,
         })
@@ -1201,6 +1211,18 @@ impl Engine {
 
     pub fn counters(&self) -> &Counters {
         &self.counters
+    }
+
+    /// Slow-path: scrape ENA-PMD xstats (ENI allowances + per-queue
+    /// counters) into `EthCounters`. Application drives the cadence —
+    /// recommended ≤1 Hz. On non-ENA / non-advertising PMDs this is a
+    /// cheap no-op (every slot in `xstat_map` is None).
+    pub fn scrape_xstats(&self) {
+        crate::ena_xstats::scrape(
+            self.cfg.port_id,
+            &self.xstat_map,
+            &self.counters,
+        );
     }
 
     /// A5.5 Task 10: expose `EngineConfig` for the ABI crate's TLP

@@ -46,14 +46,8 @@ pub struct XstatMap {
 }
 
 impl XstatMap {
-    /// Build from a name → id lookup. Pure function — used by both the
-    /// runtime resolver and the unit tests.
-    ///
-    /// `allow(dead_code)` covers Task 4 — the Engine caching wiring
-    /// that will call `resolve_xstat_ids` (and transitively this) lands
-    /// in Task 5, mirroring the same gating pattern used by
-    /// `wc_verify::parse_pat_memtype_list` pre-Task 3.
-    #[allow(dead_code)]
+    /// Pure constructor — used by both the runtime resolver
+    /// [`resolve_xstat_ids`] and the unit tests.
     pub(crate) fn from_lookup<F>(lookup: F) -> Self
     where
         F: Fn(&str) -> Option<u64>,
@@ -92,15 +86,10 @@ impl XstatMap {
 
 /// Resolve XSTAT_NAMES → ids by walking `rte_eth_xstats_get_names`.
 /// Returns an XstatMap that can be reused for every subsequent scrape.
-/// Slow-path; called once at engine_create.
+/// Slow-path resolver; called once per `Engine::new`.
 ///
 /// On non-ENA / non-advertising PMDs every slot is `None` and `apply`
 /// writes 0 across the board; the scrape becomes a cheap no-op.
-///
-/// `allow(dead_code)` covers Task 4 — the Engine caching wiring lands
-/// in Task 5. Same gating pattern used by `wc_verify::verify_wc_for_ena`
-/// pre-Task 3.
-#[allow(dead_code)]
 pub(crate) fn resolve_xstat_ids(port_id: u16) -> XstatMap {
     // First pass: query count.
     let n = unsafe { sys::rte_eth_xstats_get_names(port_id, std::ptr::null_mut(), 0) };
