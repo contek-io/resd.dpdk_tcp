@@ -14,7 +14,9 @@ use std::sync::atomic::Ordering;
 
 /// Names we want to scrape, in resolver order. Index in this array is
 /// the slot in `XstatMap.ids`; `apply()` consumes the values in the
-/// same order to write each counter.
+/// same order to write each counter. Exposed as `pub` (not
+/// `pub(crate)`) so diagnostic tooling + integration tests can
+/// enumerate the consumed name set without reaching into private API.
 pub const XSTAT_NAMES: &[&str] = &[
     // ENI allowances (README §8.2.2)
     "bw_in_allowance_exceeded",
@@ -137,7 +139,8 @@ pub(crate) fn resolve_xstat_ids(port_id: u16) -> XstatMap {
 
 /// Per-scrape: read the resolved xstat IDs into a value buffer + apply
 /// to counters. `map.ids.len() == XSTAT_NAMES.len() == 13`. Allocates
-/// two small Vec<u64>s per call — slow-path-acceptable (≤1 Hz).
+/// four small Vecs per call (capacity ≤ 13 each) — slow-path-acceptable
+/// at the ≤1 Hz cadence the application drives.
 pub fn scrape(port_id: u16, map: &XstatMap, counters: &Counters) {
     // Build the dense list of advertised IDs to query (skip None slots).
     let mut query_ids: Vec<u64> = Vec::with_capacity(map.ids.len());
@@ -164,9 +167,13 @@ pub fn scrape(port_id: u16, map: &XstatMap, counters: &Counters) {
                 values[i] = got_values[k];
             }
         }
-        // rc < expected: leave `values` at zeros so counters reset to
-        // 0 on partial failure. Acceptable because the next scrape
-        // will overwrite with fresh values if the PMD recovers.
+        // rc < expected: leave `values` at zeros. For allowance
+        // snapshot counters this is the correct reading of a failed
+        // scrape — "no throttle observed this cycle" = we don't know,
+        // which matches 0 under snapshot semantics. Preserving stale
+        // values would freeze a nonzero allowance indefinitely across
+        // PMD errors and hide the "throttle cleared" transition.
+        // Next successful scrape overwrites.
     }
     map.apply(&values, counters);
 }
