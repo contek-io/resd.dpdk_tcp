@@ -959,6 +959,48 @@ impl Engine {
         let bar_phys = unsafe { sys::shim_rte_eth_dev_prefetchable_bar_phys(cfg.port_id) };
         crate::wc_verify::verify_wc_for_ena(cfg.port_id, &driver_name, bar_phys, counters);
 
+        // phase-a-hw-plus T9 — decode driver name once for the bring-up
+        // overflow-risk guard below. NUL-walk matches the convention used
+        // by `wc_verify::verify_wc_for_ena` and
+        // `llq_verify::verify_llq_activation_from_global`. Non-UTF8 falls
+        // back to `""`, which compares unequal to "net_ena" and therefore
+        // short-circuits the guard (safe default).
+        let driver_str = std::str::from_utf8(
+            &driver_name[..driver_name.iter().position(|&b| b == 0).unwrap_or(32)],
+        )
+        .unwrap_or("");
+
+        // M1 — header-overflow-risk warning (slow-path one-shot).
+        // Worst-case header: 14 (Ethernet) + 20 (IPv4) + 20 (TCP) + 40
+        // (max TCP options) = 94 B. With ena_large_llq_hdr=0 the LLQ
+        // ceiling is 96 B; at 94 B we sit one byte under the limit and
+        // any future option-stack growth silently demotes TX off LLQ.
+        // The 6 B margin + constant `WORST_CASE_HEADER + LLQ_OVERFLOW_MARGIN
+        // > LLQ_DEFAULT_HEADER_LIMIT` tests evaluate to
+        // (94 + 6 > 96) → true, so the warn fires by default on net_ena.
+        // Operator remediation: set EngineConfig.ena_large_llq_hdr=1 and
+        // splice the corresponding devarg via dpdk_net_recommended_ena_devargs.
+        const WORST_CASE_HEADER: u32 = 14 + 20 + 20 + 40;
+        const LLQ_DEFAULT_HEADER_LIMIT: u32 = 96;
+        const LLQ_OVERFLOW_MARGIN: u32 = 6;
+        if driver_str == "net_ena"
+            && cfg.ena_large_llq_hdr == 0
+            && WORST_CASE_HEADER + LLQ_OVERFLOW_MARGIN > LLQ_DEFAULT_HEADER_LIMIT
+        {
+            counters
+                .eth
+                .llq_header_overflow_risk
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            eprintln!(
+                "dpdk_net: port {} on net_ena with ena_large_llq_hdr=0; \
+                 worst-case header {} B is within {} B of the 96 B LLQ \
+                 limit. Consider setting EngineConfig.ena_large_llq_hdr=1 \
+                 + splicing dpdk_net_recommended_ena_devargs(...) into \
+                 EAL args. See docs/references/ena-dpdk-readme.md §5.1.",
+                cfg.port_id, WORST_CASE_HEADER, LLQ_OVERFLOW_MARGIN
+            );
+        }
+
         let mut applied_tx_offloads = RTE_ETH_TX_OFFLOAD_MULTI_SEGS;
         // `applied_rx_offloads` is mutated when any RX-side offload feature
         // is enabled (rx-cksum, rss-hash). Silence `unused_mut` when no
