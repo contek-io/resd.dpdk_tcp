@@ -18,7 +18,7 @@
 | A4 | TCP options + PAWS + reassembly + SACK scoreboard | **Complete** ✓ | `2026-04-18-stage1-phase-a4-options-paws-reassembly-sack.md` |
 | A5 | RACK-TLP + RTO + retransmit + ISS | **Complete** ✓ | `2026-04-18-stage1-phase-a5-rack-rto-retransmit.md` |
 | A5.5 | Event-log forensics + in-flight introspection + TLP tuning (emission-time ts, queue overflow counter, stats getter, per-conn TLP knobs) | **Complete** ✓ | `2026-04-19-stage1-phase-a5-5-event-log-forensics-tlp-tuning.md` |
-| A-HW | ENA hardware offload enablement (LLQ verify + TX/RX checksum + MBUF_FAST_FREE + RSS-hash plumbing) | Not started | — |
+| A-HW | ENA hardware offload enablement (LLQ verify + TX/RX checksum + MBUF_FAST_FREE + RSS-hash plumbing) | **Complete** ✓ | `2026-04-19-stage1-phase-a-hw-ena-offload.md` |
 | A6 | Public API surface completeness **+ per-connection RTT histogram** (merged from former A5.6) | Not started | — |
 | A6.5 | Hot-path allocation elimination (reusable scratch, streaming csum, SmallVec, zero-copy reassembly) | Not started | — |
 | A6.6 | RX zero-copy (scatter-gather iovec API, in-order delivery-path mbuf-ref rework, LRO-compatible multi-segment, `rx_mempool_size` knob) | Not started | — |
@@ -295,6 +295,8 @@
 **Ship gate:** phase-a-hw-complete tag requires (a) software-fallback smoke tests green with both `--default-features` (runtime-fallback path exercised) and `--no-default-features` (compile-gated-off path exercised), (b) hardware-path smoke test green on the ENA VF with default features, (c) CI matrix builds every per-offload feature combination (or a sampled subset documented in the report) to prevent bit-rot of the feature-off branches. Final kept-vs-removed decision per offload is **not** gated here — it's gated in A10 once the A/B benchmark data exists.
 
 **Rough scale:** ~14 tasks (port-config upgrade, LLQ verify, TX checksum feature gate + branch, RX checksum feature gate + branch, RSS-hash feature gate + flow-table read, MBUF_FAST_FREE feature gate, LLQ feature gate, RX-timestamp feature gate + dynfield/dynflag lookup at `engine_create`, RX-timestamp inline accessor + threading through A3/A4 event-emission sites, capability-gated runtime fallback paths, software-fallback smoke × 2 build configs, hardware-path smoke, counter additions + coverage entries, startup-banner format + CI feature-matrix build).
+
+**Status:** **Complete.** Plan: `docs/superpowers/plans/2026-04-19-stage1-phase-a-hw-ena-offload.md`. Tag: `phase-a-hw-complete` (set after Task 20's mTCP + RFC review gates).
 
 ---
 

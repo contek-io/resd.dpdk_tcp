@@ -1,3 +1,4 @@
+#include <assert.h>
 #include <rte_errno.h>
 #include <rte_ethdev.h>
 #include <rte_mbuf.h>
@@ -102,6 +103,11 @@ uint64_t resd_rte_mbuf_get_ol_flags(const struct rte_mbuf *m) {
     return m->ol_flags;
 }
 
+/* The following mbuf getters (l2_len/l3_len/l4_len) are reserved for the
+ * A-HW Task 18 smoke test (ahw_smoke_ena_hw.rs) and future diagnostic
+ * tooling. They are intentionally not gated — linking them unconditionally
+ * keeps the bindgen allowlist pattern (`resd_.*`) simple. See A-HW spec
+ * §12.3. */
 uint16_t resd_rte_mbuf_get_l2_len(const struct rte_mbuf *m) {
     return (uint16_t)m->l2_len;
 }
@@ -135,5 +141,12 @@ uint32_t resd_rte_mbuf_get_rss_hash(const struct rte_mbuf *m) {
  * Only called when both the dynfield AND the dynflag lookup succeeded
  * (see Engine::hw_rx_ts_ns); ENA never reaches this path per spec §10.5. */
 uint64_t resd_rte_mbuf_read_dynfield_u64(const struct rte_mbuf *m, int32_t offset) {
+    /* x86_64 tolerates unaligned 8-byte loads, but ARM64 is strict. The
+     * DPDK dynfield registrar returns an 8-byte-aligned offset for u64
+     * fields; this assert catches misconfigured PMDs in debug builds
+     * before a stray SIGBUS on a future ARM target. NOP when NDEBUG is
+     * defined (release builds). */
+    assert(offset >= 0);
+    assert((offset & 0x7) == 0 && "dynfield offset must be 8-byte aligned (u64 field)");
     return *(const uint64_t *)((const char *)m + offset);
 }

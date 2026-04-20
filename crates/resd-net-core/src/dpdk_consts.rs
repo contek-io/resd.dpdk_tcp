@@ -69,17 +69,24 @@ mod tests {
         // Pinned values from lib/ethdev/rte_ethdev.h + lib/mbuf/rte_mbuf_core.h.
         // Failure here means DPDK changed the bit layout — do NOT blindly fix.
         assert_eq!(RTE_ETH_TX_OFFLOAD_IPV4_CKSUM, 0x0000_0000_0000_0002);
+        assert_eq!(RTE_ETH_TX_OFFLOAD_UDP_CKSUM, 0x0000_0000_0000_0004);
         assert_eq!(RTE_ETH_TX_OFFLOAD_TCP_CKSUM, 0x0000_0000_0000_0008);
         assert_eq!(RTE_ETH_TX_OFFLOAD_MBUF_FAST_FREE, 0x0000_0000_0000_4000);
         assert_eq!(RTE_ETH_TX_OFFLOAD_MULTI_SEGS, 0x0000_0000_0000_8000);
+        assert_eq!(RTE_ETH_RX_OFFLOAD_IPV4_CKSUM, 0x0000_0000_0000_0002);
+        assert_eq!(RTE_ETH_RX_OFFLOAD_UDP_CKSUM, 0x0000_0000_0000_0004);
         assert_eq!(RTE_ETH_RX_OFFLOAD_TCP_CKSUM, 0x0000_0000_0000_0008);
         assert_eq!(RTE_ETH_RX_OFFLOAD_RSS_HASH, 0x0000_0000_0008_0000);
         assert_eq!(RTE_ETH_RSS_NONFRAG_IPV4_TCP, 0x0000_0000_0000_2000);
+        assert_eq!(RTE_ETH_RSS_NONFRAG_IPV6_TCP, 0x0000_0000_0008_0000);
         assert_eq!(RTE_MBUF_F_RX_RSS_HASH, 0x0000_0000_0000_0002);
         assert_eq!(RTE_MBUF_F_RX_IP_CKSUM_MASK, 0x0000_0000_0000_0090);
         assert_eq!(RTE_MBUF_F_RX_L4_CKSUM_MASK, 0x0000_0000_0000_0108);
         assert_eq!(RTE_MBUF_F_TX_TCP_CKSUM, 0x0010_0000_0000_0000);
+        assert_eq!(RTE_MBUF_F_TX_UDP_CKSUM, 0x0030_0000_0000_0000);
+        assert_eq!(RTE_MBUF_F_TX_L4_MASK, 0x0030_0000_0000_0000);
         assert_eq!(RTE_MBUF_F_TX_IP_CKSUM, 0x0040_0000_0000_0000);
         assert_eq!(RTE_MBUF_F_TX_IPV4, 0x0080_0000_0000_0000);
+        assert_eq!(RTE_MBUF_F_TX_IPV6, 0x0100_0000_0000_0000);
     }
 }

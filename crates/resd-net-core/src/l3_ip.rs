@@ -117,7 +117,7 @@ pub fn ip_decode(pkt: &[u8], our_ip: u32, nic_csum_ok: bool) -> Result<L3Decoded
 /// See spec §7.
 #[cfg(feature = "hw-offload-rx-cksum")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum IpCksumOutcome {
+pub enum CksumOutcome {
     /// NIC did not verify — software verify required.
     Unknown,
     /// NIC verified and rejected — drop.
@@ -129,42 +129,42 @@ pub enum IpCksumOutcome {
 }
 
 /// Map the IP-cksum bits in `ol_flags` (masked by
-/// RTE_MBUF_F_RX_IP_CKSUM_MASK) to an `IpCksumOutcome`. See spec §7.
+/// RTE_MBUF_F_RX_IP_CKSUM_MASK) to a `CksumOutcome`. See spec §7.
 #[cfg(feature = "hw-offload-rx-cksum")]
-pub fn classify_ip_rx_cksum(ol_flags: u64) -> IpCksumOutcome {
+pub fn classify_ip_rx_cksum(ol_flags: u64) -> CksumOutcome {
     use crate::dpdk_consts::{
         RTE_MBUF_F_RX_IP_CKSUM_BAD, RTE_MBUF_F_RX_IP_CKSUM_GOOD, RTE_MBUF_F_RX_IP_CKSUM_MASK,
         RTE_MBUF_F_RX_IP_CKSUM_NONE,
     };
     let m = ol_flags & RTE_MBUF_F_RX_IP_CKSUM_MASK;
     if m == RTE_MBUF_F_RX_IP_CKSUM_GOOD {
-        IpCksumOutcome::Good
+        CksumOutcome::Good
     } else if m == RTE_MBUF_F_RX_IP_CKSUM_BAD {
-        IpCksumOutcome::Bad
+        CksumOutcome::Bad
     } else if m == RTE_MBUF_F_RX_IP_CKSUM_NONE {
-        IpCksumOutcome::None
+        CksumOutcome::None
     } else {
-        IpCksumOutcome::Unknown
+        CksumOutcome::Unknown
     }
 }
 
 /// Map the L4-cksum bits in `ol_flags` (masked by
-/// RTE_MBUF_F_RX_L4_CKSUM_MASK) to an `IpCksumOutcome`. See spec §7.
+/// RTE_MBUF_F_RX_L4_CKSUM_MASK) to a `CksumOutcome`. See spec §7.
 #[cfg(feature = "hw-offload-rx-cksum")]
-pub fn classify_l4_rx_cksum(ol_flags: u64) -> IpCksumOutcome {
+pub fn classify_l4_rx_cksum(ol_flags: u64) -> CksumOutcome {
     use crate::dpdk_consts::{
         RTE_MBUF_F_RX_L4_CKSUM_BAD, RTE_MBUF_F_RX_L4_CKSUM_GOOD, RTE_MBUF_F_RX_L4_CKSUM_MASK,
         RTE_MBUF_F_RX_L4_CKSUM_NONE,
     };
     let m = ol_flags & RTE_MBUF_F_RX_L4_CKSUM_MASK;
     if m == RTE_MBUF_F_RX_L4_CKSUM_GOOD {
-        IpCksumOutcome::Good
+        CksumOutcome::Good
     } else if m == RTE_MBUF_F_RX_L4_CKSUM_BAD {
-        IpCksumOutcome::Bad
+        CksumOutcome::Bad
     } else if m == RTE_MBUF_F_RX_L4_CKSUM_NONE {
-        IpCksumOutcome::None
+        CksumOutcome::None
     } else {
-        IpCksumOutcome::Unknown
+        CksumOutcome::Unknown
     }
 }
 
@@ -189,8 +189,8 @@ pub fn ip_decode_offload_aware(
         }
         use std::sync::atomic::Ordering;
         match classify_ip_rx_cksum(ol_flags) {
-            IpCksumOutcome::Good => ip_decode(pkt, our_ip, true),
-            IpCksumOutcome::Bad => {
+            CksumOutcome::Good => ip_decode(pkt, our_ip, true),
+            CksumOutcome::Bad => {
                 counters
                     .eth
                     .rx_drop_cksum_bad
@@ -359,19 +359,19 @@ mod tests {
         };
         assert_eq!(
             classify_ip_rx_cksum(RTE_MBUF_F_RX_IP_CKSUM_GOOD),
-            IpCksumOutcome::Good
+            CksumOutcome::Good
         );
         assert_eq!(
             classify_ip_rx_cksum(RTE_MBUF_F_RX_IP_CKSUM_BAD),
-            IpCksumOutcome::Bad
+            CksumOutcome::Bad
         );
         assert_eq!(
             classify_ip_rx_cksum(RTE_MBUF_F_RX_IP_CKSUM_UNKNOWN),
-            IpCksumOutcome::Unknown
+            CksumOutcome::Unknown
         );
         assert_eq!(
             classify_ip_rx_cksum(RTE_MBUF_F_RX_IP_CKSUM_NONE),
-            IpCksumOutcome::None
+            CksumOutcome::None
         );
     }
 
@@ -384,19 +384,19 @@ mod tests {
         };
         assert_eq!(
             classify_l4_rx_cksum(RTE_MBUF_F_RX_L4_CKSUM_GOOD),
-            IpCksumOutcome::Good
+            CksumOutcome::Good
         );
         assert_eq!(
             classify_l4_rx_cksum(RTE_MBUF_F_RX_L4_CKSUM_BAD),
-            IpCksumOutcome::Bad
+            CksumOutcome::Bad
         );
         assert_eq!(
             classify_l4_rx_cksum(RTE_MBUF_F_RX_L4_CKSUM_UNKNOWN),
-            IpCksumOutcome::Unknown
+            CksumOutcome::Unknown
         );
         assert_eq!(
             classify_l4_rx_cksum(RTE_MBUF_F_RX_L4_CKSUM_NONE),
-            IpCksumOutcome::None
+            CksumOutcome::None
         );
     }
 }

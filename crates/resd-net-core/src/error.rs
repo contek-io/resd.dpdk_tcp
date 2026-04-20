@@ -8,6 +8,8 @@ pub enum Error {
     EalInit(i32),
     #[error("mempool creation failed: {0}")]
     MempoolCreate(&'static str),
+    #[error("port {0} dev_info query failed: rte_errno={1}")]
+    PortInfo(u16, i32),
     #[error("port {0} configure failed: rte_errno={1}")]
     PortConfigure(u16, i32),
     #[error("port {0} rx queue setup failed: rte_errno={1}")]

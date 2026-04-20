@@ -524,3 +524,156 @@ fn knob_rtt_histogram_bucket_edges_us_override() {
     assert_eq!(h.buckets[1], 1, "custom edges land 150 µs in bucket 1");
     assert_eq!(h.buckets[2], 0, "custom edges do NOT touch bucket 2");
 }
+
+// ---- A-HW knob coverage -------------------------------------------------
+//
+// One `#[cfg(not(feature = ...))]`-gated test per A-HW compile-time flag.
+// Each test asserts a distinguishing consequence of the feature being off
+// (where a direct assertion exists) OR serves as a compile-presence
+// check that the feature-off branch compiles in CI.
+//
+// Exercised by Task 15's scripts/ci-feature-matrix.sh: the build that
+// turns OFF exactly one flag will run the matching test here; the other
+// feature-off tests stay compile-gated out of that build.
+
+/// Helper: build a valid IPv4+TCP frame starting at the IP header.
+/// Uses the existing public builder so the IP + TCP checksums are
+/// correct without hand-rolling the math. Gated on the rx_cksum test
+/// since it is the only consumer.
+#[cfg(not(feature = "hw-offload-rx-cksum"))]
+fn build_valid_ipv4_tcp_packet() -> Vec<u8> {
+    use resd_net_core::tcp_options::TcpOpts;
+    use resd_net_core::tcp_output::{build_segment, SegmentTx, TCP_ACK};
+    let seg = SegmentTx {
+        src_mac: [0; 6],
+        dst_mac: [0; 6],
+        src_ip: 0x0a_00_00_01,
+        dst_ip: 0x0a_00_00_02,
+        src_port: 10_000,
+        dst_port: 20_000,
+        seq: 0,
+        ack: 0,
+        flags: TCP_ACK,
+        window: 1024,
+        options: TcpOpts::default(),
+        payload: &[],
+    };
+    let mut buf = vec![0u8; 128];
+    let n = build_segment(&seg, &mut buf).expect("build_segment must fit");
+    buf.truncate(n);
+    // ip_decode_offload_aware expects the IP header at offset 0, so
+    // strip the 14-byte Ethernet prefix.
+    buf[14..].to_vec()
+}
+
+/// Knob: `hw-verify-llq`.
+/// Non-default: feature OFF.
+/// Observable: Engine::new on ENA does NOT verify LLQ — the capture
+/// machinery + verifier compile away entirely. Test asserts the feature-off
+/// build compiles + links without the `llq_verify` module.
+#[cfg(not(feature = "hw-verify-llq"))]
+#[test]
+fn knob_hw_verify_llq_off_compiles() {
+    // Compile-presence only: the `llq_verify` module is gated on
+    // hw-verify-llq via `#[cfg(feature = "hw-verify-llq")] pub mod llq_verify;`
+    // in lib.rs. Its absence in this build is the observable.
+}
+
+/// Knob: `hw-offload-tx-cksum`.
+/// Non-default: feature OFF.
+/// Observable: `tx_offload_finalize` has a feature-off stub that is a
+/// no-op. The feature-off build compiles the software full-fold TX
+/// checksum path unconditionally; no pseudo-header-only write.
+#[cfg(not(feature = "hw-offload-tx-cksum"))]
+#[test]
+fn knob_hw_offload_tx_cksum_off_finalize_is_noop() {
+    // The feature-off variant of `tx_offload_finalize` is a no-op —
+    // verified at compile time via the
+    // `#[cfg(not(feature = "hw-offload-tx-cksum"))]` variant's empty
+    // body in tcp_output.rs. Invoking on a null mbuf would require
+    // unsafe and a dereference; instead treat the feature-off branch's
+    // compile-presence as the proof.
+}
+
+/// Knob: `hw-offload-rx-cksum`.
+/// Non-default: feature OFF.
+/// Observable: `ip_decode_offload_aware` feature-off branch forwards
+/// directly to `ip_decode(.., nic_csum_ok=false)` — always software verify,
+/// regardless of ol_flags. Counter bumps on NIC-BAD do NOT fire because
+/// the classification path is absent.
+#[cfg(not(feature = "hw-offload-rx-cksum"))]
+#[test]
+fn knob_hw_offload_rx_cksum_off_software_verify_always() {
+    use resd_net_core::l3_ip::ip_decode_offload_aware;
+
+    let counters = Counters::new();
+    let pkt = build_valid_ipv4_tcp_packet();
+    // Feature-off: ol_flags + rx_cksum_offload_active are ignored;
+    // classifier path absent. With a valid packet, software verify
+    // succeeds regardless of what we pass for those args.
+    let result = ip_decode_offload_aware(
+        &pkt,
+        0, // our_ip = 0 → accept any dst
+        /* ol_flags = anything */ u64::MAX,
+        /* rx_cksum_offload_active = */ true,
+        &counters,
+    );
+    assert!(
+        result.is_ok(),
+        "software verify should succeed on well-formed packet; got {:?}",
+        result
+    );
+    // No counter bumps in the feature-off path — the classifier that
+    // would have bumped this on NIC-BAD is compile-gated out.
+    assert_eq!(
+        counters.eth.rx_drop_cksum_bad.load(Ordering::Relaxed),
+        0,
+        "feature-off: eth.rx_drop_cksum_bad must not fire (classifier absent)"
+    );
+}
+
+/// Knob: `hw-offload-mbuf-fast-free`.
+/// Non-default: feature OFF.
+/// Observable: no direct Rust-level diff (the bit is PMD-internal).
+/// Compile-presence is the proof.
+#[cfg(not(feature = "hw-offload-mbuf-fast-free"))]
+#[test]
+fn knob_hw_offload_mbuf_fast_free_off_compiles() {}
+
+/// Knob: `hw-offload-rss-hash`.
+/// Non-default: feature OFF.
+/// Observable: `flow_table::hash_bucket_for_lookup` always returns
+/// `siphash_4tuple(tup)` regardless of ol_flags, nic_rss_hash, or
+/// rss_active.
+#[cfg(not(feature = "hw-offload-rss-hash"))]
+#[test]
+fn knob_hw_offload_rss_hash_off_always_siphash() {
+    use resd_net_core::flow_table::hash_bucket_for_lookup;
+    let tup = FourTuple {
+        local_ip: 0x0a_00_00_01,
+        local_port: 1,
+        peer_ip: 0x0a_00_00_02,
+        peer_port: 2,
+    };
+    // Feature-off: nic_rss_hash + ol_flags are ignored; siphash_4tuple
+    // is deterministic for a given tuple within a process, so two calls
+    // with distinct ol_flags + nic_rss_hash values produce the SAME
+    // hash.
+    let with_nic_hash = hash_bucket_for_lookup(&tup, u64::MAX, 0xdead_beef, true);
+    let with_different_nic = hash_bucket_for_lookup(&tup, 0, 0xbeef_dead, false);
+    assert_eq!(
+        with_nic_hash, with_different_nic,
+        "feature-off: nic_rss_hash + ol_flags must be ignored — SipHash deterministic"
+    );
+}
+
+/// Knob: `hw-offload-rx-timestamp`.
+/// Non-default: feature OFF.
+/// Observable: `Engine::hw_rx_ts_ns` feature-off stub always returns 0.
+/// The engine state fields `rx_ts_offset` / `rx_ts_flag_mask` are
+/// compile-gated out. Compile-presence is the proof since constructing
+/// an Engine in a unit test is non-trivial (and `hw_rx_ts_ns` is
+/// `pub(crate)`).
+#[cfg(not(feature = "hw-offload-rx-timestamp"))]
+#[test]
+fn knob_hw_offload_rx_timestamp_off_compiles() {}

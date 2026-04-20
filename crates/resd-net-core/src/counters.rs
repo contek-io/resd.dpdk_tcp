@@ -19,8 +19,10 @@ pub struct EthCounters {
     pub rx_arp: AtomicU64,
     pub tx_arp: AtomicU64,
     // A-HW additions — all slow-path per spec §9.1.1. Fields always
-    // allocated regardless of feature flags (C-ABI stability). See
-    // docs/superpowers/specs/2026-04-19-stage1-phase-a-hw-ena-offload-design.md §11.
+    // allocated regardless of feature flags (C-ABI stability). Feature-off
+    // builds never bump the offload_missing_* counters because the
+    // corresponding offload requests are compile-gated away entirely.
+    // See docs/superpowers/specs/2026-04-19-stage1-phase-a-hw-ena-offload-design.md §11.
     /// Offload advertised-request-mismatch counters (one-shot at bring-up).
     pub offload_missing_rx_cksum_ipv4: AtomicU64,
     pub offload_missing_rx_cksum_tcp: AtomicU64,
@@ -31,7 +33,7 @@ pub struct EthCounters {
     pub offload_missing_mbuf_fast_free: AtomicU64,
     pub offload_missing_rss_hash: AtomicU64,
     /// Fires only when driver is net_ena AND LLQ advertised-but-not-activated.
-    /// Expected 0 on ENA with default enable_llq=1. Feature-off builds never bump.
+    /// Expected 0 on ENA with default enable_llq=1.
     pub offload_missing_llq: AtomicU64,
     /// Expected 1 on ENA (documented steady state — ENA does not register
     /// the rte_dynfield_timestamp dynfield). 0 on mlx5/ice/future-gen ENA.
