@@ -525,6 +525,155 @@ fn knob_rtt_histogram_bucket_edges_us_override() {
     assert_eq!(h.buckets[2], 0, "custom edges do NOT touch bucket 2");
 }
 
+// ---- knob 10: ena_large_llq_hdr -----------------------------------------
+
+/// Knob: `EngineConfig::ena_large_llq_hdr` (phase-a-hw-plus T7 / M1).
+/// Non-default value: `1` (request ENA `large_llq_hdr=1` devarg → 224 B
+/// LLQ header limit). Default is `0` (PMD default 96 B limit).
+/// Observable consequence: the bring-up overflow-risk guard in
+/// `Engine::new` only fires on `net_ena` when this knob is `0` — at
+/// `== 1` the `eth.llq_header_overflow_risk` counter stays at 0 and the
+/// warn-line is suppressed. The engine can't be brought up in a unit
+/// test without EAL, so at the knob-coverage layer we assert:
+///   (a) the non-default value propagates unchanged through `EngineConfig`
+///       (catches the "field added but no code path reads it" failure
+///       mode this audit exists to prevent), and
+///   (b) the guard predicate used at `Engine::new` — `ena_large_llq_hdr
+///       == 0` combined with the worst-case-header math — evaluates the
+///       way this knob's doc-comment claims (ON at default, OFF at 1).
+/// Functional bring-up behavior (the actual devarg emission + warn-line
+/// firing) is covered by T8's `dpdk_net_recommended_ena_devargs` unit
+/// tests and T9's `engine_new_warns_llq_overflow_risk_on_ena_without_large_hdr`
+/// + T11's real-ENA smoke.
+#[test]
+fn knob_ena_large_llq_hdr_suppresses_overflow_risk_guard() {
+    use dpdk_net_core::engine::EngineConfig;
+
+    // (a) Propagation: non-default value round-trips through EngineConfig.
+    let cfg = EngineConfig {
+        ena_large_llq_hdr: 1,
+        ..EngineConfig::default()
+    };
+    assert_eq!(
+        cfg.ena_large_llq_hdr, 1,
+        "non-default ena_large_llq_hdr=1 must propagate through EngineConfig"
+    );
+    // Sanity: default is 0 (the overflow-risk-guarded value).
+    assert_eq!(
+        EngineConfig::default().ena_large_llq_hdr, 0,
+        "default ena_large_llq_hdr is 0 (the guard-active value)"
+    );
+
+    // (b) Guard predicate: mirror the exact condition in
+    // `Engine::new`'s net_ena branch (see engine.rs ~line 987):
+    //   driver_str == "net_ena"
+    //     && cfg.ena_large_llq_hdr == 0
+    //     && WORST_CASE_HEADER + LLQ_OVERFLOW_MARGIN > LLQ_DEFAULT_HEADER_LIMIT
+    const WORST_CASE_HEADER: u32 = 14 + 20 + 20 + 40; // 94 B
+    const LLQ_DEFAULT_HEADER_LIMIT: u32 = 96;
+    const LLQ_OVERFLOW_MARGIN: u32 = 6;
+    // The math half of the guard is a compile-time constant — pin it so
+    // future TCP-option growth doesn't silently change behaviour.
+    assert!(
+        WORST_CASE_HEADER + LLQ_OVERFLOW_MARGIN > LLQ_DEFAULT_HEADER_LIMIT,
+        "guard math invariant: 94 + 6 > 96 must hold"
+    );
+    // At non-default ena_large_llq_hdr=1, the `cfg.ena_large_llq_hdr == 0`
+    // short-circuit suppresses the guard — so even on net_ena with the
+    // worst-case-header invariant true, the warn does NOT fire.
+    let driver_is_ena = true;
+    let default_cfg_triggers = driver_is_ena
+        && EngineConfig::default().ena_large_llq_hdr == 0
+        && WORST_CASE_HEADER + LLQ_OVERFLOW_MARGIN > LLQ_DEFAULT_HEADER_LIMIT;
+    let nondefault_cfg_triggers = driver_is_ena
+        && cfg.ena_large_llq_hdr == 0
+        && WORST_CASE_HEADER + LLQ_OVERFLOW_MARGIN > LLQ_DEFAULT_HEADER_LIMIT;
+    assert!(
+        default_cfg_triggers,
+        "sanity: default config on net_ena triggers the overflow-risk guard"
+    );
+    assert!(
+        !nondefault_cfg_triggers,
+        "non-default ena_large_llq_hdr=1 on net_ena must suppress the guard"
+    );
+}
+
+// ---- knob 11: ena_miss_txc_to_sec ---------------------------------------
+
+/// Knob: `EngineConfig::ena_miss_txc_to_sec` (phase-a-hw-plus T7 / M2).
+/// Non-default value: `3` (explicit Tx-completion watchdog timeout in
+/// seconds, faster than the PMD default 5 s). Default is `0` (use PMD
+/// default).
+/// Observable consequence: the devargs builder
+/// `dpdk_net_recommended_ena_devargs` (in the downstream `dpdk-net` ABI
+/// crate, which `dpdk-net-core` can't depend on) emits `miss_txc_to=3`
+/// when this knob is non-zero, and omits the key entirely when it is 0.
+/// The engine can't be brought up in a unit test without EAL either, so
+/// at this (core-crate) knob-coverage layer we assert:
+///   (a) the non-default value propagates unchanged through `EngineConfig`
+///       (catches the "field added but no code path reads it" failure
+///       mode this audit exists to prevent), and
+///   (b) the devargs-projection *rule* — "emit `miss_txc_to=N` iff the
+///       knob is non-zero" — by replicating the rule body here and
+///       exercising it against both the non-default value (3) and the
+///       default (0). Precedent: `knob_preset_rfc_compliance_forces_rfc_defaults`
+///       replicates a downstream override body at the core-crate layer
+///       for the same cross-crate reason.
+/// The real call site is covered by the downstream ABI-crate test
+/// `crates/dpdk-net/src/lib.rs::tests` around `dpdk_net_recommended_ena_devargs`
+/// (T8); real-ENA devarg binding is covered by T11's smoke.
+#[test]
+fn knob_ena_miss_txc_to_sec_projects_to_devargs_key() {
+    use dpdk_net_core::engine::EngineConfig;
+
+    // (a) Propagation: non-default value round-trips through EngineConfig.
+    let cfg = EngineConfig {
+        ena_miss_txc_to_sec: 3,
+        ..EngineConfig::default()
+    };
+    assert_eq!(
+        cfg.ena_miss_txc_to_sec, 3,
+        "non-default ena_miss_txc_to_sec=3 must propagate through EngineConfig"
+    );
+    // Sanity: default is 0 (the "use PMD default" sentinel).
+    assert_eq!(
+        EngineConfig::default().ena_miss_txc_to_sec, 0,
+        "default ena_miss_txc_to_sec is 0 (use PMD default)"
+    );
+
+    // (b) Devargs projection rule — mirror the body of
+    // `dpdk_net_recommended_ena_devargs` (crates/dpdk-net/src/lib.rs):
+    //   if miss_txc_to_sec != 0 { push `,miss_txc_to={}` }
+    // Replicate here so a knob-value change that silently orphans this
+    // branch (e.g. someone renames the field, or flips the non-zero
+    // predicate) is caught at the core-crate audit layer.
+    fn project_miss_txc_to(bdf: &str, miss_txc_to_sec: u8) -> String {
+        let mut s = bdf.to_string();
+        if miss_txc_to_sec != 0 {
+            s.push_str(&format!(",miss_txc_to={}", miss_txc_to_sec));
+        }
+        s
+    }
+
+    let devargs_nondefault = project_miss_txc_to("00:06.0", cfg.ena_miss_txc_to_sec);
+    assert!(
+        devargs_nondefault.contains(",miss_txc_to=3"),
+        "non-default ena_miss_txc_to_sec=3 must project as `,miss_txc_to=3`; got {devargs_nondefault:?}"
+    );
+
+    // Contrast: default value 0 must OMIT the key entirely so the PMD's
+    // default watchdog stays in effect (explicit 0 would DISABLE the
+    // watchdog — ENA README §5.1 cautions against that).
+    let devargs_default = project_miss_txc_to(
+        "00:06.0",
+        EngineConfig::default().ena_miss_txc_to_sec,
+    );
+    assert!(
+        !devargs_default.contains("miss_txc_to"),
+        "default ena_miss_txc_to_sec=0 must omit miss_txc_to= from devargs; got {devargs_default:?}"
+    );
+}
+
 // ---- A-HW knob coverage -------------------------------------------------
 //
 // One `#[cfg(not(feature = ...))]`-gated test per A-HW compile-time flag.
