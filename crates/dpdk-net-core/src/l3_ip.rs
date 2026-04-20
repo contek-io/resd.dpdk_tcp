@@ -29,17 +29,37 @@ pub enum L3Drop {
     UnsupportedProto, // protocol is not TCP and not ICMP
 }
 
-/// Compute the Internet checksum (RFC 1071) over a byte slice.
-/// Caller supplies the slice containing the IP header exactly.
-pub fn internet_checksum(buf: &[u8]) -> u16 {
+/// Compute the Internet checksum (RFC 1071) over a disjoint set of byte slices.
+/// Folds each chunk in order, carrying an odd-boundary byte across chunk
+/// transitions so the result is bit-for-bit identical to folding a single
+/// concatenated buffer. A6.5 §7.6: callers pre-build pseudo-headers as
+/// stack arrays and pass `&[&pseudo, tcp_hdr, payload]` without allocating.
+pub fn internet_checksum(chunks: &[&[u8]]) -> u16 {
     let mut sum: u32 = 0;
-    let mut i = 0;
-    while i + 1 < buf.len() {
-        sum = sum.wrapping_add(u16::from_be_bytes([buf[i], buf[i + 1]]) as u32);
-        i += 2;
+    let mut carry: Option<u8> = None;
+    for chunk in chunks {
+        let mut i = 0usize;
+        // Handle a carry-over odd byte from the previous chunk by pairing
+        // it with the first byte of this chunk, if any.
+        if let Some(high) = carry.take() {
+            if let Some(&low) = chunk.first() {
+                sum = sum.wrapping_add(u16::from_be_bytes([high, low]) as u32);
+                i = 1;
+            } else {
+                carry = Some(high);
+                continue;
+            }
+        }
+        while i + 1 < chunk.len() {
+            sum = sum.wrapping_add(u16::from_be_bytes([chunk[i], chunk[i + 1]]) as u32);
+            i += 2;
+        }
+        if i < chunk.len() {
+            carry = Some(chunk[i]);
+        }
     }
-    if i < buf.len() {
-        sum = sum.wrapping_add((buf[i] as u32) << 8);
+    if let Some(tail) = carry {
+        sum = sum.wrapping_add((tail as u32) << 8);
     }
     while sum >> 16 != 0 {
         sum = (sum & 0xffff) + (sum >> 16);
@@ -86,7 +106,7 @@ pub fn ip_decode(pkt: &[u8], our_ip: u32, nic_csum_ok: bool) -> Result<L3Decoded
         scratch[..header_len].copy_from_slice(&pkt[..header_len]);
         scratch[10] = 0;
         scratch[11] = 0;
-        let computed = internet_checksum(&scratch[..header_len]);
+        let computed = internet_checksum(&[&scratch[..header_len]]);
         let stored = u16::from_be_bytes([pkt[10], pkt[11]]);
         if computed != stored {
             return Err(L3Drop::CsumBad);
@@ -233,7 +253,7 @@ mod tests {
         ];
         v.extend_from_slice(&src.to_be_bytes());
         v.extend_from_slice(&dst.to_be_bytes());
-        let cksum = internet_checksum(&v);
+        let cksum = internet_checksum(&[&v]);
         v[10] = (cksum >> 8) as u8;
         v[11] = (cksum & 0xff) as u8;
         if bad_csum {
@@ -250,7 +270,7 @@ mod tests {
         let mut s = h[..20].to_vec();
         s[10] = 0;
         s[11] = 0;
-        let computed = internet_checksum(&s);
+        let computed = internet_checksum(&[&s]);
         let stored = u16::from_be_bytes([h[10], h[11]]);
         assert_eq!(computed, stored);
     }
@@ -304,7 +324,7 @@ mod tests {
         // need to refresh csum after editing TTL
         h[10] = 0;
         h[11] = 0;
-        let cks = internet_checksum(&h[..20]);
+        let cks = internet_checksum(&[&h[..20]]);
         h[10] = (cks >> 8) as u8;
         h[11] = (cks & 0xff) as u8;
         assert_eq!(ip_decode(&h, 0, true), Err(L3Drop::TtlZero));

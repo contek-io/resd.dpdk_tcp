@@ -112,7 +112,7 @@ fn tcp_pseudo_csum(src_ip: u32, dst_ip: u32, tcp_seg_len: u32, tcp_bytes: &[u8])
     buf.push(crate::l3_ip::IPPROTO_TCP);
     buf.extend_from_slice(&(tcp_seg_len as u16).to_be_bytes());
     buf.extend_from_slice(tcp_bytes);
-    crate::l3_ip::internet_checksum(&buf)
+    crate::l3_ip::internet_checksum(&[buf.as_slice()])
 }
 
 /// What the engine should do next after processing a segment. Emitted

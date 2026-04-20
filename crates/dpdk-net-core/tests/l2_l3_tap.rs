@@ -122,7 +122,7 @@ fn build_ipv4(proto: u8, src: u32, dst: u32, payload: &[u8]) -> Vec<u8> {
     ];
     v.extend_from_slice(&src.to_be_bytes());
     v.extend_from_slice(&dst.to_be_bytes());
-    let c = internet_checksum(&v);
+    let c = internet_checksum(&[&v]);
     v[10] = (c >> 8) as u8;
     v[11] = (c & 0xff) as u8;
     v.extend_from_slice(payload);

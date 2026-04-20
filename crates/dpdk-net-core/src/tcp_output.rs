@@ -136,7 +136,7 @@ fn build_segment_inner(
     ip[10..12].copy_from_slice(&0x0000u16.to_be_bytes());
     ip[12..16].copy_from_slice(&seg.src_ip.to_be_bytes());
     ip[16..20].copy_from_slice(&seg.dst_ip.to_be_bytes());
-    let ip_csum = internet_checksum(&out[ip_start..ip_start + IPV4_HDR_MIN]);
+    let ip_csum = internet_checksum(&[&out[ip_start..ip_start + IPV4_HDR_MIN]]);
     out[ip_start + 10] = (ip_csum >> 8) as u8;
     out[ip_start + 11] = (ip_csum & 0xff) as u8;
 
@@ -209,7 +209,7 @@ fn tcp_checksum_split(
     buf.extend_from_slice(&(tcp_seg_len as u16).to_be_bytes());
     buf.extend_from_slice(tcp_header_bytes);
     buf.extend_from_slice(payload_bytes);
-    internet_checksum(&buf)
+    internet_checksum(&[buf.as_slice()])
 }
 
 /// Pseudo-header-only TCP checksum per RFC 9293 §3.1. Used by A-HW's
@@ -231,7 +231,7 @@ pub fn tcp_pseudo_header_checksum(src_ip: u32, dst_ip: u32, tcp_seg_len: u32) ->
     buf[8] = 0;
     buf[9] = IPPROTO_TCP;
     buf[10..12].copy_from_slice(&(tcp_seg_len as u16).to_be_bytes());
-    internet_checksum(&buf)
+    internet_checksum(&[&buf])
 }
 
 /// A-HW Task 7 pure-function helper. Rewrites the TCP and IPv4 checksum
@@ -562,7 +562,7 @@ mod tests {
         pseudo.push(0);
         pseudo.push(crate::l3_ip::IPPROTO_TCP);
         pseudo.extend_from_slice(&(tcp_seg_len as u16).to_be_bytes());
-        let manual = internet_checksum(&pseudo);
+        let manual = internet_checksum(&[&pseudo]);
 
         let helper = tcp_pseudo_header_checksum(src_ip, dst_ip, tcp_seg_len);
         assert_eq!(helper, manual,
