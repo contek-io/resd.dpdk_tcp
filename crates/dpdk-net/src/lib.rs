@@ -1421,4 +1421,62 @@ mod a_hw_plus_devargs_tests {
         };
         assert_eq!(n, -libc::EINVAL);
     }
+
+    #[test]
+    fn null_out_returns_einval() {
+        let bdf = std::ffi::CString::new("00:06.0").unwrap();
+        let n = unsafe {
+            dpdk_net_recommended_ena_devargs(
+                bdf.as_ptr(),
+                0,
+                0,
+                std::ptr::null_mut(),
+                64,
+            )
+        };
+        assert_eq!(n, -libc::EINVAL);
+    }
+
+    #[test]
+    fn zero_cap_returns_enospc() {
+        // out_cap=0: bdf is 7 chars, needs 8 bytes with NUL → always ENOSPC.
+        // Must not deref `out` past the first byte — the `-ENOSPC` branch
+        // lands before `copy_nonoverlapping`.
+        let bdf = std::ffi::CString::new("00:06.0").unwrap();
+        let mut scratch = [0u8; 1];
+        let n = unsafe {
+            dpdk_net_recommended_ena_devargs(
+                bdf.as_ptr(),
+                0,
+                0,
+                scratch.as_mut_ptr() as *mut _,
+                0,
+            )
+        };
+        assert_eq!(n, -libc::ENOSPC);
+        // Scratch byte untouched — proves the helper didn't overrun.
+        assert_eq!(scratch[0], 0);
+    }
+
+    #[test]
+    fn writes_trailing_nul_byte() {
+        // Guard against a future refactor that drops the explicit NUL
+        // write. The test buffer is pre-filled with 0xff so a missed
+        // NUL would leave 0xff at index n and fail the assertion.
+        let bdf = std::ffi::CString::new("00:06.0").unwrap();
+        let mut buf = [0xffu8; 64];
+        let n = unsafe {
+            dpdk_net_recommended_ena_devargs(
+                bdf.as_ptr(),
+                1,
+                3,
+                buf.as_mut_ptr() as *mut _,
+                64,
+            )
+        };
+        assert!(n > 0);
+        assert_eq!(buf[n as usize], 0, "trailing NUL must be written");
+        // Bytes past the NUL stay at 0xff (the helper writes exactly n+1 bytes).
+        assert_eq!(buf[(n as usize) + 1], 0xff);
+    }
 }
