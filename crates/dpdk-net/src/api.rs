@@ -59,7 +59,10 @@ pub struct dpdk_net_engine_config_t {
     /// M1 — see core `EngineConfig.ena_large_llq_hdr`. Default 0.
     pub ena_large_llq_hdr: u8,
     /// M2 — see core `EngineConfig.ena_miss_txc_to_sec`. Default 0
-    /// (PMD default 5 s). Recommended 2 or 3 for trading.
+    /// (PMD default 5 s). Recommended 2 or 3 for trading. Do NOT set
+    /// 0 with the intent of disabling the Tx-completion watchdog —
+    /// disabling causes severe performance degradation (ENA README
+    /// §5.1 caution). 0 here specifically means "use PMD default".
     pub ena_miss_txc_to_sec: u8,
 }
 
