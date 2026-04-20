@@ -42,6 +42,9 @@ uint16_t shim_rte_pktmbuf_data_len(const struct rte_mbuf *m);
 int shim_rte_pktmbuf_chain(struct rte_mbuf *head, struct rte_mbuf *tail);
 void shim_rte_mbuf_refcnt_update(struct rte_mbuf *m, int16_t v);
 uint16_t shim_rte_pktmbuf_nb_segs(const struct rte_mbuf *m);
+/* A6.6 Task 5: next-segment accessor for multi-seg RX ingest chain walk.
+ * Returns m->next or NULL if `m` is the last/only segment. */
+struct rte_mbuf *shim_rte_pktmbuf_next(struct rte_mbuf *m);
 
 /* A-HW Task 7: TX offload metadata setters. `struct rte_mbuf` is opaque
  * to bindgen (packed anonymous unions), so we can't touch ol_flags /

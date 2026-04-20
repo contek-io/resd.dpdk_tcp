@@ -93,6 +93,18 @@ uint16_t shim_rte_pktmbuf_nb_segs(const struct rte_mbuf *m) {
     return m->nb_segs;
 }
 
+/* A6.6 Task 5: next-segment accessor for RX ingest chain walk. Returns
+ * the next rte_mbuf in a scattered-packet chain, or NULL when `m` is
+ * the last (or only) segment. ENA does not advertise RX_OFFLOAD_SCATTER
+ * today so the chain is always length-1 in production, but the RX
+ * ingest path calls this unconditionally so the multi-seg branch is
+ * exercised in synthetic tests (T13) + automatically light up when a
+ * future PMD enables scatter. bindgen can't deref struct rte_mbuf
+ * fields directly (packed anonymous unions), hence the shim. */
+struct rte_mbuf *shim_rte_pktmbuf_next(struct rte_mbuf *m) {
+    return m->next;
+}
+
 /* A-HW Task 7: TX offload metadata setters/getters.
  *
  * `struct rte_mbuf` is opaque in the Rust bindings (packed anonymous

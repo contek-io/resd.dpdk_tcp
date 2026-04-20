@@ -910,48 +910,132 @@ fn handle_established(
             // bump). Test coverage for the refcount-accounting branch
             // lives in `tcp_conn.rs` + TAP tests that exercise the
             // real RX path.
+            //
+            // A6.6 Task 5: walk the rte_mbuf.next chain so every chain
+            // link becomes a separate `InOrderSegment`. The head link
+            // uses the TCP payload offset (header stripped) and the
+            // head-link's TCP-payload length; subsequent links start at
+            // offset 0 and carry their full `data_len`. ENA does not
+            // advertise RX_OFFLOAD_SCATTER today (chain always length-1
+            // → the while-loop iterates once and behaviour is
+            // byte-identical to pre-T5). T13 exercises the multi-link
+            // branch synthetically.
             let cap_room = conn.recv.free_space();
-            let take = (seg.payload.len() as u32).min(cap_room);
-            if take > 0 {
-                // A6.6 T3 follow-up (reviewer request): the RX path
-                // always routes payload segments with a live
-                // `MbufCtx`; the `None` branch silently dropping
-                // delivery is a latent bug-catcher for direct-construct
-                // test callers. A future caller wiring this path
-                // without mbuf backing should fail loudly in debug
-                // builds; release builds keep the drop-silently
-                // behaviour so test-only paths still compile.
-                debug_assert!(
-                    mbuf_ctx.is_some(),
-                    "A6.6 T3: in-order append requires mbuf-backed ctx",
-                );
+            let head_take = (seg.payload.len() as u32).min(cap_room);
+            // A6.6 T3 follow-up (reviewer request): the RX path
+            // always routes payload segments with a live `MbufCtx`;
+            // the `None` branch silently dropping delivery is a
+            // latent bug-catcher for direct-construct test callers.
+            // A future caller wiring this path without mbuf backing
+            // should fail loudly in debug builds; release builds keep
+            // the drop-silently behaviour so test-only paths still
+            // compile.
+            debug_assert!(
+                mbuf_ctx.is_some() || head_take == 0,
+                "A6.6 T3: in-order append requires mbuf-backed ctx",
+            );
+            if head_take > 0 {
                 if let Some(ctx) = mbuf_ctx.as_ref() {
-                    // Bump refcount for the segment's pin. SAFETY:
-                    // `ctx.mbuf` is the live RX mbuf from the active
-                    // rx_burst iteration; the bump is paired with the
-                    // `MbufHandle::Drop` that runs when the segment is
-                    // eventually popped + released by the consumer
-                    // (via `deliver_readable` → `last_read_mbufs` →
+                    // Head link. SAFETY: `ctx.mbuf` is the live RX
+                    // mbuf from the active rx_burst iteration; the
+                    // bump is paired with the `MbufHandle::Drop` that
+                    // runs when the segment is eventually popped +
+                    // released by the consumer (via
+                    // `deliver_readable` → `last_read_mbufs` →
                     // next-poll clear).
                     unsafe {
                         sys::shim_rte_mbuf_refcnt_update(ctx.mbuf.as_ptr(), 1);
                     }
                     // SAFETY: the refcount bump above transferred one
-                    // refcount unit to this handle; the segment owns it
-                    // until pop / drop.
+                    // refcount unit to this handle; the segment owns
+                    // it until pop / drop.
                     let handle = unsafe {
                         crate::mempool::MbufHandle::from_raw(ctx.mbuf)
                     };
                     conn.recv.bytes.push_back(crate::tcp_conn::InOrderSegment {
                         mbuf: handle,
                         offset: ctx.payload_offset,
-                        len: take as u16,
+                        len: head_take as u16,
                     });
-                    delivered = take;
+                    delivered = head_take;
+
+                    // Walk the chain for additional links. The head
+                    // link's TCP payload is what `seg.payload` covers;
+                    // subsequent links are raw data blocks contributing
+                    // `data_len` each. SAFETY: every `cur` below is
+                    // either the just-observed `next` of a validated
+                    // prior link (or NULL, in which case the loop
+                    // exits), and the DPDK chain invariant guarantees
+                    // the pointer is valid as long as we hold a
+                    // refcount on at least one chain member. Here the
+                    // engine's pre-dispatch bump on the head keeps the
+                    // whole chain alive through this walk.
+                    let mut cur = unsafe {
+                        sys::shim_rte_pktmbuf_next(ctx.mbuf.as_ptr())
+                    };
+                    while !cur.is_null() {
+                        let room = conn.recv.free_space();
+                        if room == 0 {
+                            // Record the rest of the chain as cap-drop
+                            // for observability, then stop walking. We
+                            // cannot enqueue further InOrderSegments.
+                            let mut walk = cur;
+                            while !walk.is_null() {
+                                let ll = unsafe {
+                                    sys::shim_rte_pktmbuf_data_len(walk)
+                                } as u32;
+                                buf_full_drop = buf_full_drop.saturating_add(ll);
+                                walk = unsafe {
+                                    sys::shim_rte_pktmbuf_next(walk)
+                                };
+                            }
+                            break;
+                        }
+                        let link_data_len = unsafe {
+                            sys::shim_rte_pktmbuf_data_len(cur)
+                        } as u32;
+                        let link_take = link_data_len.min(room);
+                        if link_take > 0 {
+                            // Bump the link's own refcount — each chain
+                            // member has an independent refcnt. The
+                            // +1 transfers one ref to the
+                            // `InOrderSegment` we're about to push. No
+                            // rollback needed: we commit unconditionally
+                            // after the bump by push_back-ing below.
+                            unsafe {
+                                sys::shim_rte_mbuf_refcnt_update(cur, 1);
+                            }
+                            // SAFETY: refcount bump above gives us one
+                            // owned ref; `cur` is non-null (loop cond).
+                            let cur_nn =
+                                unsafe { std::ptr::NonNull::new_unchecked(cur) };
+                            let handle = unsafe {
+                                crate::mempool::MbufHandle::from_raw(cur_nn)
+                            };
+                            conn.recv.bytes.push_back(
+                                crate::tcp_conn::InOrderSegment {
+                                    mbuf: handle,
+                                    offset: 0,
+                                    len: link_take as u16,
+                                },
+                            );
+                            delivered = delivered.saturating_add(link_take);
+                        }
+                        if link_take < link_data_len {
+                            buf_full_drop = buf_full_drop
+                                .saturating_add(link_data_len - link_take);
+                        }
+                        cur = unsafe { sys::shim_rte_pktmbuf_next(cur) };
+                    }
                 }
             }
             conn.rcv_nxt = conn.rcv_nxt.wrapping_add(delivered);
-            buf_full_drop = (seg.payload.len() as u32).saturating_sub(delivered);
+            // Head-link truncation contribution (if head TCP payload
+            // exceeded free_space) — chain-tail truncation was already
+            // added inline above.
+            buf_full_drop = buf_full_drop.saturating_add(
+                (seg.payload.len() as u32).saturating_sub(head_take),
+            );
             in_order_delivered_from_seg = delivered;
 
             // A6.6 Task 4: zero-copy drain with output-param form. Each
@@ -980,9 +1064,19 @@ fn handle_established(
             buf_full_drop += drained_cap_dropped;
             reassembly_hole_filled = drained_count;
         } else if seq_lt(conn.rcv_nxt, seg.seq) {
+            // A6.6 Task 5: walk the rte_mbuf.next chain and call
+            // `reorder.insert` once per link, transferring one refcount
+            // unit per insert. The head link inherits the engine's
+            // pre-dispatch +1 bump (surfaces back via
+            // `outcome.mbuf_ref_retained` for engine-side rollback);
+            // additional links' +1 is bumped locally here and rolled
+            // back locally when their insert returns
+            // `mbuf_ref_retained == false`. Per-link seq is advanced by
+            // the link's data-length (head uses `seg.payload.len()`;
+            // subsequent links use `shim_rte_pktmbuf_data_len`).
             let total_cap = conn.recv.free_space_total();
             if total_cap > 0 {
-                let take = (seg.payload.len() as u32).min(total_cap);
+                let head_take = (seg.payload.len() as u32).min(total_cap);
                 if let Some(ctx) = mbuf_ctx {
                     // A6.5 Task 4b/4d: mbuf-ref path. The engine has
                     // already bumped the mbuf refcount by one; if no
@@ -992,7 +1086,7 @@ fn handle_established(
                     // non-mbuf callers don't enqueue OOO.
                     let outcome = conn.recv.reorder.insert(
                         seg.seq,
-                        &seg.payload[..take as usize],
+                        &seg.payload[..head_take as usize],
                         ctx.mbuf,
                         ctx.payload_offset,
                     );
@@ -1003,17 +1097,107 @@ fn handle_established(
                     // that triggered this OOO-insert so
                     // `build_ack_outcome` emits it as the first SACK
                     // block. `emit_ack` clears the trigger after
-                    // consuming it.
+                    // consuming it. When the chain has additional
+                    // links, the trigger extends to cover the whole
+                    // chain's newly-buffered span; we grow the trigger
+                    // in-line as each link's insert lands below.
                     if outcome.newly_buffered > 0 {
                         conn.last_sack_trigger =
-                            Some((seg.seq, seg.seq.wrapping_add(take)));
+                            Some((seg.seq, seg.seq.wrapping_add(head_take)));
                     }
-                }
-                if (take as usize) < seg.payload.len() {
-                    buf_full_drop += seg.payload.len() as u32 - take;
+                    if (head_take as usize) < seg.payload.len() {
+                        buf_full_drop += seg.payload.len() as u32 - head_take;
+                    }
+
+                    // A6.6 Task 5: walk additional links. SAFETY: same
+                    // chain-validity rationale as the in-order branch —
+                    // the engine's pre-dispatch bump on the head keeps
+                    // the whole chain alive through this walk.
+                    let mut link_seq = seg.seq.wrapping_add(seg.payload.len() as u32);
+                    let mut cur = unsafe {
+                        sys::shim_rte_pktmbuf_next(ctx.mbuf.as_ptr())
+                    };
+                    while !cur.is_null() {
+                        let link_data_len = unsafe {
+                            sys::shim_rte_pktmbuf_data_len(cur)
+                        } as u32;
+                        if link_data_len == 0 {
+                            cur = unsafe {
+                                sys::shim_rte_pktmbuf_next(cur)
+                            };
+                            continue;
+                        }
+                        let cur_nn =
+                            unsafe { std::ptr::NonNull::new_unchecked(cur) };
+                        // Per-link +1 to match insert's "caller bumped
+                        // by 1" contract. Rolled back locally if
+                        // insert returns `mbuf_ref_retained == false`.
+                        unsafe {
+                            sys::shim_rte_mbuf_refcnt_update(cur, 1);
+                        }
+                        // Build the link's raw payload slice. SAFETY:
+                        // `data_ptr + data_len` points into the mbuf's
+                        // data region per DPDK layout; `insert` reads
+                        // this slice only for length + overlap carving
+                        // and stores the (mbuf, offset=0, len) triple.
+                        let link_data_ptr = unsafe {
+                            sys::shim_rte_pktmbuf_data(cur)
+                        } as *const u8;
+                        let link_slice = unsafe {
+                            std::slice::from_raw_parts(
+                                link_data_ptr,
+                                link_data_len as usize,
+                            )
+                        };
+                        let outcome = conn.recv.reorder.insert(
+                            link_seq,
+                            link_slice,
+                            cur_nn,
+                            0,
+                        );
+                        reassembly_queued_bytes =
+                            reassembly_queued_bytes.saturating_add(outcome.newly_buffered);
+                        buf_full_drop =
+                            buf_full_drop.saturating_add(outcome.cap_dropped);
+                        if !outcome.mbuf_ref_retained {
+                            // Nothing stored for this link — roll back
+                            // our local +1 so the link's refcount is
+                            // unchanged. The engine's head-rollback
+                            // does NOT cover additional links.
+                            unsafe {
+                                sys::shim_rte_mbuf_refcnt_update(cur, -1);
+                            }
+                        }
+                        if outcome.newly_buffered > 0 {
+                            // Extend the SACK trigger to include this
+                            // link's buffered span. Multi-link SACK
+                            // triggers cover the contiguous chain so
+                            // `emit_ack` reports one merged block.
+                            let link_end = link_seq.wrapping_add(link_data_len);
+                            conn.last_sack_trigger = Some(match conn.last_sack_trigger {
+                                Some((l, _)) => (l, link_end),
+                                None => (link_seq, link_end),
+                            });
+                        }
+                        link_seq = link_seq.wrapping_add(link_data_len);
+                        cur = unsafe { sys::shim_rte_pktmbuf_next(cur) };
+                    }
                 }
             } else {
                 buf_full_drop = seg.payload.len() as u32;
+                // Cap was 0 for the head; account chain-tail links too.
+                if let Some(ctx) = mbuf_ctx.as_ref() {
+                    let mut cur = unsafe {
+                        sys::shim_rte_pktmbuf_next(ctx.mbuf.as_ptr())
+                    };
+                    while !cur.is_null() {
+                        let ll = unsafe {
+                            sys::shim_rte_pktmbuf_data_len(cur)
+                        } as u32;
+                        buf_full_drop = buf_full_drop.saturating_add(ll);
+                        cur = unsafe { sys::shim_rte_pktmbuf_next(cur) };
+                    }
+                }
             }
         }
         // else: seg.seq < conn.rcv_nxt — duplicate/old payload; drop silently.
