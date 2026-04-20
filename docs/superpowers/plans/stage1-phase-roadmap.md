@@ -21,7 +21,7 @@
 | A-HW | ENA hardware offload enablement (LLQ verify + TX/RX checksum + MBUF_FAST_FREE + RSS-hash plumbing) | **Complete** ✓ | `2026-04-19-stage1-phase-a-hw-ena-offload.md` |
 | A-HW+ | ENA observability + tuning knobs (WC verify + ENI xstats + per-queue xstats + large_llq_hdr / miss_txc_to knobs) | **Complete** ✓ | `2026-04-20-stage1-phase-a-hw-plus-ena-obs-knobs.md` |
 | A6 | Public API surface completeness **+ per-connection RTT histogram** (merged from former A5.6) | Not started | — |
-| A6.5 | Hot-path allocation elimination (reusable scratch, streaming csum, SmallVec, zero-copy reassembly) | Not started | — |
+| A6.5 | Hot-path allocation elimination (reusable scratch, streaming csum, SmallVec, zero-copy reassembly) | Complete | phase-a6-5-complete |
 | A6.6 | RX zero-copy (scatter-gather iovec API, in-order delivery-path mbuf-ref rework, LRO-compatible multi-segment, `rx_mempool_size` knob) | Not started | — |
 | A6.7 | FFI safety audit & hardening (miri, cbindgen header-drift CI, ABI snapshot, panic-firewall test, no-alloc-on-hot-path audit, C++ consumer under ASan/UBSan/LSan) | Not started | — |
 | A7 | Loopback test server + packetdrill-shim | Not started | — |
