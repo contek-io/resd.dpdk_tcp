@@ -2,6 +2,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <iostream>
 
 int main() {
     dpdk_net_engine_config_t cfg{};
@@ -63,11 +64,26 @@ int main() {
         return 1;
     }
 
+    uint64_t received_bytes_total = 0;
+    uint64_t received_events_total = 0;
+    uint64_t multi_seg_events_total = 0;
     for (int i = 0; i < 100; i++) {
         dpdk_net_event_t events[32];
         int n = dpdk_net_poll(eng, events, 32, 0);
-        (void)n;
+        for (int ev_i = 0; ev_i < n; ev_i++) {
+            if (events[ev_i].kind == DPDK_NET_EVT_READABLE) {
+                const auto& r = events[ev_i].u.readable;
+                for (uint32_t seg_i = 0; seg_i < r.n_segs; ++seg_i) {
+                    received_bytes_total += r.segs[seg_i].len;
+                }
+                received_events_total++;
+                if (r.n_segs > 1) multi_seg_events_total++;
+            }
+        }
     }
+    std::cout << "Received " << received_events_total << " READABLE events, "
+              << received_bytes_total << " bytes total, "
+              << multi_seg_events_total << " were multi-seg\n";
 
     const dpdk_net_counters_t* c = dpdk_net_counters(eng);
     // Counter fields are plain uint64_t but written atomically.
