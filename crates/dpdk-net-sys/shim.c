@@ -3,6 +3,17 @@
 #include <rte_ethdev.h>
 #include <rte_mbuf.h>
 
+/* phase-a-hw-plus T3: the PCI BAR physical-address reader needs to
+ * deref `struct rte_pci_device`, which DPDK 23.11 exposes ONLY via the
+ * driver-SDK private header (`bus_pci_driver.h`). `build.rs` probes
+ * for the source tree and defines `DPDK_HAS_PCI_SDK` when the header
+ * is reachable; otherwise the BAR shim degrades to "return 0" so the
+ * Rust-side verification quietly skips. */
+#ifdef DPDK_HAS_PCI_SDK
+#include <rte_bus_pci.h>
+#include <bus_pci_driver.h>
+#endif
+
 int shim_rte_errno(void) {
     return rte_errno;
 }
@@ -149,4 +160,33 @@ uint64_t shim_rte_mbuf_read_dynfield_u64(const struct rte_mbuf *m, int32_t offse
     assert(offset >= 0);
     assert((offset & 0x7) == 0 && "dynfield offset must be 8-byte aligned (u64 field)");
     return *(const uint64_t *)((const char *)m + offset);
+}
+
+/* phase-a-hw-plus T3: expose the prefetchable BAR (BAR2) physical
+ * address for an ENA port. The ENA PMD per upstream
+ * drivers/net/ena/ena_ethdev.c uses BAR2 for the prefetchable region
+ * that must be mapped write-combining under LLQ. Returns 0 when the
+ * port is not a PCI device, BAR2 is unmapped, or dev_info fails —
+ * callers treat 0 as "unavailable, skip verification". */
+uint64_t shim_rte_eth_dev_prefetchable_bar_phys(uint16_t port_id) {
+#ifdef DPDK_HAS_PCI_SDK
+    struct rte_eth_dev_info info;
+    if (rte_eth_dev_info_get(port_id, &info) != 0) {
+        return 0;
+    }
+    if (!info.device) {
+        return 0;
+    }
+    struct rte_pci_device *pci = RTE_DEV_TO_PCI(info.device);
+    if (!pci) {
+        return 0;
+    }
+    return (uint64_t)pci->mem_resource[2].phys_addr;
+#else
+    /* DPDK driver-SDK headers unavailable at build time — cannot deref
+     * `struct rte_pci_device`. Returning 0 triggers the Rust-side
+     * "BAR address unavailable, skip verification" path. */
+    (void)port_id;
+    return 0;
+#endif
 }

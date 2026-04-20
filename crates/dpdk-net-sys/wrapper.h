@@ -70,3 +70,12 @@ uint32_t shim_rte_mbuf_get_rss_hash(const struct rte_mbuf *m);
  * dynfield AND the corresponding dynflag lookup succeeded at
  * engine_create — ENA never reaches this path (spec §10.5). */
 uint64_t shim_rte_mbuf_read_dynfield_u64(const struct rte_mbuf *m, int32_t offset);
+
+/* phase-a-hw-plus T3: prefetchable-BAR physical address for ENA WC
+ * verification. The ENA PMD uses BAR2 for the prefetchable memory
+ * region that must be mapped write-combining under LLQ. Returns 0
+ * when the port is not a PCI device, BAR2 is unmapped, dev_info
+ * fails, or the DPDK driver-SDK headers were unavailable at shim
+ * build time — callers (wc_verify::verify_wc_for_ena) treat 0 as
+ * "unavailable, skip verification". */
+uint64_t shim_rte_eth_dev_prefetchable_bar_phys(uint16_t port_id);

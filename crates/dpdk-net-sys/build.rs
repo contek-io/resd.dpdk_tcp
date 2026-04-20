@@ -99,9 +99,71 @@ fn main() {
         // gate it behind `flag_if_supported`.
         build.flag_if_supported(arg);
     }
+
+    // phase-a-hw-plus T3: detect DPDK driver SDK headers for
+    // `bus_pci_driver.h` / `dev_driver.h`. These are NOT in the public
+    // `pkg-config libdpdk` tree but are required to deref
+    // `struct rte_pci_device` for BAR-physical-address lookup. If a
+    // DPDK source tree is available via `DPDK_SDK_INCLUDE` (explicit)
+    // or at the conventional `/tmp/dpdk` bench-host location, enable
+    // the full WC-verification shim path. Otherwise the shim returns 0
+    // (the "unavailable, skip verification" sentinel the Rust side
+    // already handles).
+    println!("cargo:rerun-if-env-changed=DPDK_SDK_INCLUDE");
+    if let Some((bus_pci_inc, eal_inc)) = detect_dpdk_sdk_includes() {
+        build.include(&bus_pci_inc);
+        build.include(&eal_inc);
+        // `__rte_internal` without this becomes a hard compile error on
+        // any reference to an internal symbol — see rte_compat.h:39-59.
+        build.define("ALLOW_INTERNAL_API", None);
+        build.define("DPDK_HAS_PCI_SDK", "1");
+        println!(
+            "cargo:warning=dpdk-net-sys: PCI-BAR WC-verify shim enabled \
+             (bus_pci_driver.h from {})",
+            bus_pci_inc
+        );
+    } else {
+        println!(
+            "cargo:warning=dpdk-net-sys: PCI-BAR WC-verify shim DISABLED \
+             (no bus_pci_driver.h found via DPDK_SDK_INCLUDE or /tmp/dpdk). \
+             WC verification will silently skip — set DPDK_SDK_INCLUDE to \
+             the DPDK source tree to enable."
+        );
+    }
+
     build.compile("dpdk_net_sys_shim");
 
     // Linker args come from pkg-config; cargo will emit -l and -L already.
+}
+
+/// Locate DPDK driver-SDK headers (`bus_pci_driver.h`, `dev_driver.h`).
+/// Returns `Some((bus_pci_includedir, eal_includedir))` on success, `None`
+/// when the SDK tree is unavailable.
+///
+/// Order of precedence:
+///   1. `DPDK_SDK_INCLUDE` env var — treat as a DPDK source-tree root
+///      (e.g. `/usr/src/dpdk`). Expect `$DPDK_SDK_INCLUDE/drivers/bus/pci/`
+///      and `$DPDK_SDK_INCLUDE/lib/eal/include/`.
+///   2. `/tmp/dpdk` — conventional bench-host location used by existing
+///      project references (see `llq_verify.rs` comment).
+fn detect_dpdk_sdk_includes() -> Option<(String, String)> {
+    let roots: Vec<String> = env::var("DPDK_SDK_INCLUDE")
+        .ok()
+        .into_iter()
+        .chain(std::iter::once("/tmp/dpdk".to_string()))
+        .collect();
+    for root in roots {
+        let bus_pci = format!("{}/drivers/bus/pci", root);
+        let eal = format!("{}/lib/eal/include", root);
+        if PathBuf::from(format!("{}/bus_pci_driver.h", bus_pci)).is_file()
+            && PathBuf::from(format!("{}/dev_driver.h", eal)).is_file()
+        {
+            println!("cargo:rerun-if-changed={}/bus_pci_driver.h", bus_pci);
+            println!("cargo:rerun-if-changed={}/dev_driver.h", eal);
+            return Some((bus_pci, eal));
+        }
+    }
+    None
 }
 
 /// Best-effort lookup of a clang resource directory that matches the

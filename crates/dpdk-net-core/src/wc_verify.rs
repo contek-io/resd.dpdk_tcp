@@ -59,6 +59,82 @@ pub enum WcVerdict {
     NotFound,
 }
 
+use crate::counters::Counters;
+use std::sync::atomic::Ordering;
+
+/// Bring-up integration: read /sys/kernel/debug/x86/pat_memtype_list,
+/// scan for the prefetchable BAR's WC mapping, bump the
+/// `eth.llq_wc_missing` counter on miss + emit a WARN. Never fails
+/// hard — the negative case is observable via the counter.
+///
+/// Returns unconditionally to keep the bring-up path infallible.
+/// Skipped silently (no WARN spam) for non-ENA drivers, non-Linux /
+/// non-x86_64 architectures, `bar_phys_addr == 0` (PMD did not expose
+/// the BAR), or when /sys is unreadable (missing debugfs / container
+/// permissions / non-root).
+///
+/// Called from `engine::Engine::configure_port_offloads` right after
+/// the `dev_info_get` + driver-name capture block.
+pub(crate) fn verify_wc_for_ena(
+    port_id: u16,
+    driver_name: &[u8; 32],
+    bar_phys_addr: u64,
+    counters: &Counters,
+) {
+    let driver_str = std::str::from_utf8(
+        &driver_name[..driver_name.iter().position(|&b| b == 0).unwrap_or(32)],
+    )
+    .unwrap_or("");
+    if driver_str != "net_ena" {
+        return;
+    }
+    if !cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+        return;
+    }
+    if bar_phys_addr == 0 {
+        eprintln!(
+            "dpdk_net: port {} WC verification skipped: prefetchable BAR \
+             address unavailable from PMD",
+            port_id
+        );
+        return;
+    }
+    let path = "/sys/kernel/debug/x86/pat_memtype_list";
+    let pat_contents = match std::fs::read_to_string(path) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!(
+                "dpdk_net: port {} WC verification skipped: cannot read {}: {}",
+                port_id, path, e
+            );
+            return;
+        }
+    };
+    match parse_pat_memtype_list(&pat_contents, bar_phys_addr) {
+        WcVerdict::WriteCombining => {
+            // Healthy steady state. No log line needed.
+        }
+        WcVerdict::OtherMapping => {
+            counters.eth.llq_wc_missing.fetch_add(1, Ordering::Relaxed);
+            eprintln!(
+                "dpdk_net: port {} prefetchable BAR 0x{:016x} is mapped \
+                 NON-write-combining — LLQ will run but with severe perf \
+                 degradation (ena_com_prep_pkts will dominate). See \
+                 docs/references/ena-dpdk-readme.md §6.1 + §14 perf FAQ Q1.",
+                port_id, bar_phys_addr
+            );
+        }
+        WcVerdict::NotFound => {
+            counters.eth.llq_wc_missing.fetch_add(1, Ordering::Relaxed);
+            eprintln!(
+                "dpdk_net: port {} prefetchable BAR 0x{:016x} not found in \
+                 {} — kernel may lack PAT debug or BAR address is wrong.",
+                port_id, bar_phys_addr, path
+            );
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

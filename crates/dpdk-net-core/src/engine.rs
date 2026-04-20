@@ -856,18 +856,9 @@ impl Engine {
     ) -> Result<PortConfigOutcome, Error> {
         use crate::dpdk_consts::RTE_ETH_TX_OFFLOAD_MULTI_SEGS;
 
-        // `counters` is unused when every `hw-offload-*` counter-bumping
-        // feature is compiled out. The signature stays stable because the
-        // latches are C-ABI-stable and future tasks (7, 8) reintroduce
-        // consumers. Keep the binding alive for `-D warnings` on
-        // `--no-default-features`.
-        #[cfg(not(any(
-            feature = "hw-offload-mbuf-fast-free",
-            feature = "hw-offload-tx-cksum",
-            feature = "hw-offload-rx-cksum",
-            feature = "hw-offload-rss-hash",
-        )))]
-        let _ = counters;
+        // phase-a-hw-plus T3 drops the old `let _ = counters;` suppression:
+        // `verify_wc_for_ena` below unconditionally consumes `counters`, so
+        // the binding is live on every feature matrix.
 
         let mut eth_conf: sys::rte_eth_conf = unsafe { std::mem::zeroed() };
 
@@ -931,6 +922,12 @@ impl Engine {
             dev_info.tx_offload_capa,
             dev_flags_val,
         );
+
+        // phase-a-hw-plus T3 — verify Write-Combining mapping for net_ena's
+        // prefetchable BAR. Slow-path; counter-bump-only on miss.
+        // See docs/references/ena-dpdk-readme.md §6.1.
+        let bar_phys = unsafe { sys::shim_rte_eth_dev_prefetchable_bar_phys(cfg.port_id) };
+        crate::wc_verify::verify_wc_for_ena(cfg.port_id, &driver_name, bar_phys, counters);
 
         let mut applied_tx_offloads = RTE_ETH_TX_OFFLOAD_MULTI_SEGS;
         // `applied_rx_offloads` is mutated when any RX-side offload feature
