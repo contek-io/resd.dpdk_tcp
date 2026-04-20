@@ -81,10 +81,24 @@ pub fn parse_segment<'a>(
 
     if !nic_csum_ok {
         let stored = u16::from_be_bytes([tcp_bytes[16], tcp_bytes[17]]);
-        let mut scratch = tcp_bytes.to_vec();
-        scratch[16] = 0;
-        scratch[17] = 0;
-        let csum = tcp_pseudo_csum(src_ip, dst_ip, scratch.len() as u32, &scratch);
+        // Fold pseudo-header + TCP bytes (with the 2-byte csum field
+        // zeroed) directly as a slice-of-slices, avoiding a scratch copy.
+        // Caller guarantees tcp_bytes.len() >= 20 (checked above at the
+        // header-length gate), so the split around offset 16..18 is safe.
+        const CSUM_OFFSET: usize = 16;
+        const CSUM_LEN: usize = 2;
+        let head = &tcp_bytes[..CSUM_OFFSET];
+        let tail = &tcp_bytes[CSUM_OFFSET + CSUM_LEN..];
+        let zero_csum: [u8; CSUM_LEN] = [0, 0];
+
+        let mut pseudo = [0u8; 12];
+        pseudo[0..4].copy_from_slice(&src_ip.to_be_bytes());
+        pseudo[4..8].copy_from_slice(&dst_ip.to_be_bytes());
+        pseudo[8] = 0;
+        pseudo[9] = crate::l3_ip::IPPROTO_TCP;
+        pseudo[10..12].copy_from_slice(&(tcp_bytes.len() as u16).to_be_bytes());
+
+        let csum = crate::l3_ip::internet_checksum(&[&pseudo, head, &zero_csum, tail]);
         // Folded result of header-with-zero-csum + stored-csum should sum to 0.
         if csum != stored {
             return Err(TcpParseError::Csum);
@@ -102,17 +116,6 @@ pub fn parse_segment<'a>(
         payload,
         options,
     })
-}
-
-fn tcp_pseudo_csum(src_ip: u32, dst_ip: u32, tcp_seg_len: u32, tcp_bytes: &[u8]) -> u16 {
-    let mut buf = Vec::with_capacity(12 + tcp_bytes.len());
-    buf.extend_from_slice(&src_ip.to_be_bytes());
-    buf.extend_from_slice(&dst_ip.to_be_bytes());
-    buf.push(0);
-    buf.push(crate::l3_ip::IPPROTO_TCP);
-    buf.extend_from_slice(&(tcp_seg_len as u16).to_be_bytes());
-    buf.extend_from_slice(tcp_bytes);
-    crate::l3_ip::internet_checksum(&[buf.as_slice()])
 }
 
 /// What the engine should do next after processing a segment. Emitted

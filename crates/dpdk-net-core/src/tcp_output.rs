@@ -200,16 +200,16 @@ fn tcp_checksum_split(
     tcp_header_bytes: &[u8],
     payload_bytes: &[u8],
 ) -> u16 {
-    // Pseudo-header: src_ip(4) + dst_ip(4) + zero(1) + proto(1) + tcp_len(2)
-    let mut buf = Vec::with_capacity(12 + tcp_header_bytes.len() + payload_bytes.len());
-    buf.extend_from_slice(&src_ip.to_be_bytes());
-    buf.extend_from_slice(&dst_ip.to_be_bytes());
-    buf.push(0);
-    buf.push(IPPROTO_TCP);
-    buf.extend_from_slice(&(tcp_seg_len as u16).to_be_bytes());
-    buf.extend_from_slice(tcp_header_bytes);
-    buf.extend_from_slice(payload_bytes);
-    internet_checksum(&[buf.as_slice()])
+    // Pseudo-header: src_ip(4) + dst_ip(4) + zero(1) + proto(1) + tcp_len(2).
+    // Built on the stack; fold pseudo-header + TCP header + payload as a
+    // slice-of-slices via streaming internet_checksum.
+    let mut pseudo = [0u8; 12];
+    pseudo[0..4].copy_from_slice(&src_ip.to_be_bytes());
+    pseudo[4..8].copy_from_slice(&dst_ip.to_be_bytes());
+    pseudo[8] = 0;
+    pseudo[9] = IPPROTO_TCP;
+    pseudo[10..12].copy_from_slice(&(tcp_seg_len as u16).to_be_bytes());
+    internet_checksum(&[&pseudo, tcp_header_bytes, payload_bytes])
 }
 
 /// Pseudo-header-only TCP checksum per RFC 9293 §3.1. Used by A-HW's
