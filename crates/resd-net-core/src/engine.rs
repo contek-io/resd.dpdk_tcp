@@ -383,8 +383,33 @@ pub fn eal_init(args: &[&str]) -> Result<(), Error> {
     }
     let cstrs: Vec<CString> = args.iter().map(|s| CString::new(*s).unwrap()).collect();
     let mut argv: Vec<*mut libc::c_char> = cstrs.iter().map(|c| c.as_ptr() as *mut _).collect();
+
+    // A-HW Task 12 fixup: install an fmemopen-backed capture of DPDK's
+    // log stream for the duration of `rte_eal_init`. The ENA PMD emits
+    // its LLQ "Placement policy: …" marker during `eth_ena_dev_init`,
+    // which runs at PCI-probe time inside `rte_eal_init` (NOT inside
+    // `rte_eth_dev_start`). Scan the captured log for activation /
+    // failure markers after EAL init returns, and store the verdict in
+    // a process-global OnceLock so every engine_create reads it later.
+    // Capture-init failure is NON-fatal: EAL init proceeds without a
+    // capture, and the engine-side verifier soft-skips with a warning.
+    #[cfg(feature = "hw-verify-llq")]
+    let capture = crate::llq_verify::start_log_capture().ok();
+
     // Safety: rte_eal_init mutates argv internally; we pass the constructed array.
     let rc = unsafe { sys::rte_eal_init(argv.len() as i32, argv.as_mut_ptr()) };
+
+    #[cfg(feature = "hw-verify-llq")]
+    if let Some(cap) = capture {
+        match crate::llq_verify::finish_log_capture(cap) {
+            Ok(log) => crate::llq_verify::record_eal_init_log_verdict(&log),
+            Err(e) => eprintln!(
+                "resd_net: log capture around rte_eal_init failed: {e:?}; \
+                 LLQ verification will be skipped for net_ena engines."
+            ),
+        }
+    }
+
     if rc < 0 {
         return Err(Error::EalInit(unsafe { sys::resd_rte_errno() }));
     }
@@ -566,40 +591,26 @@ impl Engine {
             }));
         }
 
-        // A-HW Task 12: LLQ activation verification via PMD-log-scrape.
-        // Install an fmemopen-backed capture of DPDK's log stream for
-        // the duration of `rte_eth_dev_start`, then scan the captured
-        // buffer for ENA's activation / failure markers after the call
-        // returns. Feature-off compiles the capture + scan away entirely.
-        // See spec §5 and crate::llq_verify for marker pinning.
-        #[cfg(feature = "hw-verify-llq")]
-        let log_capture = crate::llq_verify::start_log_capture()?;
-
+        // A-HW Task 12 fixup: LLQ verification reads the verdict that
+        // `eal_init` recorded at `rte_eal_init` time. The capture window
+        // must wrap EAL init — the ENA PMD emits the "Placement policy:
+        // …" marker during `eth_ena_dev_init` (PCI probe, inside
+        // `rte_eal_init`), NOT inside `rte_eth_dev_start`. No local
+        // capture machinery is needed here. See spec §5 and
+        // `crate::llq_verify` for marker pinning.
         let rc = unsafe { sys::rte_eth_dev_start(cfg.port_id) };
         if rc < 0 {
-            #[cfg(feature = "hw-verify-llq")]
-            {
-                // Restore the log stream + free the memstream even on
-                // failure — otherwise DPDK keeps writing into a stack
-                // buffer we're about to drop. Ignore the result; start
-                // already failed, so scanning is moot.
-                let _ = crate::llq_verify::finish_log_capture(log_capture);
-            }
             return Err(Error::PortStart(cfg.port_id, unsafe {
                 sys::resd_rte_errno()
             }));
         }
 
         #[cfg(feature = "hw-verify-llq")]
-        {
-            let captured = crate::llq_verify::finish_log_capture(log_capture)?;
-            crate::llq_verify::verify_llq_activation(
-                cfg.port_id,
-                &outcome.driver_name,
-                &captured,
-                &counters,
-            )?;
-        }
+        crate::llq_verify::verify_llq_activation_from_global(
+            cfg.port_id,
+            &outcome.driver_name,
+            &counters,
+        )?;
 
         // A-HW: RSS reta program. No-op when feature off OR when
         // the latch is false OR when dev_info.reta_size == 0.

@@ -137,14 +137,13 @@ Replaces the current block at `engine.rs:422-450`. New flow at `engine_create`, 
 8. Latch per-engine runtime flags from the applied mask: `tx_cksum_offload_active: bool`, `rx_cksum_offload_active: bool`, `rss_hash_offload_active: bool`. These feed the runtime fallback branches in Sections 6 / 7 / 8.
 9. Call `rte_eth_dev_configure(port_id, 1, 1, &eth_conf)`. (One RX queue, one TX queue — Stage 1 single-queue.)
 10. Call `rte_eth_rx_queue_setup` / `rte_eth_tx_queue_setup` as today.
-11. `#[cfg(feature = "hw-verify-llq")]`: register the LLQ-verify log callback (Section 5) before `rte_eth_dev_start`.
-12. Call `rte_eth_dev_start`.
-13. `#[cfg(feature = "hw-verify-llq")]`: unregister the log callback + inspect captured lines + fail-hard or bump `offload_missing_llq` per Section 5.
-14. `#[cfg(feature = "hw-offload-rss-hash")]` + RSS was in applied mask: call `rte_eth_dev_rss_reta_update` to program every reta slot to queue 0. (Single-queue no-op in practice but explicit for forward-compat.)
-15. `#[cfg(feature = "hw-offload-rx-timestamp")]`: perform the dynfield + dynflag lookups per Section 10; store on engine state; bump `offload_missing_rx_timestamp` if either lookup returned negative.
-16. Log the final negotiated offload banner: `resd_net: port {port_id} configured rx_offloads=0x{X} tx_offloads=0x{X}` per parent §8.5.
+11. Call `rte_eth_dev_start`.
+12. `#[cfg(feature = "hw-verify-llq")]`: call `verify_llq_activation_from_global(port_id, driver_name, counters)` to read the LLQ verdict recorded earlier by `eal_init` (Section 5). Fail-hard with `Error::LlqActivationFailed` + bump `offload_missing_llq` if ENA advertised LLQ but the capture showed no activation marker or a failure marker. The LLQ log capture itself is installed inside `eal_init` because the ENA PMD emits LLQ markers during PCI probe (inside `rte_eal_init`) — not inside `rte_eth_dev_start`.
+13. `#[cfg(feature = "hw-offload-rss-hash")]` + RSS was in applied mask: call `rte_eth_dev_rss_reta_update` to program every reta slot to queue 0. (Single-queue no-op in practice but explicit for forward-compat.)
+14. `#[cfg(feature = "hw-offload-rx-timestamp")]`: perform the dynfield + dynflag lookups per Section 10; store on engine state; bump `offload_missing_rx_timestamp` if either lookup returned negative.
+15. Log the final negotiated offload banner: `resd_net: port {port_id} configured rx_offloads=0x{X} tx_offloads=0x{X}` per parent §8.5.
 
-Step 2 and step 16 are both informational — parent §8.5 mandates the startup log is the authoritative "what offload set is active" record.
+Step 2 and step 15 are both informational — parent §8.5 mandates the startup log is the authoritative "what offload set is active" record.
 
 ---
 
@@ -154,26 +153,63 @@ LLQ activation is ENA-internal state, not exposed through a clean DPDK API. A-HW
 
 ### 5.1 Detection mechanism
 
-1. Before `rte_eth_dev_start`, register a log callback. Implementation options:
-   - `rte_openlog_stream(custom_stream)` — redirect RTE log output to a custom `FILE*`-backed memstream for the duration of bring-up.
-   - Custom `rte_log_register_type_and_pick_level` for the ENA PMD component — narrower scope.
-   
-   Plan picks one. Leaning `rte_openlog_stream` for simplicity (ENA PMD uses the default RTE log stream; `fmemopen` + `fflush` around `rte_eth_dev_start` gives a captured buffer).
-2. After `rte_eth_dev_start` returns (success only — a start failure unwinds before verification anyway), restore the original log stream.
-3. Scan the captured buffer for ENA PMD's activation / failure markers:
-   - Activation (DPDK 23.11 format): `"PMD: Placement policy: LLQ-aware"` or `"PMD: ENA LLQ mode: ..."` depending on device. Plan refines exact strings by reading `drivers/net/ena/ena_ethdev.c` before implementation.
-   - Failure: `"LLQ is not supported by the device"` / `"Fallback to disabled LLQ is allowed"` / similar.
-4. If `dev_info.driver_name != "net_ena"` → skip verification entirely (LLQ is ENA-specific).
-5. If the driver is `net_ena` AND a failure marker appeared OR no activation marker appeared:
+LLQ activation markers are emitted by the ENA PMD during
+`eth_ena_dev_init`, which runs at PCI-probe time **inside `rte_eal_init`**
+(not inside `rte_eth_dev_start` — confirmed via DPDK 23.11
+`drivers/net/ena/ena_ethdev.c:2273-2277, 2045, 2036`). The capture
+therefore wraps `rte_eal_init`, not `rte_eth_dev_start`.
+
+1. Inside the Rust-side `eal_init(&[&str])` helper (which wraps
+   `rte_eal_init`), when `hw-verify-llq` is compile-enabled:
+   - `start_log_capture()` installs an `fmemopen`-backed buffer +
+     `rte_openlog_stream` redirect BEFORE calling `rte_eal_init`.
+   - `rte_eal_init` runs — triggers PCI probe — ENA PMD emits LLQ
+     markers into the captured buffer.
+   - `finish_log_capture()` restores the original log stream + returns
+     the buffer.
+   - `record_eal_init_log_verdict(&captured_log)` scans for markers
+     and stores an `LlqVerdict { has_activation, has_failure, captured }`
+     in a process-global `OnceLock<LlqVerdict>`.
+
+2. Inside `Engine::new` per-engine-create:
+   - `verify_llq_activation_from_global(port_id, driver_name, counters)`
+     reads the global verdict. On ENA: fail hard with
+     `Error::LlqActivationFailed` + bump `eth.offload_missing_llq`
+     when `has_failure || !has_activation`. On non-ENA or
+     no-verdict-recorded: return `Ok` silently.
+
+3. Capture-init failure (`fmemopen` / `rte_openlog_stream` returns
+   error) is NON-fatal — `eal_init` proceeds without a capture,
+   engine-side verification is soft-skipped with a warning log. This
+   preserves bring-up on hosts where the log-capture mechanism is
+   unavailable.
+
+4. Markers pinned against DPDK 23.11:
+   - Activation: `"Placement policy: Low latency"` (`ena_ethdev.c:2273-2277`).
+   - Failure: `"LLQ is not supported"`, `"Placement policy: Regular"`,
+     `"Fallback to host mode policy"`, `"NOTE: LLQ has been disabled"`,
+     etc. (`ena_ethdev.c:2034-2062`).
+
+5. If `dev_info.driver_name != "net_ena"` → skip verification entirely
+   (LLQ is ENA-specific); `Engine::new` does not read the verdict for
+   non-ENA ports.
+
+6. If the driver is `net_ena` AND a failure marker appeared OR no
+   activation marker appeared:
    - Bump `eth.offload_missing_llq`.
-   - Return `Error::LlqActivationFailed` from `engine_create` — fail-hard per parent §8.4 Tier 1 "LLQ verified via PMD log + runtime dev-info check; startup fails if dev_info reports LLQ-capable but it did not activate."
+   - Return `Error::LlqActivationFailed` from `engine_create` —
+     fail-hard per parent §8.4 Tier 1 "LLQ verified via PMD log +
+     runtime dev-info check; startup fails if dev_info reports
+     LLQ-capable but it did not activate."
 
 ### 5.2 Fragility mitigation
 
-- Log format stability — DPDK 22.11 LTS and 23.11 LTS use the same ENA LLQ log lines. A future breakage fails the engine startup rather than silently running without LLQ — fail-safe direction. Plan includes a comment in engine.rs pointing to the exact ENA source reference, so a future DPDK upgrade surfaces the dependency.
-- Log-capture scope — the memstream captures only during `rte_eth_dev_start`; other RTE log traffic before / after is unaffected.
-- Non-ENA drivers — `driver_name` check in step 4 short-circuits; `net_vdev` / `net_tap` / `net_af_packet` never hit the LLQ-verify branch.
-- Performance — `rte_openlog_stream` redirect + scan runs once at bring-up. Zero hot-path cost.
+- Log format stability — DPDK 22.11 LTS and 23.11 LTS use the same ENA LLQ log lines. A future breakage fails the engine startup rather than silently running without LLQ — fail-safe direction. Comments in `crates/resd-net-core/src/llq_verify.rs` reference the exact ENA source lines, so a future DPDK upgrade surfaces the dependency.
+- Log-capture scope — the memstream captures only during `rte_eal_init`; other RTE log traffic before / after is unaffected.
+- Non-ENA drivers — `driver_name` check in step 5 short-circuits; `net_vdev` / `net_tap` / `net_af_packet` never hit the LLQ-verify branch.
+- Shared verdict across multi-engine hosts — `rte_eal_init` runs once per process, so a single `OnceLock<LlqVerdict>` suffices; every subsequent `Engine::new` reads the same stored verdict.
+- Non-fatal capture-init — if `fmemopen` or `rte_openlog_stream` fail, `eal_init` proceeds and the engine soft-skips verification with a warning log; real-ENA bring-up then has no automated guard, but the capture path has no prior failure mode on supported glibc / DPDK versions.
+- Performance — `rte_openlog_stream` redirect + scan runs once at process start. Zero hot-path cost.
 
 ### 5.3 When `hw-verify-llq` is off
 
