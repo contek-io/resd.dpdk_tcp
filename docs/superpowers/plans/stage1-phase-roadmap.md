@@ -20,6 +20,8 @@
 | A5.5 | Event-log forensics + in-flight introspection + TLP tuning (emission-time ts, queue overflow counter, stats getter, per-conn TLP knobs) | **Complete** ✓ | `2026-04-19-stage1-phase-a5-5-event-log-forensics-tlp-tuning.md` |
 | A-HW | ENA hardware offload enablement (LLQ verify + TX/RX checksum + MBUF_FAST_FREE + RSS-hash plumbing) | Not started | — |
 | A6 | Public API surface completeness **+ per-connection RTT histogram** (merged from former A5.6) | Not started | — |
+| A6.6 | RX zero-copy (scatter-gather iovec API, in-order delivery-path mbuf-ref rework, LRO-compatible multi-segment, `rx_mempool_size` knob) | Not started | — |
+| A6.7 | FFI safety audit & hardening (miri, cbindgen header-drift CI, ABI snapshot, panic-firewall test, no-alloc-on-hot-path audit, C++ consumer under ASan/UBSan/LSan) | Not started | — |
 | A7 | Loopback test server + packetdrill-shim | Not started | — |
 | A8 | tcpreq + observability gate | Not started | — |
 | A9 | TCP-Fuzz differential + smoltcp FaultInjector | Not started | — |
@@ -327,6 +329,103 @@ Per-connection RTT histogram (merged from A5.6):
 **Dependencies:** A5 + A5.5 (the histogram hooks into A5's `rtt_est.sample()` call site which A5.5 extended; public API additions build on A5.5's event + stats infrastructure).
 
 **Rough scale:** ~23 tasks (~20 for A6-core + ~3 for RTT histogram).
+
+---
+
+## A6.6 — RX zero-copy (scatter-gather, LRO-compatible)
+
+**Numbering note:** Inserted after A6.5 as the API-evolution half of the zero-copy RX story. A6.5 Group 4 retires internal `Vec<u8>` copies inside `tcp_reassembly.rs` (OOO path) and pins mbufs through the READABLE event — strictly internal. A6.6 evolves the *public* API to scatter-gather so chained mbufs (LRO / jumbo / IP-defragmented) deliver without a flatten copy, and finishes the in-order-delivery-path mbuf-ref rework that A6.5 Group 4 does not cover. Uses the "A6.6" decimal tag (A5.5 / A6.5 precedent) to avoid renumbering A7–A14.
+
+**Goal:** Close the drift between spec §5.3 / §7.3 (mbuf-pinned zero-copy delivery) and the current delivery implementation. After A6.6 the `RESD_NET_EVT_READABLE` event borrows directly into mempool-backed DMA memory via `resd_net_iovec_t segs[]`; no intermediate `Vec<u8>` on the RX hot path.
+
+**Spec refs:** §4.2 (event contract — `readable.data` lifetime), §5.3 (mbuf lifetime), §7.2 / §7.3 (per-conn buffers + zero-copy path). §4.1 header evolves: `resd_net_event_readable_t` gains `segs` / `n_segs` / `total_len`, drops `data` / `len`. New POD struct `resd_net_iovec_t`.
+
+**Design spec:** `docs/superpowers/specs/2026-04-20-stage1-phase-a6-6-and-a6-7-rx-zero-copy-and-ffi-safety-audit-design.md`.
+
+**In scope:**
+
+Group 1 — in-order delivery-path mbuf-ref migration:
+- `RecvQueue.bytes: VecDeque<u8>` (`tcp_conn.rs`) → `VecDeque<InOrderSegment { mbuf: Mbuf, offset: u16, len: u16 }>`.
+- `RecvQueue.last_read_buf: Vec<u8>` (`engine.rs`) retired entirely.
+- `tcp_reassembly.drain_contiguous_into(rcv_nxt, out: &mut VecDeque<InOrderSegment>)` appends mbuf-ref segments directly into `RecvQueue.bytes` (no intermediate collection).
+- Partial-segment split on delivery uses an explicit `Mbuf::try_clone()` method (refcount-bump + new wrapper) — intentionally not a `Clone` derive, to avoid silent over-bumps.
+
+Group 2 — scatter-gather public API:
+- Add `resd_net_iovec_t { const uint8_t *base; uint32_t len; uint32_t _pad; }` (16 B, x86_64).
+- `resd_net_event_readable_t` reshaped: `segs: const resd_net_iovec_t*`, `n_segs: u32`, `total_len: u32`.
+- Engine-owned per-conn `readable_scratch_iovecs: RefCell<Vec<resd_net_iovec_t>>` (capacity retained; cleared at top of each `poll_once`).
+- `TcpConn.delivered_segments: Vec<InOrderSegment>` holds popped segments until the *next* `poll_once` drains them — backing the scatter-gather pointers.
+
+Group 3 — multi-segment (LRO / jumbo) ingest:
+- `tcp_input` RX path already walks mbuf chains for checksum / header parse; A6.6 extends reassembly enqueue to enqueue each link as its own `InOrderSegment` / reorder entry.
+- No flatten helper in this phase. Consumers with contiguous-only processing call `memcpy` across `segs[]` themselves.
+
+Group 4 — pool sizing:
+- `resd_net_engine_config_t.rx_mempool_size: u32` (0 = compute default from `recv_buffer_bytes × max_conns / avg_payload_bytes × 2`, clamped to ≥ `2 × RTE_ETH_RX_DESC_DEFAULT`).
+- Plumbed through `engine_create`; documented in cbindgen header.
+
+Group 5 — verification:
+- `tools/bench-rx-zero-copy/` — criterion harness: poll-to-delivery cycle cost + `bench-alloc-audit` assertion that the single-segment in-order delivery path allocates zero bytes post-warmup.
+- `tests/rx_zero_copy_single_seg.rs`, `tests/rx_zero_copy_multi_seg.rs`, `tests/rx_partial_read.rs`, `tests/rx_close_drains_mbufs.rs`.
+- `examples/cpp-consumer/main.cpp` updated to iterate `segs[]`.
+
+**Observability additions (slow-path):**
+- `obs.rx_iovec_segs_total` — cumulative iovec count emitted.
+- `obs.rx_multi_seg_events` — events with `n_segs > 1` (LRO effectiveness).
+- `obs.rx_partial_read_splits` — partial-segment splits on delivery (tune `max_read_bytes`).
+
+**Does NOT include:**
+- OOO reassembly mbuf-ref refactor — **A6.5 Group 4** owns it.
+- TX zero-copy (user-held buffer consumed without copy) — separate contract change, deferred.
+- `resd_net_readable_flatten()` convenience helper — YAGNI; add if a consumer asks.
+- WRITABLE event / backpressure — A6.
+- cxx-bridge migration — stays cbindgen.
+
+**Dependencies:**
+- **A6.5 Group 4** (firm) — OOO reassembly mbuf-refs + READABLE-event mbuf-pinning must land first.
+- **A6** (firm) — final public-API event shape stable before A6.6 evolves `resd_net_event_readable_t`.
+- **A-HW** (soft) — LRO enablement exercises the multi-segment path under realistic load; A6.6 ships correct single-seg behavior regardless.
+
+**Rough scale:** ~14 tasks (~3 Group 1 + ~3 Group 2 + ~2 Group 3 + ~1 Group 4 + ~4 Group 5 + ~1 cpp-consumer update).
+
+---
+
+## A6.7 — FFI safety audit & hardening
+
+**Numbering note:** Inserted immediately after A6.6 as a gate before A7's packetdrill harness. Audits the final FFI contract once, in its Stage 1 shape, rather than auditing then re-auditing after A6.6 evolves the event shape. Non-integer tag matches A5.5 / A6.5 / A6.6 precedent.
+
+**Goal:** Certify FFI memory safety, panic safety, and ABI stability at the C ↔ Rust boundary before A7–A11 depend on it. Not about TCP correctness (A9 + A7 cover that) — specifically about what can go wrong when a C++ consumer calls into Rust and vice versa.
+
+**Spec refs:** §2.5 (C ABI surface), §3.3 (panic discipline — `panic = abort`), §7.5 (mempool lifecycle + Drop ordering). This phase adds `docs/superpowers/reports/panic-audit.md` and `docs/superpowers/reports/ffi-safety-audit.md` as durable artifacts.
+
+**Design spec:** `docs/superpowers/specs/2026-04-20-stage1-phase-a6-6-and-a6-7-rx-zero-copy-and-ffi-safety-audit-design.md`.
+
+**In scope:**
+
+Group 1 — static + compile-time checks:
+- miri CI job over `resd-net-core` tests (DPDK-touching modules `#[cfg(miri)]`-skipped or shimmed). Covers safe/unsafe-Rust UB in pure-core logic.
+- cbindgen header-drift CI check: `cargo xtask check-header` regenerates `include/resd_net.h` and diffs against committed; CI fails on drift.
+- ABI-stability snapshot: `tests/abi/resd_net.h.expected` committed; `check-header` diffs against it; drift requires intentional snapshot update (semver-like discipline, pre-1.0 snapshot is the contract).
+- Counters data-race audit: emit `_Atomic uint64_t` guards in cbindgen-generated `resd_net_counters_t`, or document atomic-load requirement with a compile-time assertion in the cpp-consumer.
+
+Group 2 — runtime safety tests:
+- Panic-firewall test: child-process fork + `resd_net_panic_for_test()` ABI entry + SIGABRT assertion. Regression guard if `panic = abort` is ever unchanged.
+- No-alloc-on-hot-path: extends A6.5 Group 5's `bench-alloc-audit` wrapper with a dedicated unit-test asserting `allocations == 0` over a representative workload through `poll_once` / `send_bytes` / event-emit.
+- C++ consumer under ASan + UBSan + LSan: `examples/cpp-consumer/main.cpp` in a CI sanitizer matrix, runs scripted connect → send → recv → close.
+
+Group 3 — audit artifacts:
+- Panic audit (grep + manual): `panic!` / `unwrap` / `expect` / unchecked indexing on FFI-reachable paths → either eliminated or documented unreachable-by-construction. Report: `docs/superpowers/reports/panic-audit.md`.
+- Summary report: `docs/superpowers/reports/ffi-safety-audit.md` — every check + evidence + residual risks.
+
+**Does NOT include:**
+- TCP correctness fuzzing — **A9** owns TCP-Fuzz differential + smoltcp FaultInjector.
+- ABI-boundary fuzzing (random sequence of ABI calls via cargo-fuzz) — natural home is A9.
+- `cargo-semver-checks` / formal semver tooling — pre-1.0, snapshot is the contract.
+- TSan — single-lcore RTC model has no cross-thread races by construction; TSan would exercise a zero-race codepath, add CI minutes without catching real issues.
+
+**Dependencies:** A6.6 (audit the final contract once).
+
+**Rough scale:** ~8 tasks (~4 Group 1 + ~3 Group 2 + ~1 Group 3 bundling the two reports).
 
 ---
 
