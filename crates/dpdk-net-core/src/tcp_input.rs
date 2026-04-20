@@ -904,48 +904,96 @@ fn handle_established(
     // engine's `deliver_readable` uses this to decide how many bytes
     // of the RX mbuf's payload to pin for the READABLE event.
     let mut in_order_delivered_from_seg = 0u32;
-    // A6.5 Task 4c: mbufs drained from the reorder queue by
-    // `drain_contiguous_from_mbuf` on gap-close. The queue transfers
-    // one refcount per entry to the caller; the engine wraps each in
-    // an `MbufHandle` and emits a READABLE event.
-    let mut drained_mbufs: SmallVec<[crate::tcp_reassembly::DrainedMbuf; 4]> = SmallVec::new();
+    // A6.6 Task 3: `drained_mbufs` is now always empty on the Outcome —
+    // drained mbufs land directly in `conn.recv.bytes` as
+    // `InOrderSegment`s at ingest time (below), not on the Outcome for
+    // `deliver_readable` to handle. The field is retained on `Outcome`
+    // for ABI stability through T7 but is no longer populated here.
+    let drained_mbufs: SmallVec<[crate::tcp_reassembly::DrainedMbuf; 4]> = SmallVec::new();
     if !seg.payload.is_empty() {
         if seg.seq == conn.rcv_nxt {
-            delivered = conn.recv.append(seg.payload);
+            // A6.6 Task 3: push an `InOrderSegment` directly into
+            // `recv.bytes`, carrying one mbuf refcount. The engine's RX
+            // path has already ensured `mbuf_ctx` is `Some` whenever
+            // the RX mbuf is live; the `None` branch retains the
+            // legacy pure-slice behaviour for direct-construct unit
+            // tests (no mbuf backing → cannot pin a segment, so the
+            // in-order byte-delivery is dropped with no `delivered`
+            // bump). Test coverage for the refcount-accounting branch
+            // lives in `tcp_conn.rs` + TAP tests that exercise the
+            // real RX path.
+            let cap_room = conn.recv.free_space();
+            let take = (seg.payload.len() as u32).min(cap_room);
+            if take > 0 {
+                if let Some(ctx) = mbuf_ctx.as_ref() {
+                    // Bump refcount for the segment's pin. SAFETY:
+                    // `ctx.mbuf` is the live RX mbuf from the active
+                    // rx_burst iteration; the bump is paired with the
+                    // `MbufHandle::Drop` that runs when the segment is
+                    // eventually popped + released by the consumer
+                    // (via `deliver_readable` → `last_read_mbufs` →
+                    // next-poll clear).
+                    unsafe {
+                        sys::shim_rte_mbuf_refcnt_update(ctx.mbuf.as_ptr(), 1);
+                    }
+                    // SAFETY: the refcount bump above transferred one
+                    // refcount unit to this handle; the segment owns it
+                    // until pop / drop.
+                    let handle = unsafe {
+                        crate::mempool::MbufHandle::from_raw(ctx.mbuf)
+                    };
+                    conn.recv.bytes.push_back(crate::tcp_conn::InOrderSegment {
+                        mbuf: handle,
+                        offset: ctx.payload_offset,
+                        len: take as u16,
+                    });
+                    delivered = take;
+                }
+            }
             conn.rcv_nxt = conn.rcv_nxt.wrapping_add(delivered);
             buf_full_drop = (seg.payload.len() as u32).saturating_sub(delivered);
             in_order_delivered_from_seg = delivered;
 
-            // A6.5 Task 4c: zero-copy drain. Each `DrainedMbuf` carries
-            // a refcount ref handed off from the queue; the engine
-            // wraps them in `MbufHandle` and emits one READABLE per
-            // drained entry. We still append the drained bytes to
-            // `conn.recv.bytes` for flow-control accounting (the
-            // VecDeque's len participates in `free_space_total`);
-            // A6.6 retires that VecDeque entirely.
+            // A6.5 Task 4c / A6.6 Task 3: zero-copy drain. Each
+            // `DrainedMbuf` already carries exactly one refcount
+            // transferred from the reorder queue. `into_handle()`
+            // moves that refcount into an `MbufHandle` (disarming
+            // DrainedMbuf::Drop) that we park inside an
+            // `InOrderSegment` in `recv.bytes`. No extra refcount
+            // bump — the segment now owns the handoff refcount unit.
+            // Per spec "append per-segment, not flattened" each
+            // drained mbuf becomes one `InOrderSegment`.
             let drained = conn.recv.reorder.drain_contiguous_from_mbuf(conn.rcv_nxt);
             let mut drained_count = 0u32;
-            for d in &drained {
-                // SAFETY: `d.mbuf` is live (queue held a refcount
-                // until this drain transferred it to the caller). The
-                // data range `[d.offset, d.offset + d.len)` is bounded
-                // by the mbuf's data_len at `insert` time.
-                let payload_area = unsafe {
-                    let mbuf_ptr = d.mbuf.as_ptr();
-                    let base_ptr = sys::shim_rte_pktmbuf_data(mbuf_ptr) as *const u8;
-                    std::slice::from_raw_parts(
-                        base_ptr.add(d.offset as usize),
-                        d.len as usize,
-                    )
-                };
-                let appended = conn.recv.append(payload_area);
+            for d in drained.into_iter() {
+                let cap_room = conn.recv.free_space();
+                let d_offset = d.offset;
+                let d_len = d.len;
+                let appended = (d_len as u32).min(cap_room);
+                if appended > 0 {
+                    // Consume the `DrainedMbuf`'s refcount into the
+                    // segment handle. `into_handle()` disarms
+                    // `DrainedMbuf::Drop` so the refcount transfer is
+                    // exactly one unit.
+                    let handle = d.into_handle();
+                    conn.recv.bytes.push_back(crate::tcp_conn::InOrderSegment {
+                        mbuf: handle,
+                        offset: d_offset,
+                        len: appended as u16,
+                    });
+                }
+                // If appended < d_len (cap-truncated), the drop of the
+                // full-sized `DrainedMbuf` on this iteration decrements
+                // the queue-handoff refcount — which is correct: no
+                // segment was stored, so the refcount is released.
+                // When `appended == 0` we also drop the DrainedMbuf
+                // here, releasing its refcount.
                 conn.rcv_nxt = conn.rcv_nxt.wrapping_add(appended);
-                buf_full_drop += (d.len as u32).saturating_sub(appended);
+                buf_full_drop += (d_len as u32).saturating_sub(appended);
                 delivered += appended;
                 drained_count += 1;
             }
             reassembly_hole_filled = drained_count;
-            drained_mbufs = drained;
         } else if seq_lt(conn.rcv_nxt, seg.seq) {
             let total_cap = conn.recv.free_space_total();
             if total_cap > 0 {
@@ -1559,6 +1607,20 @@ mod tests {
 
     #[test]
     fn established_inorder_data_delivered_and_acked() {
+        // A6.6 Task 3: the in-order append now pushes an
+        // `InOrderSegment` pinning the RX mbuf, so we feed a fake
+        // mbuf-backed ctx — same pattern as the OOO test below. Boxed
+        // storage keeps the refcount-update shim pointed at live
+        // memory even though we don't dereference it beyond the first
+        // cacheline's `refcnt` field.
+        let mut fake_mbuf_storage: Box<[u8; 256]> = Box::new([0u8; 256]);
+        let fake_mbuf: std::ptr::NonNull<dpdk_net_sys::rte_mbuf> = unsafe {
+            std::ptr::NonNull::new_unchecked(
+                fake_mbuf_storage.as_mut_ptr() as *mut dpdk_net_sys::rte_mbuf,
+            )
+        };
+        let mbuf_ctx = MbufInsertCtx { mbuf: fake_mbuf, payload_offset: 54 };
+
         let mut c = est_conn(1000, 5000, 1024);
         let payload = b"abcdef";
         let seg = ParsedSegment {
@@ -1572,13 +1634,27 @@ mod tests {
             payload,
             options: &[],
         };
-        let out = dispatch(&mut c, &seg, &TEST_EDGES, TEST_SEND_BUF_BYTES, None);
+        let out = dispatch(&mut c, &seg, &TEST_EDGES, TEST_SEND_BUF_BYTES, Some(mbuf_ctx));
         assert_eq!(out.tx, TxAction::Ack);
         assert_eq!(out.delivered, 6);
         assert_eq!(c.rcv_nxt, 5001 + 6);
-        assert_eq!(c.recv.bytes.len(), 6);
-        let got: Vec<u8> = c.recv.bytes.iter().copied().collect();
-        assert_eq!(&got, b"abcdef");
+        // A6.6 Task 3: structural assertion on the VecDeque<InOrderSegment>
+        // shape. Byte-level content verification moves to the TAP
+        // tests under the real RX path (byte payloads live inside a
+        // real mbuf's data region there). Direct-unit byte readback
+        // through the fake mbuf is covered separately by dedicated
+        // reassembly unit tests with in-memory storage.
+        assert_eq!(c.recv.bytes.len(), 1);
+        let seg0 = c.recv.bytes.front().unwrap();
+        assert_eq!(seg0.offset, 54);
+        assert_eq!(seg0.len, 6);
+        assert_eq!(c.recv.buffered_bytes(), 6);
+
+        // Drop `c` (and its held segment refcount) before the fake
+        // mbuf storage goes out of scope so the refcount decrement on
+        // segment Drop lands in live storage.
+        drop(c);
+        let _ = &mut fake_mbuf_storage;
     }
 
     #[test]
@@ -1653,6 +1729,15 @@ mod tests {
 
     #[test]
     fn established_inorder_payload_does_not_flag_ooo() {
+        // A6.6 Task 3: in-order append requires mbuf-backed ctx (fake
+        // mbuf boxed storage for the refcnt shim).
+        let mut fake_mbuf_storage: Box<[u8; 256]> = Box::new([0u8; 256]);
+        let fake_mbuf: std::ptr::NonNull<dpdk_net_sys::rte_mbuf> = unsafe {
+            std::ptr::NonNull::new_unchecked(
+                fake_mbuf_storage.as_mut_ptr() as *mut dpdk_net_sys::rte_mbuf,
+            )
+        };
+        let mbuf_ctx = MbufInsertCtx { mbuf: fake_mbuf, payload_offset: 54 };
         let mut c = est_conn(1000, 5000, 1024);
         let seg = ParsedSegment {
             src_port: 5000,
@@ -1665,14 +1750,24 @@ mod tests {
             payload: b"abc",
             options: &[],
         };
-        let out = dispatch(&mut c, &seg, &TEST_EDGES, TEST_SEND_BUF_BYTES, None);
+        let out = dispatch(&mut c, &seg, &TEST_EDGES, TEST_SEND_BUF_BYTES, Some(mbuf_ctx));
         assert_eq!(out.delivered, 3);
         assert_eq!(out.buf_full_drop, 0);
+        drop(c);
+        let _ = &mut fake_mbuf_storage;
     }
 
     #[test]
     fn established_recv_buf_full_flags_buf_full_drop_not_ooo() {
+        // A6.6 Task 3: in-order append requires mbuf-backed ctx.
         // recv buffer cap is 1024 in `est_conn`; send 2000 bytes in-order.
+        let mut fake_mbuf_storage: Box<[u8; 256]> = Box::new([0u8; 256]);
+        let fake_mbuf: std::ptr::NonNull<dpdk_net_sys::rte_mbuf> = unsafe {
+            std::ptr::NonNull::new_unchecked(
+                fake_mbuf_storage.as_mut_ptr() as *mut dpdk_net_sys::rte_mbuf,
+            )
+        };
+        let mbuf_ctx = MbufInsertCtx { mbuf: fake_mbuf, payload_offset: 54 };
         let mut c = est_conn(1000, 5000, 4096);
         // Widen rcv_wnd so the 2000-byte segment is in-window, else the
         // handler would reject it before the delivery branch.
@@ -1689,10 +1784,12 @@ mod tests {
             payload: &payload,
             options: &[],
         };
-        let out = dispatch(&mut c, &seg, &TEST_EDGES, TEST_SEND_BUF_BYTES, None);
+        let out = dispatch(&mut c, &seg, &TEST_EDGES, TEST_SEND_BUF_BYTES, Some(mbuf_ctx));
         // 1024 accepted, 976 dropped — overflow is `buf_full_drop`, not OOO.
         assert_eq!(out.delivered, 1024);
         assert_eq!(out.buf_full_drop, 2000 - 1024);
+        drop(c);
+        let _ = &mut fake_mbuf_storage;
     }
 
     #[test]
@@ -1988,7 +2085,15 @@ mod tests {
 
     #[test]
     fn paws_accepts_fresh_tsval_and_updates_ts_recent() {
+        // A6.6 Task 3: in-order append requires mbuf-backed ctx.
         use crate::tcp_options::TcpOpts;
+        let mut fake_mbuf_storage: Box<[u8; 256]> = Box::new([0u8; 256]);
+        let fake_mbuf: std::ptr::NonNull<dpdk_net_sys::rte_mbuf> = unsafe {
+            std::ptr::NonNull::new_unchecked(
+                fake_mbuf_storage.as_mut_ptr() as *mut dpdk_net_sys::rte_mbuf,
+            )
+        };
+        let mbuf_ctx = MbufInsertCtx { mbuf: fake_mbuf, payload_offset: 54 };
         let mut c = est_conn_ts(1000, 5000, 1024, 200);
         let mut peer_opts = TcpOpts::default();
         peer_opts.timestamps = Some((300, 0));
@@ -2005,10 +2110,12 @@ mod tests {
             payload: b"hello",
             options: &buf[..n],
         };
-        let out = dispatch(&mut c, &seg, &TEST_EDGES, TEST_SEND_BUF_BYTES, None);
+        let out = dispatch(&mut c, &seg, &TEST_EDGES, TEST_SEND_BUF_BYTES, Some(mbuf_ctx));
         assert!(!out.paws_rejected);
         assert_eq!(out.delivered, 5);
         assert_eq!(c.ts_recent, 300);
+        drop(c);
+        let _ = &mut fake_mbuf_storage;
     }
 
     #[test]

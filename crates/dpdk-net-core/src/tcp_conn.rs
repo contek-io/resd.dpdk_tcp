@@ -39,9 +39,15 @@ impl SendQueue {
 }
 
 /// One contiguous in-order payload segment backed by a refcount-pinned mbuf.
-/// A split on partial-read produces two `InOrderSegment`s both referencing
-/// the same underlying `rte_mbuf` with refcount bumped once via
-/// `MbufHandle::try_clone()`.
+/// Each segment references a live DPDK mbuf (via `MbufHandle` that owns
+/// exactly one refcount) and a `[offset, offset+len)` window into the
+/// mbuf's data region. The window is the TCP payload slice; `offset`
+/// starts at the first TCP payload byte (post-header).
+///
+/// Ownership contract: at most one `InOrderSegment` holds each refcount
+/// unit. A split on partial-read produces two `InOrderSegment`s both
+/// referencing the same underlying `rte_mbuf` with refcount bumped once
+/// via `MbufHandle::try_clone()` — both halves own independent refcounts.
 #[derive(Debug)]
 pub struct InOrderSegment {
     pub mbuf: crate::mempool::MbufHandle,
@@ -59,13 +65,23 @@ impl InOrderSegment {
             base.add(self.offset as usize)
         }
     }
+
+    #[inline]
+    pub fn len_bytes(&self) -> u32 {
+        self.len as u32
+    }
 }
 
 /// Per-connection receive buffer. A4 co-locates the out-of-order
 /// reassembly queue (`reorder`) with the in-order ring (`bytes`); both
 /// share the same cap, so `free_space_total` reports combined room.
+///
+/// A6.6 Task 3: `bytes` is now a queue of `InOrderSegment` descriptors
+/// pinning mbuf-resident payload windows, not a flattened `VecDeque<u8>`
+/// byte ring. Flow-control accounting reads `buffered_bytes()` which
+/// sums `seg.len` over the queue.
 pub struct RecvQueue {
-    pub bytes: VecDeque<u8>,
+    pub bytes: VecDeque<InOrderSegment>,
     pub cap: u32,
     /// A4: out-of-order segments buffered past the in-order point.
     /// Shares `cap` with `bytes`; `free_space_total` reports combined room.
@@ -83,19 +99,18 @@ pub struct RecvQueue {
 impl RecvQueue {
     pub fn new(cap: u32) -> Self {
         Self {
-            bytes: VecDeque::with_capacity(cap as usize),
+            bytes: VecDeque::new(),
             cap,
             reorder: crate::tcp_reassembly::ReorderQueue::new(cap),
             last_read_mbufs: smallvec::SmallVec::new(),
         }
     }
 
-    /// Current buffered-but-not-delivered byte count for flow-control accounting.
-    /// Post-T3: sums `seg.len` across the VecDeque<InOrderSegment>.
-    /// Pre-T3: returns `self.bytes.len() as u32`.
+    /// Total bytes currently pinned in the in-order queue (sum of segment
+    /// lengths). Used by flow-control accounting (free_space / free_space_total).
     #[inline]
     pub fn buffered_bytes(&self) -> u32 {
-        self.bytes.len() as u32
+        self.bytes.iter().map(|s| s.len as u32).sum()
     }
 
     /// In-order free-space only (matches A3's semantic).
@@ -108,15 +123,6 @@ impl RecvQueue {
         self.cap
             .saturating_sub(self.buffered_bytes())
             .saturating_sub(self.reorder.total_bytes())
-    }
-
-    /// Append `payload` to the in-order queue, up to in-order free-space.
-    /// Returns the number of bytes accepted (may be < payload.len() if
-    /// the in-order half would overflow).
-    pub fn append(&mut self, payload: &[u8]) -> u32 {
-        let take = payload.len().min(self.free_space() as usize);
-        self.bytes.extend(&payload[..take]);
-        take as u32
     }
 }
 
@@ -641,10 +647,15 @@ mod tests {
     }
 
     #[test]
-    fn recv_queue_append_respects_cap() {
-        let mut rq = RecvQueue::new(3);
-        assert_eq!(rq.append(b"hello"), 3);
-        assert_eq!(rq.bytes.len(), 3);
+    fn recv_queue_buffered_bytes_starts_zero_and_matches_free_space() {
+        // A6.6 Task 3: `RecvQueue::append` is retired (the VecDeque<u8>
+        // ring was replaced by VecDeque<InOrderSegment>). The ingest
+        // path in `tcp_input.rs` now pushes mbuf-backed segments
+        // directly; this test retains the flow-control accounting
+        // check that pre-dated the ingest rework.
+        let rq = RecvQueue::new(3);
+        assert_eq!(rq.buffered_bytes(), 0);
+        assert_eq!(rq.free_space(), 3);
     }
 
     #[test]

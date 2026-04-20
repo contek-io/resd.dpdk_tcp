@@ -160,6 +160,11 @@ impl MbufHandle {
     ///
     /// Explicit method (not `Clone` derive) so accidental copies don't
     /// silently bump the refcount at call sites that only intended a borrow.
+    ///
+    /// Primary caller: partial-segment splits in `deliver_readable` — the
+    /// delivered portion gets a fresh refcount via this clone; the
+    /// in-queue portion retains its existing refcount.
+    #[inline]
     pub fn try_clone(&self) -> Self {
         // SAFETY: self.ptr is a valid NonNull<rte_mbuf> (invariant of MbufHandle).
         // The refcount bump is the last operation before the infallible from_raw;

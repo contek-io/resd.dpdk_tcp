@@ -2933,7 +2933,7 @@ impl Engine {
             None
         };
 
-        let mut outcome = {
+        let outcome = {
             let mut ft = self.flow_table.borrow_mut();
             let Some(conn) = ft.get_mut(handle) else {
                 // Rare race: conn lookup succeeded above but a concurrent
@@ -3266,26 +3266,14 @@ impl Engine {
         }
 
         if outcome.delivered > 0 {
-            // A6.5 Task 4c: pin the RX mbuf (in-order portion) and each
-            // drained mbuf (from the reorder queue's gap-close) via
-            // `conn.recv.last_read_mbufs`, then emit one READABLE event
-            // per pinned mbuf. Drained mbufs already carry a refcount
-            // handed off from the queue; the RX mbuf needs an explicit
-            // bump so the pin outlives the post-dispatch
-            // `rte_pktmbuf_free` on the original RX-burst ref.
-            let in_order_offset = mbuf_ctx
-                .as_ref()
-                .map(|ctx| ctx.payload_offset)
-                .unwrap_or(0);
-            self.deliver_readable(
-                handle,
-                rx_mbuf,
-                in_order_offset,
-                outcome.in_order_delivered_from_seg,
-                std::mem::take(&mut outcome.drained_mbufs),
-                outcome.delivered,
-                hw_rx_ts,
-            );
+            // A6.6 Task 3: segments (both in-order + drained) landed in
+            // `conn.recv.bytes` at tcp_input ingest; `deliver_readable`
+            // pops up to `outcome.delivered` bytes' worth of segments,
+            // transferring their owned mbuf refcounts to
+            // `last_read_mbufs` and emitting one READABLE event per
+            // popped segment. The pre-T3 `rx_mbuf` + `drained_mbufs`
+            // refcount bookkeeping moved to tcp_input ingest.
+            self.deliver_readable(handle, outcome.delivered, hw_rx_ts);
         }
 
         if outcome.buf_full_drop > 0 {
@@ -3618,132 +3606,117 @@ impl Engine {
         }
     }
 
-    /// A6.5 Task 4c: pin each delivered-payload mbuf in
-    /// `conn.recv.last_read_mbufs` and emit one READABLE event per
-    /// pinned mbuf.
+    /// A6.6 Task 3: pop up to `total_delivered` bytes' worth of
+    /// `InOrderSegment` entries from `conn.recv.bytes`, transferring
+    /// their owned mbuf refcounts into `conn.recv.last_read_mbufs` and
+    /// emitting one READABLE event per popped segment.
     ///
-    /// Ownership model: the in-order mbuf (`rx_mbuf`) gets an explicit
-    /// refcount bump here so the pin outlives the post-dispatch
-    /// `rte_pktmbuf_free` on the original RX-burst ref. Each entry in
-    /// `drained_mbufs` already carries a refcount handoff from the
-    /// reorder queue — it's moved straight into an `MbufHandle`
-    /// without a bump. `MbufHandle::Drop` decrements the count at
-    /// `last_read_mbufs.clear()` time on the next poll-start.
+    /// Ownership model post-T3:
+    /// - Segments in `recv.bytes` each own exactly one mbuf refcount
+    ///   (bumped at tcp_input ingest on the in-order append, or
+    ///   transferred via `DrainedMbuf::into_handle()` on the gap-close
+    ///   drain).
+    /// - Popping a segment transfers ownership from `recv.bytes` to
+    ///   `last_read_mbufs`; no explicit refcount op.
+    /// - Partial-segment split (when the segment overshoots the
+    ///   remaining `total_delivered` budget) uses
+    ///   `MbufHandle::try_clone()` to produce a fresh refcount for the
+    ///   delivered portion; the in-queue portion keeps its existing
+    ///   refcount.
+    /// - `last_read_mbufs.clear()` at next `dpdk_net_poll` drops each
+    ///   handle, releasing the pin.
     ///
     /// `rx_hw_ts_ns`: NIC-provided RX timestamp captured at the per-
     /// mbuf decode boundary in `poll_once` and threaded through the
     /// RX frame path. Stored on each `Readable` event verbatim. `0`
     /// on ENA / feature-off (spec §10.3, §10.5).
     ///
-    /// `in_order_offset`: offset of the segment's payload within the
-    /// RX mbuf's data region (from `MbufInsertCtx.payload_offset`).
-    /// `in_order_len`: bytes of this segment's payload delivered
-    /// in-order (`Outcome::in_order_delivered_from_seg`). Zero when
-    /// the segment itself delivered nothing directly (e.g. a pure
-    /// drain-triggering in-order segment that was all in-order from
-    /// reorder, which is impossible — but guard anyway).
-    ///
-    /// `drained_mbufs`: list of reorder-queue mbufs consumed by the
-    /// gap-close drain. Each carries a refcount owned by the caller.
-    /// Pops `total_delivered` bytes from `conn.recv.bytes` to keep
-    /// the recv-buffer invariant ("everything delivered this
-    /// dispatch is flushed from the in-order VecDeque before the
-    /// next ACK re-advertises free_space"). A6.6 retires the
-    /// VecDeque entirely.
-    ///
-    /// Clippy's `too_many_arguments` default threshold is 7 (counting
-    /// `&self`); this fn has 8, so the allow is required.
-    #[allow(clippy::too_many_arguments)]
+    /// The pre-T3 `rx_mbuf` / `in_order_len` / `drained_mbufs`
+    /// parameters are retired here: both the in-order append and the
+    /// reorder-drain push `InOrderSegment` into `recv.bytes` at
+    /// tcp_input ingest time, so `deliver_readable` only needs the
+    /// total-byte-count budget and the timestamp.
     fn deliver_readable(
         &self,
         handle: ConnHandle,
-        rx_mbuf: Option<std::ptr::NonNull<sys::rte_mbuf>>,
-        in_order_offset: u16,
-        in_order_len: u32,
-        drained_mbufs: smallvec::SmallVec<[crate::tcp_reassembly::DrainedMbuf; 4]>,
         total_delivered: u32,
         rx_hw_ts_ns: u64,
     ) {
         use crate::counters::add;
         let mut ft = self.flow_table.borrow_mut();
         let Some(conn) = ft.get_mut(handle) else {
-            // Rare race — conn gone. Drain's DrainedMbufs still hold
-            // refcount refs; wrap each in a handle and drop them so
-            // the refcounts are released. rx_mbuf is NOT bumped yet
-            // (we bump only when we push the handle), so no action
-            // there.
-            for d in drained_mbufs {
-                // Consume the refcount handoff into a handle and drop
-                // it immediately so `refcnt_update(-1)` fires exactly
-                // once. `into_handle()` disarms the DrainedMbuf Drop
-                // so we don't double-decrement.
-                let _ = d.into_handle();
-            }
+            // Rare race — conn gone between dispatch and event-emit.
+            // Segments in the flow-table slot's `recv.bytes` already
+            // drop their own refcounts via `MbufHandle::Drop` if the
+            // slot itself is being torn down elsewhere. Nothing owed
+            // here.
             return;
         };
 
-        // In-order portion from the RX mbuf: push one handle + emit
-        // one event. Skip when there's no in-order byte count (e.g.
-        // the whole delivery came from drain — `rx_mbuf`/`in_order_len`
-        // are still coherent but we'd emit an empty event).
-        if let (Some(mb), true) = (rx_mbuf, in_order_len > 0) {
-            // Bump refcount: pin beyond the post-dispatch
-            // `rte_pktmbuf_free`. Handle drops it on next clear.
-            // SAFETY: `mb` is the live RX mbuf from the rx_burst
-            // iteration; refcount >= 1.
-            unsafe {
-                sys::shim_rte_mbuf_refcnt_update(mb.as_ptr(), 1);
+        let mut events = self.events.borrow_mut();
+        let mut remaining = total_delivered;
+        while remaining > 0 {
+            let Some(front) = conn.recv.bytes.front_mut() else {
+                // Invariant break: `total_delivered` was > 0 but
+                // `recv.bytes` drained early. Log via counter? For T3
+                // we just stop — the accounting above (`rcv_nxt`
+                // advanced, `tcp.recv_buf_delivered` credit) remains
+                // consistent with the pop we managed.
+                break;
+            };
+            let seg_len = front.len as u32;
+            if seg_len <= remaining {
+                // Full pop: the segment's refcount transfers from
+                // `recv.bytes` to `last_read_mbufs`.
+                let seg = conn.recv.bytes.pop_front().unwrap();
+                let payload_offset = seg.offset as u32;
+                let payload_len = seg.len as u32;
+                let mbuf_idx = conn.recv.last_read_mbufs.len() as u32;
+                conn.recv.last_read_mbufs.push(seg.mbuf);
+                events.push(
+                    InternalEvent::Readable {
+                        conn: handle,
+                        mbuf_idx,
+                        payload_offset,
+                        payload_len,
+                        rx_hw_ts_ns,
+                        emitted_ts_ns: crate::clock::now_ns(),
+                    },
+                    &self.counters,
+                );
+                remaining -= seg_len;
+            } else {
+                // Partial pop: split the front segment. The delivered
+                // portion gets a fresh refcount via `try_clone`; the
+                // in-queue portion keeps its existing refcount and
+                // advances `offset` / shrinks `len` to cover the
+                // remaining window.
+                let take = remaining as u16;
+                let payload_offset = front.offset as u32;
+                let payload_len = take as u32;
+                let delivered_handle = front.mbuf.try_clone();
+                // Advance the in-queue segment past the delivered
+                // window. Overflow-safe: `take <= front.len` and
+                // `front.offset + front.len` fits u16 by construction.
+                front.offset = front.offset.saturating_add(take);
+                front.len -= take;
+                let mbuf_idx = conn.recv.last_read_mbufs.len() as u32;
+                conn.recv.last_read_mbufs.push(delivered_handle);
+                events.push(
+                    InternalEvent::Readable {
+                        conn: handle,
+                        mbuf_idx,
+                        payload_offset,
+                        payload_len,
+                        rx_hw_ts_ns,
+                        emitted_ts_ns: crate::clock::now_ns(),
+                    },
+                    &self.counters,
+                );
+                remaining = 0;
             }
-            let handle_mbuf = unsafe { crate::mempool::MbufHandle::from_raw(mb) };
-            let mbuf_idx = conn.recv.last_read_mbufs.len() as u32;
-            conn.recv.last_read_mbufs.push(handle_mbuf);
-            self.events.borrow_mut().push(
-                InternalEvent::Readable {
-                    conn: handle,
-                    mbuf_idx,
-                    payload_offset: in_order_offset as u32,
-                    payload_len: in_order_len,
-                    rx_hw_ts_ns,
-                    emitted_ts_ns: crate::clock::now_ns(),
-                },
-                &self.counters,
-            );
         }
-
-        // Drained portion from the reorder queue: one handle + one
-        // event per entry. Each entry already carries a refcount
-        // handed off from the queue — `into_handle()` moves that count
-        // into an `MbufHandle` and disarms `DrainedMbuf::Drop` so the
-        // decrement happens exactly once (at handle Drop time).
-        for d in drained_mbufs {
-            let payload_offset = d.offset as u32;
-            let payload_len = d.len as u32;
-            let handle_mbuf = d.into_handle();
-            let mbuf_idx = conn.recv.last_read_mbufs.len() as u32;
-            conn.recv.last_read_mbufs.push(handle_mbuf);
-            self.events.borrow_mut().push(
-                InternalEvent::Readable {
-                    conn: handle,
-                    mbuf_idx,
-                    payload_offset,
-                    payload_len,
-                    rx_hw_ts_ns,
-                    emitted_ts_ns: crate::clock::now_ns(),
-                },
-                &self.counters,
-            );
-        }
-
-        // Drain the in-order VecDeque to preserve the recv-buffer
-        // invariant: deliver_readable empties `conn.recv.bytes` of
-        // everything delivered this dispatch so the advertised window
-        // on the next ACK reflects "all delivered bytes are gone from
-        // the buffer". A6.6 retires the VecDeque entirely; until
-        // then, this pop_front loop keeps flow-control accounting
-        // consistent with pre-A6.5 behaviour.
-        for _ in 0..total_delivered {
-            conn.recv.bytes.pop_front();
-        }
+        drop(events);
         drop(ft);
         add(&self.counters.tcp.recv_buf_delivered, total_delivered as u64);
     }
