@@ -47,8 +47,13 @@ pub struct XstatMap {
 
 impl XstatMap {
     /// Pure constructor — used by both the runtime resolver
-    /// [`resolve_xstat_ids`] and the unit tests.
-    pub(crate) fn from_lookup<F>(lookup: F) -> Self
+    /// [`resolve_xstat_ids`] and the unit tests. Exposed as `pub` so the
+    /// sibling `ena_obs_smoke` integration test (which runs on every CI
+    /// worker without DPDK/EAL) can exercise the same code path the
+    /// resolver uses, catching module-level regressions at the
+    /// integration boundary. See Task 12 of
+    /// `2026-04-20-stage1-phase-a-hw-plus-ena-obs-knobs.md`.
+    pub fn from_lookup<F>(lookup: F) -> Self
     where
         F: Fn(&str) -> Option<u64>,
     {
