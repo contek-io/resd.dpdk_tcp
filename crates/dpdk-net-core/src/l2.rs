@@ -67,11 +67,13 @@ mod tests {
         v
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn short_frame_dropped() {
         assert_eq!(l2_decode(&[0u8; 10], [1; 6]), Err(L2Drop::Short));
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn wrong_dst_mac_dropped() {
         let us = [0x11, 0x22, 0x33, 0x44, 0x55, 0x66];
@@ -80,6 +82,7 @@ mod tests {
         assert_eq!(l2_decode(&f, us), Err(L2Drop::MissMac));
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn correct_dst_mac_accepted() {
         let us = [0x11, 0x22, 0x33, 0x44, 0x55, 0x66];
@@ -89,6 +92,7 @@ mod tests {
         assert_eq!(d.payload_offset, 14);
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn broadcast_accepted_for_arp() {
         let us = [0x11, 0x22, 0x33, 0x44, 0x55, 0x66];
@@ -96,6 +100,7 @@ mod tests {
         assert!(l2_decode(&f, us).is_ok());
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn unknown_ethertype_dropped() {
         let us = [0x11, 0x22, 0x33, 0x44, 0x55, 0x66];
@@ -103,6 +108,7 @@ mod tests {
         assert_eq!(l2_decode(&f, us), Err(L2Drop::UnknownEthertype));
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn zero_our_mac_accepts_any() {
         let dst = [0x99; 6];

@@ -94,6 +94,7 @@ fn check_invariant_tsc() -> Result<(), crate::Error> {
 mod tests {
     use super::*;
 
+    #[cfg_attr(miri, ignore = "uses x86_64 _rdtsc inline asm; miri rejects inline asm")]
     #[test]
     fn now_ns_monotonic_increasing() {
         let a = now_ns();
@@ -101,6 +102,7 @@ mod tests {
         assert!(b >= a, "now_ns went backwards: {a} -> {b}");
     }
 
+    #[cfg_attr(miri, ignore = "uses x86_64 _rdtsc inline asm; miri rejects inline asm")]
     #[test]
     fn now_ns_within_one_percent_of_wall_clock() {
         // Force calibration before capturing wall_start so the 50ms calibration

@@ -412,6 +412,7 @@ impl Drop for ReorderQueue {
 mod tests {
     use super::*;
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn empty_queue_is_empty() {
         let q = ReorderQueue::new(1024);
@@ -433,6 +434,7 @@ mod tests {
     // disarm those drops. Tests that leave entries in the queue also
     // `std::mem::forget(q)` to bypass `ReorderQueue::Drop`.
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn drain_mbuf_with_no_contiguous_front_returns_empty() {
         let mut q = ReorderQueue::new(1024);
@@ -448,6 +450,7 @@ mod tests {
         std::mem::forget(q);
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn drain_mbuf_single_adjacent_segment() {
         let mut q = ReorderQueue::new(1024);
@@ -470,6 +473,7 @@ mod tests {
         std::mem::forget(out);
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn drain_mbuf_stops_at_gap() {
         let mut q = ReorderQueue::new(1024);
@@ -492,6 +496,7 @@ mod tests {
         std::mem::forget(q);
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn drain_mbuf_chains_through_touching_segments() {
         let mut q = ReorderQueue::new(1024);
@@ -518,6 +523,7 @@ mod tests {
         std::mem::forget(q);
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn drain_mbuf_with_rcv_nxt_inside_segment_skips_prefix() {
         let mut q = ReorderQueue::new(1024);
@@ -535,6 +541,7 @@ mod tests {
         std::mem::forget(out);
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn drain_mbuf_past_end_of_segment_drops_entirely() {
         // When rcv_nxt is past the segment's end, the segment is stale
@@ -563,6 +570,7 @@ mod tests {
         let _ = &mut fake_mbuf_storage;
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn drain_mbuf_empty_queue_is_noop() {
         let mut q = ReorderQueue::new(1024);
@@ -574,6 +582,7 @@ mod tests {
         assert!(out.is_empty());
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn drain_mbuf_cap_exhausted_mid_segment_reports_cap_dropped() {
         // Build a real mbuf-backed pointer so `drop_segment_mbuf_ref`
@@ -616,6 +625,7 @@ mod tests {
     // bypass the Drop impl. Refcount-decrement bookkeeping is exercised
     // via the TAP integration tests with real mbufs.
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn insert_produces_ooo_segment() {
         let mut q = ReorderQueue::new(1024);
@@ -636,6 +646,7 @@ mod tests {
         std::mem::forget(q);
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn insert_cap_overflow_signals_no_retained_ref() {
         let mut q = ReorderQueue::new(3);
@@ -658,6 +669,7 @@ mod tests {
         std::mem::forget(q2);
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn insert_empty_payload_returns_not_retained() {
         let mut q = ReorderQueue::new(1024);
@@ -673,6 +685,7 @@ mod tests {
         std::mem::forget(q);
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn insert_inserts_sort_by_seq() {
         let mut q = ReorderQueue::new(1024);
@@ -692,6 +705,7 @@ mod tests {
         std::mem::forget(q);
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn insert_two_disjoint_stay_separate() {
         let mut q = ReorderQueue::new(1024);
@@ -703,6 +717,7 @@ mod tests {
         std::mem::forget(q);
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn insert_overlap_with_existing_is_deduplicated() {
         let mut q = ReorderQueue::new(1024);
@@ -724,6 +739,7 @@ mod tests {
         std::mem::forget(q);
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn insert_spanning_multiple_existing_segments_produces_three_gap_slices() {
         // Bug repro for A6.5 Task 7 C1: insert with payload spanning
@@ -780,6 +796,7 @@ mod tests {
         let _ = &mut fake_mbuf_storage;
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn insert_fully_covered_by_existing_returns_not_retained() {
         let mut q = ReorderQueue::new(1024);

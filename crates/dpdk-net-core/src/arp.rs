@@ -218,11 +218,13 @@ mod tests {
         }
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn short_rejected() {
         assert_eq!(arp_decode(&[0u8; 10]), Err(ArpDrop::Short));
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn roundtrip_reply() {
         let req = sample_request();
@@ -242,6 +244,7 @@ mod tests {
         assert_eq!(&buf[12..14], &0x0806u16.to_be_bytes());
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn roundtrip_gratuitous() {
         let mut buf = [0u8; ARP_FRAME_LEN];
@@ -255,6 +258,7 @@ mod tests {
         assert_eq!(&buf[0..6], &[0xff; 6]);
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn reply_is_padded_to_ethernet_minimum() {
         let req = sample_request();
@@ -271,6 +275,7 @@ mod tests {
         }
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn gratuitous_is_padded_to_ethernet_minimum() {
         let mut buf = [0u8; ARP_FRAME_LEN];
@@ -281,6 +286,7 @@ mod tests {
         }
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn wrong_htype_rejected() {
         let mut body = [0u8; ARP_HDR_LEN];
@@ -290,6 +296,7 @@ mod tests {
         assert_eq!(arp_decode(&body), Err(ArpDrop::UnsupportedHardware));
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn wrong_op_rejected() {
         let req = sample_request();
@@ -299,6 +306,7 @@ mod tests {
         assert_eq!(arp_decode(&buf[14..]), Err(ArpDrop::UnsupportedOp));
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn buffer_too_small_for_reply() {
         let req = sample_request();
@@ -306,6 +314,7 @@ mod tests {
         assert!(build_arp_reply([1; 6], 0, &req, &mut buf).is_none());
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn parse_proc_arp_line_sample() {
         let line = "10.0.0.1         0x1         0x2         aa:bb:cc:dd:ee:ff     *        eth0\n";
@@ -314,6 +323,7 @@ mod tests {
         assert_eq!(mac, [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff]);
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn parse_proc_arp_incomplete_entry_rejected() {
         // Flags 0x0 means entry is incomplete — don't use it.
@@ -321,6 +331,7 @@ mod tests {
         assert!(super::parse_proc_arp_line(line).is_none());
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn resolve_from_proc_arp_missing_returns_not_found() {
         // Address we are extremely unlikely to have — 0.0.0.1 is never

@@ -141,6 +141,7 @@ mod tests {
         }
     }
 
+    #[cfg_attr(miri, ignore = "IssGen::next calls clock::now_ns (rdtsc inline asm)")]
     #[test]
     fn two_engines_produce_different_iss_for_same_tuple() {
         let g1 = IssGen::new();
@@ -151,6 +152,7 @@ mod tests {
         assert_ne!(g1.next(&t), g2.next(&t));
     }
 
+    #[cfg_attr(miri, ignore = "IssGen::next calls clock::now_ns (rdtsc inline asm)")]
     #[test]
     fn sequential_calls_monotonic_for_same_tuple() {
         let g = IssGen::new_deterministic_for_test([0; 16], [0; 16]);
@@ -164,6 +166,7 @@ mod tests {
         assert!(delta < 1_000_000, "delta too large: {delta}");
     }
 
+    #[cfg_attr(miri, ignore = "IssGen::next calls clock::now_ns (rdtsc inline asm)")]
     #[test]
     fn different_tuples_give_different_iss() {
         let g = IssGen::new_deterministic_for_test([0; 16], [0; 16]);
@@ -177,6 +180,7 @@ mod tests {
 mod tests_a5 {
     use super::*;
 
+    #[cfg_attr(miri, ignore = "IssGen::next calls clock::now_ns (rdtsc inline asm)")]
     #[test]
     fn a5_uses_4us_clock_ticks_for_monotonic_component() {
         // The spec §6.5 clock is 4µs ticks. Verify that two calls separated by
@@ -198,6 +202,7 @@ mod tests_a5 {
         assert!(delta < 100_000, "delta should not be huge: {delta}");
     }
 
+    #[cfg_attr(miri, ignore = "IssGen::next calls clock::now_ns (rdtsc inline asm)")]
     #[test]
     fn a5_different_boot_nonces_produce_different_iss_for_same_tuple() {
         let g1 = IssGen::new_deterministic_for_test([0xaa; 16], [0x01; 16]);
@@ -208,6 +213,7 @@ mod tests_a5 {
         assert_ne!(g1.next(&t), g2.next(&t));
     }
 
+    #[cfg_attr(miri, ignore = "IssGen::next calls clock::now_ns (rdtsc inline asm)")]
     #[test]
     fn a5_boot_id_readable_path_produces_nonzero_boot_nonce() {
         // When /proc/sys/kernel/random/boot_id exists (typical Linux host),

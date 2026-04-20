@@ -70,6 +70,14 @@ bench-alloc-audit = []
 # Backtrace capture is itself allocating, so enable only for repro
 # runs of a failing audit.
 bench-alloc-audit-backtrace = ["bench-alloc-audit"]
+# A6.7 hardening: marker feature for the miri job. Tests that touch
+# DPDK sys::* (mbuf alloc, mempool create, port init) are skipped via
+# `#[cfg_attr(miri, ignore = "touches DPDK sys::*")]`. Pure-compute
+# modules (siphash24, iss, tcp_seq/state/sack/rack/rtt/tlp,
+# tcp_options, tcp_events ConnHandle/queue logic, rtt_histogram,
+# error, counters, clock) run fully under miri to detect UB,
+# aliasing, and integer-overflow hazards.
+miri-safe = []
 
 [lints.rust]
 unsafe_op_in_unsafe_fn = "warn"

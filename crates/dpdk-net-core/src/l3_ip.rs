@@ -263,6 +263,7 @@ mod tests {
         v
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn checksum_folds_correctly() {
         let h = build_ip_hdr(IPPROTO_TCP, 0x0a000001, 0x0a000002, 0, false);
@@ -275,11 +276,13 @@ mod tests {
         assert_eq!(computed, stored);
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn short_packet_dropped() {
         assert_eq!(ip_decode(&[0u8; 10], 0, true), Err(L3Drop::Short));
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn bad_version_dropped() {
         let mut h = build_ip_hdr(IPPROTO_TCP, 1, 2, 0, false);
@@ -287,6 +290,7 @@ mod tests {
         assert_eq!(ip_decode(&h, 0, true), Err(L3Drop::BadVersion));
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn bad_header_len_dropped() {
         let mut h = build_ip_hdr(IPPROTO_TCP, 1, 2, 0, false);
@@ -294,6 +298,7 @@ mod tests {
         assert_eq!(ip_decode(&h, 0, true), Err(L3Drop::BadHeaderLen));
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn bad_total_len_dropped() {
         let mut h = build_ip_hdr(IPPROTO_TCP, 1, 2, 0, false);
@@ -302,6 +307,7 @@ mod tests {
         assert_eq!(ip_decode(&h, 0, true), Err(L3Drop::BadTotalLen));
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn fragment_dropped_mf() {
         let mut h = build_ip_hdr(IPPROTO_TCP, 1, 2, 0, false);
@@ -309,6 +315,7 @@ mod tests {
         assert_eq!(ip_decode(&h, 0, true), Err(L3Drop::Fragment));
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn fragment_dropped_offset() {
         let mut h = build_ip_hdr(IPPROTO_TCP, 1, 2, 0, false);
@@ -317,6 +324,7 @@ mod tests {
         assert_eq!(ip_decode(&h, 0, true), Err(L3Drop::Fragment));
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn ttl_zero_dropped() {
         let mut h = build_ip_hdr(IPPROTO_TCP, 1, 2, 0, false);
@@ -330,30 +338,35 @@ mod tests {
         assert_eq!(ip_decode(&h, 0, true), Err(L3Drop::TtlZero));
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn bad_csum_dropped_when_verifying() {
         let h = build_ip_hdr(IPPROTO_TCP, 1, 2, 0, true);
         assert_eq!(ip_decode(&h, 0, false), Err(L3Drop::CsumBad));
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn bad_csum_passes_when_nic_ok() {
         let h = build_ip_hdr(IPPROTO_TCP, 1, 2, 0, true);
         assert!(ip_decode(&h, 0, true).is_ok());
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn not_ours_dropped() {
         let h = build_ip_hdr(IPPROTO_TCP, 1, 2, 0, false);
         assert_eq!(ip_decode(&h, 99, true), Err(L3Drop::NotOurs));
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn unsupported_proto_dropped() {
         let h = build_ip_hdr(17 /* UDP */, 1, 2, 0, false);
         assert_eq!(ip_decode(&h, 0, true), Err(L3Drop::UnsupportedProto));
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn tcp_accepted() {
         let h = build_ip_hdr(IPPROTO_TCP, 1, 2, 10, false);
@@ -363,6 +376,7 @@ mod tests {
         assert_eq!(d.total_len, 30);
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn icmp_accepted() {
         let h = build_ip_hdr(IPPROTO_ICMP, 1, 2, 4, false);
@@ -371,6 +385,7 @@ mod tests {
     }
 
     #[cfg(feature = "hw-offload-rx-cksum")]
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn classify_ip_cksum_from_ol_flags() {
         use crate::dpdk_consts::{
@@ -396,6 +411,7 @@ mod tests {
     }
 
     #[cfg(feature = "hw-offload-rx-cksum")]
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn classify_l4_cksum_from_ol_flags() {
         use crate::dpdk_consts::{

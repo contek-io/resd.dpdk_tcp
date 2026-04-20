@@ -406,6 +406,7 @@ mod tests {
         }
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn syn_frame_has_mss_option_and_valid_sizes() {
         let seg = base();
@@ -420,6 +421,7 @@ mod tests {
         assert_eq!(mss, 1460);
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn frame_ipv4_header_parses_roundtrip() {
         let seg = base();
@@ -431,6 +433,7 @@ mod tests {
         assert_eq!(dec.dst_ip, 0x0a_00_00_01);
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn data_segment_with_payload_has_correct_tcp_csum() {
         let mut seg = base();
@@ -452,6 +455,7 @@ mod tests {
         assert_eq!(expected, actual);
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn output_too_small_returns_none() {
         let seg = base();
@@ -459,6 +463,7 @@ mod tests {
         assert!(build_segment(&seg, &mut out).is_none());
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn rst_frame_has_rst_flag_and_no_options() {
         let mut seg = base();
@@ -473,6 +478,7 @@ mod tests {
     // Task 9: retransmit primitive — the hdr-only builder must produce the
     // same L2/L3/TCP header bytes (including TCP checksum) as `build_segment`
     // would for the same SegmentTx if the payload were inline.
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn build_retrans_header_matches_build_segment_header_prefix() {
         // Use an ACK+PSH data segment with a real payload. TS/SACK options
@@ -511,6 +517,7 @@ mod tests {
         );
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn build_retrans_header_with_options_matches_prefix() {
         // Same invariant with TS + SACK options present.
@@ -539,6 +546,7 @@ mod tests {
         assert_eq!(&full_buf[0..hdr_n], &hdr_buf[0..hdr_n]);
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn build_retrans_header_returns_none_on_small_buf() {
         let seg = SegmentTx {
@@ -549,6 +557,7 @@ mod tests {
         assert!(build_retrans_header(&seg, b"payload", &mut out).is_none());
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn pseudo_header_only_cksum_matches_manual_fold() {
         use crate::l3_ip::internet_checksum;
@@ -581,6 +590,7 @@ mod tests {
     // offload_active is false, so a null mbuf pointer is safe.
 
     #[cfg(feature = "hw-offload-tx-cksum")]
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn tx_offload_rewrite_cksums_writes_pseudo_and_zeroes_ip() {
         // Build a full segment with build_segment, then rewrite cksum
@@ -616,6 +626,7 @@ mod tests {
     }
 
     #[cfg(feature = "hw-offload-tx-cksum")]
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn tx_offload_rewrite_cksums_rejects_short_frame() {
         let mut frame = [0u8; ETH_HDR_LEN + IPV4_HDR_MIN + TCP_HDR_MIN - 1];
@@ -624,6 +635,7 @@ mod tests {
     }
 
     #[cfg(feature = "hw-offload-tx-cksum")]
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn tx_offload_finalize_noop_on_null_mbuf() {
         // offload_active == true but a null mbuf pointer hits the early
@@ -636,6 +648,7 @@ mod tests {
     }
 
     #[cfg(feature = "hw-offload-tx-cksum")]
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn tx_offload_finalize_noop_when_offload_inactive() {
         // offload_active == false ⇒ early return. With a null mbuf we
@@ -650,6 +663,7 @@ mod tests {
     // no-op signature to confirm it compiles + links across the feature
     // matrix. Runs only when hw-offload-tx-cksum is compile-off.
     #[cfg(not(feature = "hw-offload-tx-cksum"))]
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn tx_offload_finalize_feature_off_is_noop() {
         let seg = base();

@@ -220,6 +220,7 @@ mod tests {
         }
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn insert_and_lookup_by_handle() {
         let mut ft = FlowTable::new(4);
@@ -229,6 +230,7 @@ mod tests {
         assert!(ft.get(h).is_some());
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn lookup_by_tuple_roundtrip() {
         let mut ft = FlowTable::new(4);
@@ -238,6 +240,7 @@ mod tests {
         assert_eq!(ft.lookup_by_tuple(&t), Some(h));
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn full_table_returns_none() {
         let mut ft = FlowTable::new(2);
@@ -249,6 +252,7 @@ mod tests {
         assert!(ft.insert(c).is_none());
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn duplicate_tuple_rejected() {
         let mut ft = FlowTable::new(4);
@@ -259,6 +263,7 @@ mod tests {
         assert!(ft.insert(b).is_none());
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn remove_frees_slot_and_tuple() {
         let mut ft = FlowTable::new(4);
@@ -270,12 +275,14 @@ mod tests {
         assert!(ft.lookup_by_tuple(&t).is_none());
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn invalid_handle_rejected() {
         let ft = FlowTable::new(4);
         assert!(ft.get(INVALID_HANDLE).is_none());
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn get_mut_roundtrip_mutation() {
         let mut ft = FlowTable::new(4);
@@ -290,6 +297,7 @@ mod tests {
         );
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn iter_handles_skips_freed_slots() {
         let mut ft = FlowTable::new(4);
@@ -335,6 +343,7 @@ mod tests {
     }
 
     #[cfg(feature = "hw-offload-rss-hash")]
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn rss_hash_used_when_flag_set_and_latch_on() {
         use crate::dpdk_consts::RTE_MBUF_F_RX_RSS_HASH;
@@ -351,6 +360,7 @@ mod tests {
     }
 
     #[cfg(feature = "hw-offload-rss-hash")]
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn rss_hash_unused_when_flag_clear() {
         let tup = FourTuple {
@@ -374,6 +384,7 @@ mod tests {
     }
 
     #[cfg(feature = "hw-offload-rss-hash")]
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn rss_hash_unused_when_latch_off() {
         use crate::dpdk_consts::RTE_MBUF_F_RX_RSS_HASH;

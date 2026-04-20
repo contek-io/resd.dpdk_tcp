@@ -1381,6 +1381,7 @@ mod tests {
         out
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn parse_ack_segment_with_payload() {
         let frame = build_test_segment(TCP_ACK | TCP_PSH, None, b"hello");
@@ -1394,12 +1395,14 @@ mod tests {
         assert_eq!(p.flags, TCP_ACK | TCP_PSH);
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn parse_rejects_short_segment() {
         let err = parse_segment(&[0u8; 10], 0, 0, true).unwrap_err();
         assert_eq!(err, TcpParseError::Short);
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn parse_rejects_syn_fin_combo() {
         let frame = build_test_segment(TCP_SYN | TCP_FIN, None, &[]);
@@ -1408,6 +1411,7 @@ mod tests {
         assert_eq!(err, TcpParseError::BadFlags);
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn bad_tcp_csum_rejected() {
         let mut frame = build_test_segment(TCP_ACK, None, b"hi");
@@ -1418,6 +1422,7 @@ mod tests {
         assert_eq!(err, TcpParseError::Csum);
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn tuple_from_segment_swaps_src_and_dst() {
         let frame = build_test_segment(TCP_ACK, None, &[]);
@@ -1430,6 +1435,7 @@ mod tests {
         assert_eq!(t.peer_port, 5000);
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn syn_sent_syn_ack_negotiates_full_option_set() {
         use crate::flow_table::FourTuple;
@@ -1478,6 +1484,7 @@ mod tests {
         assert_eq!(c.ts_recent, 0xCAFEBABE);
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn handle_syn_sent_wires_maybe_seed_srtt_from_syn() {
         // A5.5 Task 13 wiring gate: the 4 unit tests on
@@ -1542,6 +1549,7 @@ mod tests {
         );
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn syn_sent_peer_without_wscale_zeroes_both_shifts() {
         use crate::flow_table::FourTuple;
@@ -1583,6 +1591,7 @@ mod tests {
         assert_eq!(c.ws_shift_out, 0);
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn syn_ack_window_is_not_ws_scaled_per_rfc7323_2_2() {
         // F-3 RFC 7323 §2.2: SYN/SYN-ACK window fields MUST NOT be scaled.
@@ -1625,6 +1634,7 @@ mod tests {
         assert_eq!(c.ws_shift_in, 7, "peer's WS is recorded for post-handshake");
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn syn_ack_ws_shift_clamped_at_14_per_rfc7323_2_3() {
         // F-1 RFC 7323 §2.3: peer's shift.cnt > 14 MUST be clamped to 14.
@@ -1665,6 +1675,7 @@ mod tests {
         );
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn established_post_handshake_snd_wnd_is_ws_scaled_per_rfc7323_2_3() {
         // F-2 RFC 7323 §2.3: on post-handshake segments, receiver MUST
@@ -1693,6 +1704,7 @@ mod tests {
         );
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn syn_sent_plain_ack_wrong_seq_sends_rst() {
         use crate::flow_table::FourTuple;
@@ -1723,6 +1735,7 @@ mod tests {
         assert_eq!(out.tx, TxAction::RstForSynSentBadAck);
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn syn_sent_rst_matching_our_ack_closes() {
         use crate::flow_table::FourTuple;
@@ -1773,6 +1786,7 @@ mod tests {
         c
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn established_inorder_data_delivered_and_acked() {
         // A6.6 Task 3: the in-order append now pushes an
@@ -1825,6 +1839,7 @@ mod tests {
         let _ = &mut fake_mbuf_storage;
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn established_ooo_segment_queues_into_reassembly() {
         // A6.5 Task 4d: OOO-enqueue is mbuf-ref only. This test sources
@@ -1895,6 +1910,7 @@ mod tests {
     //     the test running clean under repeated invocations.
     // A6.6 / A10 may add the dedicated OOO end-to-end scenario.
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn established_inorder_payload_does_not_flag_ooo() {
         // A6.6 Task 3: in-order append requires mbuf-backed ctx (fake
@@ -1925,6 +1941,7 @@ mod tests {
         let _ = &mut fake_mbuf_storage;
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn established_recv_buf_full_flags_buf_full_drop_not_ooo() {
         // A6.6 Task 3: in-order append requires mbuf-backed ctx.
@@ -1960,6 +1977,7 @@ mod tests {
         let _ = &mut fake_mbuf_storage;
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn established_ack_field_advances_snd_una() {
         let mut c = est_conn(1000, 5000, 1024);
@@ -1983,6 +2001,7 @@ mod tests {
         assert_eq!(c.snd.pending.len(), 0);
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn established_fin_transitions_to_close_wait() {
         let mut c = est_conn(1000, 5000, 1024);
@@ -2003,6 +2022,7 @@ mod tests {
         assert_eq!(c.rcv_nxt, 5002); // FIN consumes one seq
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn established_rst_closes_immediately() {
         let mut c = est_conn(1000, 5000, 1024);
@@ -2022,6 +2042,7 @@ mod tests {
         assert!(out.closed);
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn established_rst_outcome_carries_rst_cause() {
         let mut c = est_conn(1000, 5000, 1024);
@@ -2045,6 +2066,7 @@ mod tests {
         assert!((seg.flags & TCP_RST) != 0);
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn fin_wait1_ack_of_our_fin_transitions_to_fin_wait2() {
         use crate::flow_table::FourTuple;
@@ -2079,6 +2101,7 @@ mod tests {
         assert_eq!(out.new_state, Some(TcpState::FinWait2));
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn fin_wait2_peer_fin_transitions_to_time_wait() {
         use crate::flow_table::FourTuple;
@@ -2115,6 +2138,7 @@ mod tests {
         assert_eq!(c.rcv_nxt, 5002);
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn fin_wait1_peer_fin_without_ack_of_our_fin_transitions_to_closing() {
         use crate::flow_table::FourTuple;
@@ -2149,6 +2173,7 @@ mod tests {
         assert_eq!(out.new_state, Some(TcpState::Closing));
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn closing_ack_of_our_fin_transitions_to_time_wait() {
         use crate::flow_table::FourTuple;
@@ -2183,6 +2208,7 @@ mod tests {
         assert_eq!(out.new_state, Some(TcpState::TimeWait));
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn last_ack_ack_of_our_fin_closes_connection() {
         use crate::flow_table::FourTuple;
@@ -2225,6 +2251,7 @@ mod tests {
         c
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn paws_drops_segment_with_stale_tsval_and_emits_challenge_ack() {
         use crate::tcp_options::TcpOpts;
@@ -2251,6 +2278,7 @@ mod tests {
         assert_eq!(c.ts_recent, 200); // unchanged
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn paws_accepts_fresh_tsval_and_updates_ts_recent() {
         // A6.6 Task 3: in-order append requires mbuf-backed ctx.
@@ -2286,6 +2314,7 @@ mod tests {
         let _ = &mut fake_mbuf_storage;
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn missing_ts_on_ts_enabled_conn_bumps_bad_option_and_drops() {
         let mut c = est_conn_ts(1000, 5000, 1024, 200);
@@ -2305,6 +2334,7 @@ mod tests {
         assert_eq!(out.delivered, 0);
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn established_decodes_peer_sack_blocks_into_scoreboard() {
         use crate::tcp_options::{SackBlock, TcpOpts};
@@ -2343,6 +2373,7 @@ mod tests {
         assert!(!c.sack_scoreboard.is_sacked(1003));
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn established_prunes_scoreboard_below_snd_una() {
         use crate::tcp_options::{SackBlock, TcpOpts};
@@ -2383,6 +2414,7 @@ mod tests {
     // A5 Task 16: RFC 2883 DSACK detection. Visibility only — no behavior
     // change; the block is skipped from the scoreboard and counted.
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn is_dsack_below_snd_una() {
         // Condition (a): block.right <= snd_una — the peer is reporting a
@@ -2408,6 +2440,7 @@ mod tests {
         ));
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn is_dsack_covered_by_existing_scoreboard_block() {
         // Condition (b): block is fully enclosed by an existing scoreboard
@@ -2436,6 +2469,7 @@ mod tests {
         ));
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn is_dsack_rejects_block_reporting_new_data() {
         // Block above snd_una and not covered by any existing scoreboard
@@ -2451,6 +2485,7 @@ mod tests {
         ));
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn is_dsack_rejects_partial_overlap_with_existing() {
         // Block overlaps but is NOT fully covered by the existing entry —
@@ -2470,6 +2505,7 @@ mod tests {
         ));
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn established_dsack_below_snd_una_counted_and_skipped() {
         use crate::tcp_options::{SackBlock, TcpOpts};
@@ -2509,6 +2545,7 @@ mod tests {
         assert!(c.rack.dsack_seen);
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn established_dsack_covered_by_existing_counted_and_skipped() {
         use crate::tcp_options::{SackBlock, TcpOpts};
@@ -2551,6 +2588,7 @@ mod tests {
         assert_eq!(c.sack_scoreboard.blocks()[0].right, 1020);
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn established_mixed_dsack_plus_live_sack_handled_separately() {
         use crate::tcp_options::{SackBlock, TcpOpts};
@@ -2593,6 +2631,7 @@ mod tests {
         assert_eq!(c.sack_scoreboard.blocks()[0].left, 1015);
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn time_wait_replays_ack_on_any_segment() {
         use crate::flow_table::FourTuple;
@@ -2626,6 +2665,7 @@ mod tests {
 
     // A4 Task 19: cross-phase backfill flags on `Outcome`.
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn established_urg_flag_drops_and_sets_urgent_dropped() {
         use crate::tcp_output::TCP_URG;
@@ -2649,6 +2689,7 @@ mod tests {
         assert_eq!(c.rcv_nxt, 5001);
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn established_out_of_window_sets_bad_seq_and_challenge_acks() {
         let mut c = est_conn(1000, 5000, 1024);
@@ -2670,6 +2711,7 @@ mod tests {
         assert_eq!(out.delivered, 0);
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn established_ack_ahead_of_snd_nxt_sets_bad_ack() {
         let mut c = est_conn(1000, 5000, 1024);
@@ -2690,6 +2732,7 @@ mod tests {
         assert_eq!(out.tx, TxAction::Ack); // challenge ACK
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn established_duplicate_ack_sets_dup_ack() {
         let mut c = est_conn(1000, 5000, 1024);
@@ -2716,6 +2759,7 @@ mod tests {
         assert!(out.dup_ack);
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn dup_ack_ignored_when_seg_has_data() {
         // c2 violated: payload non-empty. A6.6 T3 follow-up: the
@@ -2754,6 +2798,7 @@ mod tests {
         let _ = &mut fake_mbuf_storage;
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn dup_ack_ignored_when_seg_updates_window() {
         // c3 violated: seg.window differs from conn.snd_wnd (no-shift).
@@ -2776,6 +2821,7 @@ mod tests {
         assert!(!out.dup_ack);
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn dup_ack_ignored_when_no_outstanding_data() {
         // c4 violated: snd_una == snd_nxt (nothing in flight).
@@ -2798,6 +2844,7 @@ mod tests {
         assert!(!out.dup_ack);
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn dup_ack_set_when_all_five_conditions_hold_with_ws_shift() {
         // Parallel to `established_duplicate_ack_sets_dup_ack`, but with a
@@ -2823,6 +2870,7 @@ mod tests {
         assert!(out.dup_ack);
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn dup_ack_ignored_when_fin_flag_set() {
         // c5 violated: FIN flag set. All other conditions (c1-c4) hold,
@@ -2847,6 +2895,7 @@ mod tests {
         assert!(!out.dup_ack);
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn dup_ack_ignored_when_syn_flag_set() {
         // c5 violated: SYN flag set. Mirrors the FIN case — RFC 5681 §2 (c)
@@ -2870,6 +2919,7 @@ mod tests {
         assert!(!out.dup_ack);
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn established_zero_window_segment_sets_rx_zero_window() {
         let mut c = est_conn(1000, 5000, 1024);
@@ -2888,6 +2938,7 @@ mod tests {
         assert!(out.rx_zero_window);
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn established_nonzero_window_does_not_set_rx_zero_window() {
         let mut c = est_conn(1000, 5000, 1024);
@@ -2906,6 +2957,7 @@ mod tests {
         assert!(!out.rx_zero_window);
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn close_path_out_of_window_sets_bad_seq() {
         use crate::flow_table::FourTuple;
@@ -2942,6 +2994,7 @@ mod tests {
         assert_eq!(out.tx, TxAction::Ack);
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn established_base_outcome_flags_default_false() {
         let out = Outcome::base();
@@ -2952,6 +3005,7 @@ mod tests {
         assert!(!out.rx_zero_window);
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn outcome_snd_una_advanced_to_field_defaults() {
         let o = Outcome::base();
@@ -2959,6 +3013,7 @@ mod tests {
         assert!(!o.rtt_sample_taken);
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn outcome_rack_lost_indexes_defaults_empty() {
         let o = Outcome::base();
@@ -2970,6 +3025,7 @@ mod tests {
     // (newer xmit, SACKed by the incoming ACK). After the ACK, A's
     // xmit_ts is older than RACK.xmit_ts + age exceeds reo_wnd, so it's
     // marked lost and its index is surfaced via Outcome.rack_lost_indexes.
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn rack_detects_older_entry_as_lost_when_newer_sacked_and_beyond_reo_wnd() {
         use crate::mempool::Mbuf;
@@ -3036,6 +3092,7 @@ mod tests {
     }
 
     // Empty snd_retrans → RACK pass is a no-op, rack_lost_indexes stays empty.
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn rack_pass_noop_when_no_inflight_segments() {
         let mut c = est_conn(1000, 5000, 1024);

@@ -167,6 +167,7 @@ mod tests {
         }
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn empty_is_empty() {
         let r = SendRetrans::new();
@@ -175,6 +176,7 @@ mod tests {
         assert!(r.oldest_unacked_seq().is_none());
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn push_grows() {
         let mut r = SendRetrans::new();
@@ -183,6 +185,7 @@ mod tests {
         assert_eq!(r.oldest_unacked_seq(), Some(100));
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn prune_below_drops_fully_acked() {
         let mut r = SendRetrans::new();
@@ -195,6 +198,7 @@ mod tests {
         assert_eq!(r.oldest_unacked_seq(), Some(120));
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn prune_below_stops_at_first_not_fully_acked() {
         let mut r = SendRetrans::new();
@@ -206,6 +210,7 @@ mod tests {
         assert_eq!(r.len(), 1);
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn mark_sacked_flags_overlapping_entries() {
         let mut r = SendRetrans::new();
@@ -220,6 +225,7 @@ mod tests {
         assert_eq!(sacked, vec![false, true, false]);
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn mark_sacked_partial_overlap_flags_whole_entry() {
         let mut r = SendRetrans::new();

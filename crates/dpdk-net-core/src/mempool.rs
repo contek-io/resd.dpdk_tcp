@@ -208,6 +208,7 @@ mod try_clone_tests {
     // a synthetic mbuf allocated via rte_pktmbuf_alloc. If tests cannot reach
     // the DPDK runtime, guard with #[ignore] — the actual verification happens
     // via the TAP integration tests in Task 13.
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     #[ignore = "requires DPDK EAL + mempool; covered by tests/rx_close_drains_mbufs.rs"]
     fn try_clone_bumps_refcount() {

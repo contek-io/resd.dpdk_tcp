@@ -4855,6 +4855,7 @@ impl Drop for Engine {
 mod tests {
     use super::*;
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn default_engine_config_has_a2_fields() {
         let cfg = EngineConfig::default();
@@ -4866,6 +4867,7 @@ mod tests {
         assert_eq!(cfg.garp_interval_sec, 0);
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn default_engine_config_has_a3_fields() {
         let cfg = EngineConfig::default();
@@ -4877,6 +4879,7 @@ mod tests {
         assert!(!cfg.tcp_nagle);
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn engine_config_default_rto_values_match_spec() {
         let cfg = EngineConfig::default();
@@ -4887,12 +4890,14 @@ mod tests {
         assert!(!cfg.tcp_per_packet_events);
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn engine_config_default_event_queue_soft_cap_matches_spec() {
         let cfg = EngineConfig::default();
         assert_eq!(cfg.event_queue_soft_cap, 4096);
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn engine_exposes_addressing_and_pmtu() {
         // Unit-test smoke: engine struct has the new accessors. We can't
@@ -4907,6 +4912,7 @@ mod tests {
         // If this compiles, the methods exist.
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn connect_requires_nonzero_local_ip() {
         // We can't construct an Engine without EAL, so test via a function
@@ -4921,6 +4927,7 @@ mod tests {
     }
 
     // A5 Task 19: ConnectOpts type + connect_with_opts signature.
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn connect_opts_default_is_both_false() {
         let opts = super::ConnectOpts::default();
@@ -4928,6 +4935,7 @@ mod tests {
         assert!(!opts.rto_no_backoff);
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn connect_with_opts_signature_exists() {
         // Compile-only: engine can't be constructed without EAL. This
@@ -4940,6 +4948,7 @@ mod tests {
         }
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn send_bytes_signature_exists() {
         fn _check(e: &Engine, h: crate::flow_table::ConnHandle) {
@@ -4952,6 +4961,7 @@ mod tests {
     // field is readable on a TcpConn looked up via `flow_table()`. Full
     // end-to-end coverage (short-accept → bit set → WRITABLE fires on
     // ACK-prune) lives in Task 21's TAP integration.
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn send_bytes_sets_send_refused_pending_on_short_accept() {
         // Compile-only signature check. Full end-to-end in Task 21.
@@ -4965,6 +4975,7 @@ mod tests {
         let _ = _compile_only;
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn close_conn_signature_exists() {
         fn _check(e: &Engine, h: crate::flow_table::ConnHandle) {
@@ -4972,6 +4983,7 @@ mod tests {
         }
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn close_conn_with_flags_signature_exists() {
         fn _compile_only(e: &Engine) {
@@ -4981,6 +4993,7 @@ mod tests {
         let _ = _compile_only;
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn drain_events_signature_exists() {
         fn _check(e: &Engine) {
@@ -4995,6 +5008,7 @@ mod tests {
     // tests in `tcp_output.rs` plus the refcount/chain hand-trace in the
     // self-review. A `retransmit(...)` call on an empty `snd_retrans` or
     // stale entry_index is a silent no-op by design.
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn retransmit_signature_exists() {
         fn _check(e: &Engine, h: crate::flow_table::ConnHandle) {
@@ -5006,6 +5020,7 @@ mod tests {
     // lives in Task 28 (RTO/RACK/TLP TAP integration) — a real fire
     // needs EAL/DPDK. The handler itself is exercised indirectly via
     // `advance_timer_wheel` from `poll_once`.
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn on_rto_fire_signature_exists() {
         fn _check(
@@ -5020,6 +5035,7 @@ mod tests {
     // Task 13: `force_close_etimedout` signature compile-check. Body
     // coverage via Task 28 TAP integration (RTO budget-exhaustion end-
     // to-end). The method is pub(crate) so this test can reference it.
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn force_close_etimedout_signature_exists() {
         fn _check(e: &Engine, h: crate::flow_table::ConnHandle) {
@@ -5030,6 +5046,7 @@ mod tests {
     // Task 17: `on_tlp_fire` signature compile-check. Body coverage lives
     // in Task 28 (RTO/RACK/TLP TAP integration) — a real fire needs EAL/
     // DPDK. Exercised indirectly via `advance_timer_wheel` from `poll_once`.
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn on_tlp_fire_signature_exists() {
         fn _check(
@@ -5046,6 +5063,7 @@ mod tests {
     // end-to-end). A real fire needs EAL/DPDK. Handler is pub(crate) so
     // this test can reference it; exercised via `advance_timer_wheel`
     // from `poll_once`.
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn on_syn_retrans_fire_signature_exists() {
         fn _check(
@@ -5063,6 +5081,7 @@ mod tests {
     // observed when SRTT < RTO). The per-conn gate — including the
     // SRTT-present check added in Task 15 — is unit-tested in
     // `tcp_conn::a5_5_tlp_hook_tests`.
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn arm_tlp_pto_signature_exists() {
         fn _check(e: &Engine, h: crate::flow_table::ConnHandle) {
@@ -5078,6 +5097,7 @@ mod tests {
     // by the TAP integration test (`tcp_basic_tap.rs`) and the
     // `tcp_output::build_segment` round-trip tests.
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn compute_ws_shift_for_below_64kib_returns_zero() {
         // 65535 is exactly u16::MAX — no scaling needed.
@@ -5086,6 +5106,7 @@ mod tests {
         assert_eq!(super::compute_ws_shift_for(0), 0);
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn compute_ws_shift_for_256kib_returns_three() {
         // Trace: cap=65535 (ws=0) < 262144 → cap=131071 (ws=1) < 262144 →
@@ -5093,12 +5114,14 @@ mod tests {
         assert_eq!(super::compute_ws_shift_for(256 * 1024), 3);
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn compute_ws_shift_for_caps_at_fourteen() {
         // RFC 7323 §2.3: WS option value MUST NOT exceed 14.
         assert_eq!(super::compute_ws_shift_for(u32::MAX), 14);
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn build_connect_syn_opts_has_mss_ws_sack_perm_ts() {
         // This is the data that `connect()` feeds into SegmentTx.options;
@@ -5116,6 +5139,7 @@ mod tests {
         assert_eq!(tsecr, 0, "SYN has no received TSval to echo");
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn build_connect_syn_opts_tsval_nonzero_for_nonzero_clock() {
         // Sanity: we truncate `now_ns / 1000` to u32; a realistic
@@ -5131,6 +5155,7 @@ mod tests {
     // delegates to. Frame-level TS echo + SACK encoding is already
     // round-trip-tested in `tcp_options::tests`.
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn build_ack_outcome_ts_and_ws_scaled_window() {
         // TS enabled + WS shift 7 + free_space well above 0 ⇒ window
@@ -5155,6 +5180,7 @@ mod tests {
         assert_eq!(out.opts.sack_block_count, 0);
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn build_ack_outcome_ts_disabled_skips_option() {
         // Mirrors A3 defaults: no TS negotiated ⇒ no TS option.
@@ -5163,6 +5189,7 @@ mod tests {
         assert_eq!(out.window, 4096);
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn build_ack_outcome_ws_shift_zero_passes_free_space_through() {
         // ws_shift=0 ⇒ no scaling; clamp still bounds at u16::MAX.
@@ -5170,6 +5197,7 @@ mod tests {
         assert_eq!(out.window, 50_000);
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn build_ack_outcome_window_clamps_to_u16_max() {
         // Unscaled 2 MiB ⇒ clamp to 65535 (what A3 did).
@@ -5177,6 +5205,7 @@ mod tests {
         assert_eq!(out.window, u16::MAX);
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn build_ack_outcome_scaled_window_clamps_to_u16_max() {
         // 512 MiB >> 3 = 64 MiB ⇒ still >> u16::MAX, so clamp.
@@ -5184,6 +5213,7 @@ mod tests {
         assert_eq!(out.window, u16::MAX);
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn build_ack_outcome_zero_free_space_signals_zero_window_and_window_zero() {
         let out = super::build_ack_outcome(7, false, 0, 0, false, &[], None, 0);
@@ -5191,6 +5221,7 @@ mod tests {
         assert!(out.zero_window);
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn build_ack_outcome_sack_blocks_emit_in_reverse_seq_order_without_trigger() {
         // No trigger_range supplied (e.g. pure-ACK path, no OOO insert
@@ -5224,6 +5255,7 @@ mod tests {
         );
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn build_ack_outcome_trigger_middle_block_emitted_first() {
         // F-8 RFC 2018 §4 MUST-26: the block containing the triggering
@@ -5259,6 +5291,7 @@ mod tests {
         );
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn build_ack_outcome_trigger_merged_into_existing_block_emits_merged_first() {
         // Trigger (420, 450) fell inside an existing block (400, 500)
@@ -5283,6 +5316,7 @@ mod tests {
         );
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn build_ack_outcome_trigger_no_match_falls_back_to_reverse_order() {
         // Trigger range outside all reorder blocks (e.g. it was fully
@@ -5300,6 +5334,7 @@ mod tests {
         );
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn build_ack_outcome_sack_disabled_skips_blocks_even_with_reorder() {
         // Peer didn't negotiate SACK-permitted ⇒ no blocks on wire.
@@ -5309,6 +5344,7 @@ mod tests {
         assert_eq!(out.opts.sack_block_count, 0);
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn build_ack_outcome_sack_caps_at_max_blocks_emit() {
         // 5 ranges but MAX_SACK_BLOCKS_EMIT=3 ⇒ only top-3 by seq make it.
@@ -5345,6 +5381,7 @@ mod tests {
         );
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn build_ack_outcome_full_matrix_ts_plus_ws_plus_sack() {
         // All three options on — verify no interaction breaks any of them.
@@ -5379,6 +5416,7 @@ mod tests {
     // (`conn_table_full`, `conn_time_wait_reaped`, `tx_window_update`)
     // are integration-test reachable once TAP-mode tests land in Task 20+.
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn apply_tcp_input_counters_maps_paws_rejected() {
         let c = crate::counters::TcpCounters::default();
@@ -5389,6 +5427,7 @@ mod tests {
         assert_eq!(c.rx_paws_rejected.load(Ordering::Relaxed), 1);
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn apply_tcp_input_counters_maps_bad_option() {
         let c = crate::counters::TcpCounters::default();
@@ -5399,6 +5438,7 @@ mod tests {
         assert_eq!(c.rx_bad_option.load(Ordering::Relaxed), 1);
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn apply_tcp_input_counters_reassembly_queued_increments_once() {
         let c = crate::counters::TcpCounters::default();
@@ -5409,6 +5449,7 @@ mod tests {
         assert_eq!(c.rx_reassembly_queued.load(Ordering::Relaxed), 1);
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn apply_tcp_input_counters_reassembly_hole_filled_adds_count() {
         let c = crate::counters::TcpCounters::default();
@@ -5419,6 +5460,7 @@ mod tests {
         assert_eq!(c.rx_reassembly_hole_filled.load(Ordering::Relaxed), 3);
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn apply_tcp_input_counters_sack_blocks_decoded_adds_count() {
         let c = crate::counters::TcpCounters::default();
@@ -5430,6 +5472,7 @@ mod tests {
     }
 
     // A5 Task 16: DSACK counter bumped by the count in Outcome.
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn apply_tcp_input_counters_rx_dsack_adds_count() {
         let c = crate::counters::TcpCounters::default();
@@ -5440,6 +5483,7 @@ mod tests {
         assert_eq!(c.rx_dsack.load(Ordering::Relaxed), 2);
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn apply_tcp_input_counters_backfill_flags_each_bump_once() {
         let c = crate::counters::TcpCounters::default();
@@ -5459,6 +5503,7 @@ mod tests {
     }
 
     // A5 Task 22: parser-layer WS>14 clamp signal → counter bump.
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn apply_tcp_input_counters_maps_ws_shift_clamped() {
         let c = crate::counters::TcpCounters::default();
@@ -5470,6 +5515,7 @@ mod tests {
     }
 
     // A5 Task 26: RTT sample taken (Task 11's Outcome flag) → counter bump.
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn apply_tcp_input_counters_bumps_rtt_samples_when_flag_set() {
         let c = crate::counters::TcpCounters::default();
@@ -5480,6 +5526,7 @@ mod tests {
         assert_eq!(c.rtt_samples.load(Ordering::Relaxed), 1);
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn apply_tcp_input_counters_base_outcome_no_bumps() {
         let c = crate::counters::TcpCounters::default();
@@ -5502,6 +5549,7 @@ mod tests {
         assert_eq!(c.rtt_samples.load(Ordering::Relaxed), 0);
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn flush_tx_pending_data_signature_exists() {
         // Signature-only check; empty-ring drain and full drain are exercised
@@ -5512,6 +5560,7 @@ mod tests {
         let _ = _compile_only;
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn rtt_histogram_edges_defaults_applied_on_all_zero() {
         let validated = crate::engine::validate_and_default_histogram_edges(&[0u32; 15])
@@ -5523,6 +5572,7 @@ mod tests {
         assert_eq!(validated, expected);
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn rtt_histogram_edges_non_monotonic_rejected() {
         let bad: [u32; 15] = [
@@ -5532,6 +5582,7 @@ mod tests {
         assert!(crate::engine::validate_and_default_histogram_edges(&bad).is_err());
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn rtt_histogram_edges_monotonic_passes_through() {
         let good: [u32; 15] = [
@@ -5541,6 +5592,7 @@ mod tests {
         assert_eq!(out, good);
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn rx_enomem_edge_trigger_signature_exists() {
         fn _compile_only(e: &Engine) {
@@ -5550,6 +5602,7 @@ mod tests {
         let _ = _compile_only;
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn public_timer_add_cancel_signature_exists() {
         fn _compile_only(e: &Engine) {
@@ -5559,6 +5612,7 @@ mod tests {
         let _ = _compile_only;
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn public_timer_id_packing_roundtrip() {
         let id = crate::tcp_timer_wheel::TimerId { slot: 0xAABB_CCDD, generation: 0x1122_3344 };
@@ -5569,6 +5623,7 @@ mod tests {
         assert_eq!(unpacked.generation, 0x1122_3344);
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn align_up_to_tick_zero_and_boundary() {
         assert_eq!(crate::engine::align_up_to_tick_ns(0), 0);
@@ -5582,6 +5637,7 @@ mod tests {
     /// TIME_WAIT conn whose `force_tw_skip` flag is set even when the
     /// 2×MSL deadline is still in the future. The flag is seeded by
     /// `close_conn_with_flags` in Task 10 when `ts_enabled` is true.
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn force_tw_skip_short_circuits_reap() {
         use crate::flow_table::{FlowTable, FourTuple};
@@ -5646,6 +5702,7 @@ mod a_hw_port_config_tests {
 
     use super::and_offload_with_miss_counter;
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn offload_miss_bumps_counter_returns_zero() {
         let ctr = AtomicU64::new(0);
@@ -5656,6 +5713,7 @@ mod a_hw_port_config_tests {
         assert_eq!(ctr.load(Ordering::Relaxed), 1);
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn offload_present_no_bump_returns_bit() {
         let ctr = AtomicU64::new(0);
@@ -5666,6 +5724,7 @@ mod a_hw_port_config_tests {
         assert_eq!(ctr.load(Ordering::Relaxed), 0);
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn offload_not_requested_noop() {
         let ctr = AtomicU64::new(0);

@@ -627,6 +627,7 @@ mod tests {
         }
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn new_client_sets_iss_both_una_and_nxt() {
         let c = TcpConn::new_client(
@@ -645,12 +646,14 @@ mod tests {
         assert_eq!(c.state, TcpState::Closed);
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn rcv_wnd_clamped_to_u16_max_without_wscale() {
         let c = TcpConn::new_client(tuple(), 0, 1460, 1_000_000, 1024, 5000, 5000, 1_000_000);
         assert_eq!(c.rcv_wnd, u16::MAX as u32);
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn send_queue_push_respects_cap() {
         let mut sq = SendQueue::new(4);
@@ -659,6 +662,7 @@ mod tests {
         assert_eq!(sq.free_space(), 0);
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn recv_queue_buffered_bytes_starts_zero_and_matches_free_space() {
         // A6.6 Task 3: `RecvQueue::append` is retired (the VecDeque<u8>
@@ -671,6 +675,7 @@ mod tests {
         assert_eq!(rq.free_space(), 3);
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn fin_acked_checks_fin_seq_plus_one() {
         let mut c = TcpConn::new_client(tuple(), 100, 1460, 1024, 2048, 5000, 5000, 1_000_000);
@@ -681,6 +686,7 @@ mod tests {
         assert!(c.fin_has_been_acked(500));
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn recv_queue_has_reorder_field_and_shares_cap() {
         let rq = RecvQueue::new(1024);
@@ -690,6 +696,7 @@ mod tests {
         assert_eq!(rq.free_space_total(), 1024);
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn a4_options_fields_default_to_not_negotiated() {
         let c = TcpConn::new_client(tuple(), 1000, 1460, 1024, 2048, 5000, 5000, 1_000_000);
@@ -704,6 +711,7 @@ mod tests {
         assert!(!c.sack_enabled);
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn a4_sack_scoreboard_starts_empty() {
         let c = TcpConn::new_client(tuple(), 1000, 1460, 1024, 2048, 5000, 5000, 1_000_000);
@@ -711,6 +719,7 @@ mod tests {
         assert_eq!(c.sack_scoreboard.len(), 0);
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn a4_last_sack_trigger_starts_none() {
         // F-8 RFC 2018 §4 MUST-26: conn.last_sack_trigger is set by
@@ -720,12 +729,14 @@ mod tests {
         assert!(c.last_sack_trigger.is_none());
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn new_client_timer_ids_starts_empty() {
         let c = TcpConn::new_client(tuple(), 1, 1460, 1024, 2048, 5000, 5000, 1_000_000);
         assert!(c.timer_ids.is_empty());
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn a5_conn_starts_with_empty_snd_retrans_and_default_rtt() {
         let c = TcpConn::new_client(tuple(), 100, 1460, 1024, 2048, 5000, 5000, 1_000_000);
@@ -739,6 +750,7 @@ mod tests {
         assert!(!c.rto_no_backoff);
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn a5_conn_has_default_rack_state() {
         let c = TcpConn::new_client(tuple(), 1, 1460, 1024, 2048, 5000, 5000, 1_000_000);
@@ -756,6 +768,7 @@ mod tests {
     // direct-construct conn (bypassing `connect_with_opts`) has a working
     // `tlp_arm_gate_passes()` budget. All other TLP fields remain
     // zero/false/None (that still maps to A5 behavior).
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn a5_5_tlp_tuning_fields_default_init_on_new_client() {
         let c = TcpConn::new_client(tuple(), 1, 1460, 1024, 2048, 5000, 5000, 1_000_000);
@@ -777,6 +790,7 @@ mod tests {
         assert_eq!(c.syn_tx_ts_ns, 0);
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn a5_5_tlp_config_projects_fields() {
         let mut c = TcpConn::new_client(tuple(), 1, 1460, 1024, 2048, 5000, 5000, 1_000_000);
@@ -789,6 +803,7 @@ mod tests {
         assert!(cfg.skip_flight_size_gate);
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn a5_5_tlp_config_u32_max_means_no_floor() {
         let mut c = TcpConn::new_client(tuple(), 1, 1460, 1024, 2048, 5000, 5000, 1_000_000);
@@ -798,6 +813,7 @@ mod tests {
         assert_eq!(cfg.floor_us, 0, "u32::MAX sentinel must project to 0");
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn a6_new_fields_zero_init_after_new_client() {
         let c = TcpConn::new_client(
@@ -834,6 +850,7 @@ mod a5_5_stats_tests {
         TcpConn::new_client(tuple(), 0, 1460, 1024, 2048, 5000, 5000, 1_000_000)
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn stats_projects_send_path_fields() {
         let mut c = make_test_conn();
@@ -846,6 +863,7 @@ mod a5_5_stats_tests {
         assert_eq!(s.snd_wnd, 65535);
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn stats_before_any_rtt_sample_returns_zero_except_rto() {
         let c = make_test_conn();
@@ -856,6 +874,7 @@ mod a5_5_stats_tests {
         assert_eq!(s.rto_us, c.rtt_est.rto_us());
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn stats_send_buf_bytes_free_saturates_at_zero() {
         let mut c = make_test_conn();
@@ -884,6 +903,7 @@ mod a5_5_tlp_hook_tests {
         });
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn tlp_arm_gate_rejects_when_retrans_empty() {
         let mut c = make_test_conn();
@@ -892,6 +912,7 @@ mod a5_5_tlp_hook_tests {
         assert!(!c.tlp_arm_gate_passes());
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn tlp_arm_gate_rejects_when_timer_already_armed() {
         let mut c = make_test_conn();
@@ -905,6 +926,7 @@ mod a5_5_tlp_hook_tests {
         assert!(!c.tlp_arm_gate_passes());
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn tlp_arm_gates_reject_when_budget_exhausted() {
         let mut c = make_test_conn();
@@ -915,6 +937,7 @@ mod a5_5_tlp_hook_tests {
         assert!(!c.tlp_arm_gate_passes());
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn tlp_arm_gates_pass_when_under_budget_and_sample_seen() {
         let mut c = make_test_conn();
@@ -927,6 +950,7 @@ mod a5_5_tlp_hook_tests {
         assert!(c.tlp_arm_gate_passes());
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn tlp_arm_gate_rejects_without_rtt_sample_seen_when_not_skipped() {
         let mut c = make_test_conn();
@@ -938,6 +962,7 @@ mod a5_5_tlp_hook_tests {
         assert!(!c.tlp_arm_gate_passes());
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn tlp_arm_gate_bypasses_rtt_sample_check_when_skip_flag_set() {
         let mut c = make_test_conn();
@@ -952,6 +977,7 @@ mod a5_5_tlp_hook_tests {
         assert!(c.tlp_arm_gate_passes());
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn tlp_arm_gate_rejects_when_srtt_absent() {
         // A5.5 Task 15: gate rejects when SRTT is unavailable. Post
@@ -968,6 +994,7 @@ mod a5_5_tlp_hook_tests {
         assert!(!c.tlp_arm_gate_passes());
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn on_tlp_fire_records_probe_bumps_counter_clears_flag() {
         let mut c = make_test_conn();
@@ -987,6 +1014,7 @@ mod a5_5_tlp_hook_tests {
         assert_eq!(c.tlp_recent_probes_next_slot, 1);
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn on_tlp_fire_wraps_ring_at_slot_5() {
         let mut c = make_test_conn();
@@ -998,6 +1026,7 @@ mod a5_5_tlp_hook_tests {
         assert_eq!(c.tlp_recent_probes[1].unwrap().seq, 1);
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn on_tlp_fire_budget_saturates_at_u8_max() {
         let mut c = make_test_conn();
@@ -1006,6 +1035,7 @@ mod a5_5_tlp_hook_tests {
         assert_eq!(c.tlp_consecutive_probes_fired, u8::MAX);
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn on_rtt_sample_tlp_hook_resets_budget_and_sets_sample_seen() {
         let mut c = make_test_conn();
@@ -1018,6 +1048,7 @@ mod a5_5_tlp_hook_tests {
         assert!(c.tlp_rtt_sample_seen_since_last_tlp);
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn on_new_data_ack_tlp_hook_resets_budget_only() {
         let mut c = make_test_conn();
@@ -1036,6 +1067,7 @@ mod a5_5_dsack_attribution {
     use super::a5_5_stats_tests::make_test_conn;
     use super::RecentProbe;
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn attribute_dsack_matches_recent_probe_within_window() {
         let mut c = make_test_conn();
@@ -1054,6 +1086,7 @@ mod a5_5_dsack_attribution {
         assert!(c.tlp_recent_probes[0].as_ref().unwrap().attributed);
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn attribute_dsack_outside_window_skips_probe() {
         let mut c = make_test_conn();
@@ -1071,6 +1104,7 @@ mod a5_5_dsack_attribution {
         assert!(!c.tlp_recent_probes[0].as_ref().unwrap().attributed);
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn attribute_dsack_does_not_double_count_same_probe() {
         let mut c = make_test_conn();
@@ -1089,6 +1123,7 @@ mod a5_5_dsack_attribution {
         assert!(!second); // already attributed
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn attribute_dsack_partial_block_coverage_skips_probe() {
         let mut c = make_test_conn();
@@ -1106,6 +1141,7 @@ mod a5_5_dsack_attribution {
         assert!(!attributed);
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn attribute_dsack_with_no_probes_in_ring_returns_false() {
         let mut c = make_test_conn();
@@ -1122,6 +1158,7 @@ mod a5_5_syn_srtt_seed {
     use super::a5_5_stats_tests::make_test_conn;
     use crate::engine::DEFAULT_RTT_HISTOGRAM_EDGES_US;
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn syn_rtt_seed_absorbs_first_sample() {
         let mut c = make_test_conn();
@@ -1137,6 +1174,7 @@ mod a5_5_syn_srtt_seed {
         assert_eq!(c.rtt_histogram.buckets[12], 1);
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn syn_rtt_seed_karns_rule_skips_retransmits() {
         let mut c = make_test_conn();
@@ -1151,6 +1189,7 @@ mod a5_5_syn_srtt_seed {
         assert!(c.rtt_histogram.buckets.iter().all(|&b| b == 0));
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn syn_rtt_seed_rejects_zero_syn_tx_ts() {
         let mut c = make_test_conn();
@@ -1164,6 +1203,7 @@ mod a5_5_syn_srtt_seed {
         assert!(c.rtt_histogram.buckets.iter().all(|&b| b == 0));
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn syn_rtt_seed_rejects_out_of_bounds_rtt() {
         let mut c = make_test_conn();

@@ -263,6 +263,7 @@ mod tests {
         }
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn add_and_fire_short_timer() {
         let mut w = TimerWheel::new(8);
@@ -271,6 +272,7 @@ mod tests {
         assert_eq!(fired.len(), 1);
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn advance_with_no_tick_skips() {
         let mut w = TimerWheel::new(8);
@@ -279,6 +281,7 @@ mod tests {
         assert_eq!(w.last_tick, 0);
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn level_math_level0_level1() {
         assert_eq!(level_and_bucket_offset(1), (0, 1));
@@ -286,6 +289,7 @@ mod tests {
         assert_eq!(level_and_bucket_offset(256), (1, 1));
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn long_timer_cascades() {
         let mut w = TimerWheel::new(8);
@@ -295,6 +299,7 @@ mod tests {
         assert_eq!(w.advance(3_000_000).len(), 1);
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn cancel_tombstones_the_slot() {
         let mut w = TimerWheel::new(8);
@@ -305,6 +310,7 @@ mod tests {
         assert!(!w.cancel(id));
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn cancel_stale_id_after_reuse_is_noop() {
         let mut w = TimerWheel::new(8);
@@ -317,6 +323,7 @@ mod tests {
         assert_eq!(fired[0].0, id_b);
     }
 
+    #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
     #[test]
     fn timer_node_carries_user_data_through_fire() {
         let mut w = TimerWheel::new(8);
