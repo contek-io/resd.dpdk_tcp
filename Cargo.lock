@@ -154,6 +154,7 @@ version = "0.1.0"
 dependencies = [
  "cbindgen",
  "dpdk-net-core",
+ "dpdk-net-sys",
  "libc",
 ]
 

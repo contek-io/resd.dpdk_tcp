@@ -102,3 +102,65 @@ impl Mbuf {
 // serializes; `SendRetrans` lives per-conn inside `TcpConn`, which is
 // accessed by one engine lcore at a time. Matches `Mempool`'s Send impl.
 unsafe impl Send for Mbuf {}
+
+/// A6.5 Task 4c: RAII wrapper for a DPDK mbuf reference. Decrements
+/// refcount on drop, returning the mbuf to its mempool when the count
+/// reaches zero.
+///
+/// Used by `TcpConn::recv::last_read_mbufs` to pin mbufs across an event
+/// emission window: the engine bumps refcount + wraps in `MbufHandle`
+/// when a READABLE event is queued; clearing `last_read_mbufs` at the
+/// start of the next poll drops every handle, releasing the pins.
+///
+/// Ownership contract: construction via `from_raw` transfers one
+/// refcount from the caller to the handle. Drop decrements that one
+/// refcount. The pointer is never null (caller must bump refcount
+/// before constructing, so the pointed-to mbuf is live). Cloning is
+/// NOT supported — that would require a refcount bump at clone time,
+/// which callers can do explicitly via `shim_rte_mbuf_refcnt_update`
+/// + another `from_raw` if needed.
+pub struct MbufHandle {
+    ptr: NonNull<sys::rte_mbuf>,
+}
+
+impl MbufHandle {
+    /// Wrap an already-refcount-bumped mbuf pointer. The caller transfers
+    /// one unit of refcount ownership to this handle; dropping the
+    /// handle decrements the refcount by one.
+    ///
+    /// # Safety
+    /// Caller guarantees `ptr` points to a live mbuf with at least one
+    /// refcount owned by the caller (which this handle takes ownership
+    /// of). After this call, the caller MUST NOT release that refcount
+    /// on its own — it's the handle's responsibility now.
+    #[inline]
+    pub unsafe fn from_raw(ptr: NonNull<sys::rte_mbuf>) -> Self {
+        Self { ptr }
+    }
+
+    #[inline]
+    pub fn as_ptr(&self) -> *mut sys::rte_mbuf {
+        self.ptr.as_ptr()
+    }
+
+    #[inline]
+    pub fn as_non_null(&self) -> NonNull<sys::rte_mbuf> {
+        self.ptr
+    }
+}
+
+impl Drop for MbufHandle {
+    fn drop(&mut self) {
+        // SAFETY: `ptr` was validated at construction and the handle
+        // owns exactly one refcount. The decrement may take the count
+        // to zero and return the mbuf to its mempool, which is the
+        // intended end-of-life behaviour.
+        unsafe {
+            sys::shim_rte_mbuf_refcnt_update(self.ptr.as_ptr(), -1);
+        }
+    }
+}
+
+// SAFETY: MbufHandle holds a raw mbuf pointer but the engine serializes
+// access on one lcore. Matches the `Send` story on `Mbuf` / `Mempool`.
+unsafe impl Send for MbufHandle {}

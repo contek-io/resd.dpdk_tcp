@@ -1584,9 +1584,10 @@ impl Engine {
     }
 
     /// One iteration of the run-to-completion loop.
-    /// A3: clears each conn's per-poll `last_read_buf` accumulator,
-    /// drains an RX burst, dispatches frames through the L2/L3/TCP
-    /// pipeline, then reaps any TIME_WAIT flows past their 2×MSL deadline.
+    /// A3: clears each conn's per-poll `last_read_mbufs` list (dropping
+    /// the held `MbufHandle` refcounts), drains an RX burst, dispatches
+    /// frames through the L2/L3/TCP pipeline, then reaps any TIME_WAIT
+    /// flows past their 2×MSL deadline.
     pub fn poll_once(&self) -> usize {
         use crate::counters::{add, inc};
         use std::sync::atomic::Ordering;
@@ -1598,15 +1599,16 @@ impl Engine {
         self.rx_drop_nomem_prev
             .set(self.counters.eth.rx_drop_nomem.load(Ordering::Relaxed));
 
-        // Clear per-conn last_read_buf so prior borrowed views are
-        // invalidated per spec §4.2, before any rx_frame dispatches
-        // can append new data this iteration.
+        // Clear per-conn last_read_mbufs so prior event-window mbuf
+        // pins are released (MbufHandle::Drop decrements refcount) per
+        // spec §4.2, before any rx_frame dispatches can push fresh
+        // refs this iteration.
         {
             let mut ft = self.flow_table.borrow_mut();
             let handles: Vec<_> = ft.iter_handles().collect();
             for h in handles {
                 if let Some(c) = ft.get_mut(h) {
-                    c.recv.last_read_buf.clear();
+                    c.recv.last_read_mbufs.clear();
                 }
             }
         }
@@ -2811,10 +2813,10 @@ impl Engine {
                     tcp_bytes_offset_in_mbuf.saturating_add(parsed.header_len as u16);
                 // SAFETY: `mb` came from the active rx_burst iteration in
                 // `poll_once`, which has not yet called
-                // `resd_rte_pktmbuf_free` on it. The refcount bump is
+                // `shim_rte_pktmbuf_free` on it. The refcount bump is
                 // ordered before any queue store.
                 unsafe {
-                    sys::resd_rte_mbuf_refcnt_update(mb.as_ptr(), 1);
+                    sys::shim_rte_mbuf_refcnt_update(mb.as_ptr(), 1);
                 }
                 Some(MbufInsertCtx {
                     mbuf: mb,
@@ -2827,7 +2829,7 @@ impl Engine {
             None
         };
 
-        let outcome = {
+        let mut outcome = {
             let mut ft = self.flow_table.borrow_mut();
             let Some(conn) = ft.get_mut(handle) else {
                 // Rare race: conn lookup succeeded above but a concurrent
@@ -2835,7 +2837,7 @@ impl Engine {
                 // refcount up-bump if we did one.
                 if let Some(ctx) = mbuf_ctx {
                     unsafe {
-                        sys::resd_rte_mbuf_refcnt_update(ctx.mbuf.as_ptr(), -1);
+                        sys::shim_rte_mbuf_refcnt_update(ctx.mbuf.as_ptr(), -1);
                     }
                 }
                 return 0;
@@ -2874,14 +2876,14 @@ impl Engine {
         //   3. Segment dropped before the OOO-insert site (e.g. PAWS,
         //      bad-seq, out-of-window). All such paths leave
         //      `mbuf_ref_retained = false`.
-        // In all rollback cases, the subsequent `resd_rte_pktmbuf_free`
+        // In all rollback cases, the subsequent `shim_rte_pktmbuf_free`
         // on the original RX-burst reference will release the mbuf to
         // its mempool. When `mbuf_ref_retained = true`, the queued ref
         // keeps the mbuf alive until drain or eviction.
         if let Some(ctx) = mbuf_ctx {
             if !outcome.mbuf_ref_retained {
                 unsafe {
-                    sys::resd_rte_mbuf_refcnt_update(ctx.mbuf.as_ptr(), -1);
+                    sys::shim_rte_mbuf_refcnt_update(ctx.mbuf.as_ptr(), -1);
                 }
             }
         }
@@ -3148,7 +3150,26 @@ impl Engine {
         }
 
         if outcome.delivered > 0 {
-            self.deliver_readable(handle, outcome.delivered, hw_rx_ts);
+            // A6.5 Task 4c: pin the RX mbuf (in-order portion) and each
+            // drained mbuf (from the reorder queue's gap-close) via
+            // `conn.recv.last_read_mbufs`, then emit one READABLE event
+            // per pinned mbuf. Drained mbufs already carry a refcount
+            // handed off from the queue; the RX mbuf needs an explicit
+            // bump so the pin outlives the post-dispatch
+            // `rte_pktmbuf_free` on the original RX-burst ref.
+            let in_order_offset = mbuf_ctx
+                .as_ref()
+                .map(|ctx| ctx.payload_offset)
+                .unwrap_or(0);
+            self.deliver_readable(
+                handle,
+                rx_mbuf,
+                in_order_offset,
+                outcome.in_order_delivered_from_seg,
+                std::mem::take(&mut outcome.drained_mbufs),
+                outcome.delivered,
+                hw_rx_ts,
+            );
         }
 
         if outcome.buf_full_drop > 0 {
@@ -3481,43 +3502,130 @@ impl Engine {
         }
     }
 
-    /// `rx_hw_ts_ns` — NIC-provided RX timestamp captured at the per-mbuf
-    /// decode boundary in `poll_once` and threaded through the RX frame
-    /// path. Stored on the `Readable` event verbatim. Mbuf is no longer
-    /// in scope here (data has already moved from mbuf to `conn.recv.bytes`),
-    /// so this parameter is the only way to surface the NIC timestamp to
-    /// the event consumer. `0` on ENA / feature-off (spec §10.3, §10.5).
-    fn deliver_readable(&self, handle: ConnHandle, delivered: u32, rx_hw_ts_ns: u64) {
+    /// A6.5 Task 4c: pin each delivered-payload mbuf in
+    /// `conn.recv.last_read_mbufs` and emit one READABLE event per
+    /// pinned mbuf.
+    ///
+    /// Ownership model: the in-order mbuf (`rx_mbuf`) gets an explicit
+    /// refcount bump here so the pin outlives the post-dispatch
+    /// `rte_pktmbuf_free` on the original RX-burst ref. Each entry in
+    /// `drained_mbufs` already carries a refcount handoff from the
+    /// reorder queue — it's moved straight into an `MbufHandle`
+    /// without a bump. `MbufHandle::Drop` decrements the count at
+    /// `last_read_mbufs.clear()` time on the next poll-start.
+    ///
+    /// `rx_hw_ts_ns`: NIC-provided RX timestamp captured at the per-
+    /// mbuf decode boundary in `poll_once` and threaded through the
+    /// RX frame path. Stored on each `Readable` event verbatim. `0`
+    /// on ENA / feature-off (spec §10.3, §10.5).
+    ///
+    /// `in_order_offset`: offset of the segment's payload within the
+    /// RX mbuf's data region (from `MbufInsertCtx.payload_offset`).
+    /// `in_order_len`: bytes of this segment's payload delivered
+    /// in-order (`Outcome::in_order_delivered_from_seg`). Zero when
+    /// the segment itself delivered nothing directly (e.g. a pure
+    /// drain-triggering in-order segment that was all in-order from
+    /// reorder, which is impossible — but guard anyway).
+    ///
+    /// `drained_mbufs`: list of reorder-queue mbufs consumed by the
+    /// gap-close drain. Each carries a refcount owned by the caller.
+    /// Pops `total_delivered` bytes from `conn.recv.bytes` to keep
+    /// the recv-buffer invariant ("everything delivered this
+    /// dispatch is flushed from the in-order VecDeque before the
+    /// next ACK re-advertises free_space"). A6.6 retires the
+    /// VecDeque entirely.
+    #[allow(clippy::too_many_arguments)]
+    fn deliver_readable(
+        &self,
+        handle: ConnHandle,
+        rx_mbuf: Option<std::ptr::NonNull<sys::rte_mbuf>>,
+        in_order_offset: u16,
+        in_order_len: u32,
+        drained_mbufs: smallvec::SmallVec<[crate::tcp_reassembly::DrainedMbuf; 4]>,
+        total_delivered: u32,
+        rx_hw_ts_ns: u64,
+    ) {
         use crate::counters::add;
         let mut ft = self.flow_table.borrow_mut();
         let Some(conn) = ft.get_mut(handle) else {
+            // Rare race — conn gone. Drain's DrainedMbufs still hold
+            // refcount refs; wrap each in a handle and drop them so
+            // the refcounts are released. rx_mbuf is NOT bumped yet
+            // (we bump only when we push the handle), so no action
+            // there.
+            for d in drained_mbufs {
+                // SAFETY: queue handed off exactly one refcount per
+                // entry; wrapping in MbufHandle transfers that to the
+                // handle which drops it via refcnt_update(-1).
+                unsafe {
+                    let _ = crate::mempool::MbufHandle::from_raw(d.mbuf);
+                }
+            }
             return;
         };
-        // Append delivered bytes to last_read_buf (do NOT clear — the poll
-        // entry point clears once per iteration so multiple Readable events
-        // within one poll stack contiguously in the buffer).
-        let byte_offset = conn.recv.last_read_buf.len() as u32;
-        conn.recv.last_read_buf.reserve(delivered as usize);
-        let (a, b) = conn.recv.bytes.as_slices();
-        let from_a = a.len().min(delivered as usize);
-        conn.recv.last_read_buf.extend_from_slice(&a[..from_a]);
-        let remaining = delivered as usize - from_a;
-        conn.recv.last_read_buf.extend_from_slice(&b[..remaining]);
-        for _ in 0..delivered {
+
+        // In-order portion from the RX mbuf: push one handle + emit
+        // one event. Skip when there's no in-order byte count (e.g.
+        // the whole delivery came from drain — `rx_mbuf`/`in_order_len`
+        // are still coherent but we'd emit an empty event).
+        if let (Some(mb), true) = (rx_mbuf, in_order_len > 0) {
+            // Bump refcount: pin beyond the post-dispatch
+            // `rte_pktmbuf_free`. Handle drops it on next clear.
+            // SAFETY: `mb` is the live RX mbuf from the rx_burst
+            // iteration; refcount >= 1.
+            unsafe {
+                sys::shim_rte_mbuf_refcnt_update(mb.as_ptr(), 1);
+            }
+            let handle_mbuf = unsafe { crate::mempool::MbufHandle::from_raw(mb) };
+            let mbuf_idx = conn.recv.last_read_mbufs.len() as u32;
+            conn.recv.last_read_mbufs.push(handle_mbuf);
+            self.events.borrow_mut().push(
+                InternalEvent::Readable {
+                    conn: handle,
+                    mbuf_idx,
+                    payload_offset: in_order_offset as u32,
+                    payload_len: in_order_len,
+                    rx_hw_ts_ns,
+                    emitted_ts_ns: crate::clock::now_ns(),
+                },
+                &self.counters,
+            );
+        }
+
+        // Drained portion from the reorder queue: one handle + one
+        // event per entry. Each entry already carries a refcount
+        // handed off from the queue — just wrap it.
+        for d in drained_mbufs {
+            // SAFETY: queue transferred one refcount to this entry;
+            // `from_raw` takes ownership of that count.
+            let handle_mbuf = unsafe { crate::mempool::MbufHandle::from_raw(d.mbuf) };
+            let mbuf_idx = conn.recv.last_read_mbufs.len() as u32;
+            conn.recv.last_read_mbufs.push(handle_mbuf);
+            self.events.borrow_mut().push(
+                InternalEvent::Readable {
+                    conn: handle,
+                    mbuf_idx,
+                    payload_offset: d.offset as u32,
+                    payload_len: d.len as u32,
+                    rx_hw_ts_ns,
+                    emitted_ts_ns: crate::clock::now_ns(),
+                },
+                &self.counters,
+            );
+        }
+
+        // Drain the in-order VecDeque to preserve the recv-buffer
+        // invariant: deliver_readable empties `conn.recv.bytes` of
+        // everything delivered this dispatch so the advertised window
+        // on the next ACK reflects "all delivered bytes are gone from
+        // the buffer". A6.6 retires the VecDeque entirely; until
+        // then, this pop_front loop keeps flow-control accounting
+        // consistent with pre-A6.5 behaviour.
+        for _ in 0..total_delivered {
             conn.recv.bytes.pop_front();
         }
         drop(ft);
-        add(&self.counters.tcp.recv_buf_delivered, delivered as u64);
-        self.events.borrow_mut().push(
-            InternalEvent::Readable {
-                conn: handle,
-                byte_offset,
-                byte_len: delivered,
-                rx_hw_ts_ns,
-                emitted_ts_ns: crate::clock::now_ns(),
-            },
-            &self.counters,
-        );
+        add(&self.counters.tcp.recv_buf_delivered, total_delivered as u64);
     }
 
     /// Open a new client-side connection. Emits a single SYN and

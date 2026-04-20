@@ -11,8 +11,9 @@ fn internal_event_carries_emitted_ts_ns_on_every_variant() {
     };
     let ev_readable = InternalEvent::Readable {
         conn: ConnHandle::default(),
-        byte_offset: 0,
-        byte_len: 0,
+        mbuf_idx: 0,
+        payload_offset: 0,
+        payload_len: 0,
         rx_hw_ts_ns: 0,
         emitted_ts_ns: 42,
     };
@@ -166,8 +167,9 @@ fn integration_event_queue_preserves_emitted_ts_ns_across_fifo_span() {
     q.push(
         InternalEvent::Readable {
             conn: 1,
-            byte_offset: 0,
-            byte_len: 1,
+            mbuf_idx: 0,
+            payload_offset: 0,
+            payload_len: 1,
             rx_hw_ts_ns: 0,
             emitted_ts_ns: ts[1],
         },

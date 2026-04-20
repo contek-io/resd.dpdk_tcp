@@ -47,10 +47,14 @@ pub struct RecvQueue {
     /// A4: out-of-order segments buffered past the in-order point.
     /// Shares `cap` with `bytes`; `free_space_total` reports combined room.
     pub reorder: crate::tcp_reassembly::ReorderQueue,
-    /// Scratch buffer for the borrow-view exposed to
-    /// `DPDK_NET_EVT_READABLE.data`. Cleared at the start of each
-    /// `dpdk_net_poll` on the owning engine (not here).
-    pub last_read_buf: Vec<u8>,
+    /// A6.5 Task 4c: mbuf handle list pinning payload windows for the
+    /// current poll's READABLE events. Cleared at the start of each
+    /// `dpdk_net_poll` on the owning engine (not here); each stored
+    /// `MbufHandle` drops its held refcount on clear, releasing the
+    /// pin. The public `DPDK_NET_EVT_READABLE.data` pointer lives
+    /// inside one of these mbufs for the duration of the event-
+    /// emission window.
+    pub last_read_mbufs: smallvec::SmallVec<[crate::mempool::MbufHandle; 4]>,
 }
 
 impl RecvQueue {
@@ -59,7 +63,7 @@ impl RecvQueue {
             bytes: VecDeque::with_capacity(cap as usize),
             cap,
             reorder: crate::tcp_reassembly::ReorderQueue::new(cap),
-            last_read_buf: Vec::new(),
+            last_read_mbufs: smallvec::SmallVec::new(),
         }
     }
 

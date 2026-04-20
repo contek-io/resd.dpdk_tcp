@@ -218,17 +218,25 @@ fn ahw_sw_fallback_counters_and_correctness() {
             all_events.push(ev.clone());
             if let InternalEvent::Readable {
                 conn,
-                byte_offset,
-                byte_len,
+                mbuf_idx,
+                payload_offset,
+                payload_len,
                 ..
             } = ev
             {
                 if *conn == handle {
                     let ft = engine.flow_table();
                     if let Some(c) = ft.get(handle) {
-                        let off = *byte_offset as usize;
-                        let len = *byte_len as usize;
-                        echoed.extend_from_slice(&c.recv.last_read_buf[off..off + len]);
+                        let idx = *mbuf_idx as usize;
+                        let mbuf_ptr = c.recv.last_read_mbufs[idx].as_ptr();
+                        let data_ptr = unsafe {
+                            (dpdk_net_sys::shim_rte_pktmbuf_data(mbuf_ptr) as *const u8)
+                                .add(*payload_offset as usize)
+                        };
+                        let slice = unsafe {
+                            std::slice::from_raw_parts(data_ptr, *payload_len as usize)
+                        };
+                        echoed.extend_from_slice(slice);
                     }
                 }
             }
@@ -522,17 +530,25 @@ fn ahw_sw_only_counters_and_correctness() {
             all_events.push(ev.clone());
             if let InternalEvent::Readable {
                 conn,
-                byte_offset,
-                byte_len,
+                mbuf_idx,
+                payload_offset,
+                payload_len,
                 ..
             } = ev
             {
                 if *conn == handle {
                     let ft = engine.flow_table();
                     if let Some(c) = ft.get(handle) {
-                        let off = *byte_offset as usize;
-                        let len = *byte_len as usize;
-                        echoed.extend_from_slice(&c.recv.last_read_buf[off..off + len]);
+                        let idx = *mbuf_idx as usize;
+                        let mbuf_ptr = c.recv.last_read_mbufs[idx].as_ptr();
+                        let data_ptr = unsafe {
+                            (dpdk_net_sys::shim_rte_pktmbuf_data(mbuf_ptr) as *const u8)
+                                .add(*payload_offset as usize)
+                        };
+                        let slice = unsafe {
+                            std::slice::from_raw_parts(data_ptr, *payload_len as usize)
+                        };
+                        echoed.extend_from_slice(slice);
                     }
                 }
             }

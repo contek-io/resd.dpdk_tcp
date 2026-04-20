@@ -11,6 +11,7 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 
 [dependencies]
 dpdk-net-core = { path = "../dpdk-net-core" }
+dpdk-net-sys = { path = "../dpdk-net-sys" }
 libc.workspace = true
 
 [build-dependencies]

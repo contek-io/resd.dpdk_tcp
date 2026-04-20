@@ -241,7 +241,7 @@ fn build_event_from_internal(
         },
         InternalEvent::Readable {
             conn,
-            byte_len,
+            payload_len,
             rx_hw_ts_ns,
             ..
         } => dpdk_net_event_t {
@@ -252,7 +252,7 @@ fn build_event_from_internal(
             u: dpdk_net_event_payload_t {
                 readable: dpdk_net_event_readable_t {
                     data: readable_view.0,
-                    data_len: *byte_len,
+                    data_len: *payload_len,
                 },
             },
         },
@@ -378,22 +378,39 @@ pub unsafe extern "C" fn dpdk_net_poll(
     }
     let mut filled: u32 = 0;
     e.drain_events(max_events, |ev, engine| {
-        // Resolve the `Readable` variant's data-view pointer into the
-        // connection's last_read_buf (Task 19 fix for multi-segment polls).
-        // Non-Readable variants ignore the tuple.
+        // A6.5 Task 4c: resolve the `Readable` variant's data-view
+        // pointer by dereferencing the pinned mbuf at
+        // `conn.recv.last_read_mbufs[mbuf_idx]` and adding
+        // `payload_offset`. The pin is valid until the next
+        // `dpdk_net_poll` clears `last_read_mbufs`. Non-Readable
+        // variants ignore the tuple.
         let readable_view: (*const u8, u32) = match ev {
             dpdk_net_core::tcp_events::InternalEvent::Readable {
                 conn,
-                byte_offset,
-                byte_len,
+                mbuf_idx,
+                payload_offset,
+                payload_len,
                 ..
             } => {
                 let ft = engine.flow_table();
                 match ft.get(*conn) {
                     Some(c) => {
-                        let off = *byte_offset as usize;
-                        let ptr = unsafe { c.recv.last_read_buf.as_ptr().add(off) };
-                        (ptr, *byte_len)
+                        let idx = *mbuf_idx as usize;
+                        if idx < c.recv.last_read_mbufs.len() {
+                            let mbuf_ptr = c.recv.last_read_mbufs[idx].as_ptr();
+                            // SAFETY: `mbuf_ptr` is live (MbufHandle
+                            // holds a refcount). `payload_offset` is
+                            // bounded by the mbuf's data region at
+                            // insert / in-order-delivery time.
+                            let data_ptr = unsafe {
+                                let base = dpdk_net_sys::shim_rte_pktmbuf_data(mbuf_ptr)
+                                    as *const u8;
+                                base.add(*payload_offset as usize)
+                            };
+                            (data_ptr, *payload_len)
+                        } else {
+                            (std::ptr::null(), 0)
+                        }
                     }
                     None => (std::ptr::null(), 0),
                 }
@@ -1008,8 +1025,9 @@ mod tests {
             },
             InternalEvent::Readable {
                 conn: ConnHandle::default(),
-                byte_offset: 0,
-                byte_len: 0,
+                mbuf_idx: 0,
+                payload_offset: 0,
+                payload_len: 0,
                 rx_hw_ts_ns: 0,
                 emitted_ts_ns: EMITTED,
             },

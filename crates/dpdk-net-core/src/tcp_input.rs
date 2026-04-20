@@ -7,6 +7,7 @@
 //! `rcv_nxt` or transitions state triggers an ACK on the same poll
 //! iteration (wired in the handlers via `TxAction::Ack`).
 
+use dpdk_net_sys as sys;
 use smallvec::SmallVec;
 
 use crate::flow_table::FourTuple;
@@ -49,7 +50,7 @@ pub struct ParsedSegment<'a> {
 /// false. Both happen in the engine's RX path.
 #[derive(Debug, Clone, Copy)]
 pub struct MbufInsertCtx {
-    pub mbuf: std::ptr::NonNull<resd_net_sys::rte_mbuf>,
+    pub mbuf: std::ptr::NonNull<dpdk_net_sys::rte_mbuf>,
     /// Offset (in bytes) of the TCP payload within the mbuf's data
     /// region. Equals `ETH_HDR_LEN + ip.header_len + tcp.header_len`
     /// at the RX decode boundary.
@@ -155,7 +156,12 @@ pub enum TxAction {
 }
 
 /// Outcome of dispatching a segment to a per-state handler.
-#[derive(Debug, Clone)]
+///
+/// Not `Clone`: `drained_mbufs` carries refcount handoffs from the
+/// reorder queue that must not be duplicated without a matching refcnt
+/// bump. The engine always consumes `Outcome` by-move via
+/// `std::mem::take` on the field.
+#[derive(Debug)]
 pub struct Outcome {
     pub tx: TxAction,
     pub new_state: Option<TcpState>,
@@ -245,6 +251,22 @@ pub struct Outcome {
     /// OOO insert at all) — the legacy engine paths do not touch
     /// refcount here.
     pub mbuf_ref_retained: bool,
+    /// A6.5 Task 4c: bytes of this segment's payload that were delivered
+    /// in-order directly from the RX mbuf (not via the reorder queue).
+    /// Equals `delivered` when there was no drain on gap-close; less
+    /// than `delivered` when some of the delivered bytes came from OOO
+    /// segments that were drained in the same dispatch. Zero when the
+    /// segment was OOO (went to reorder) or dropped. Used by the
+    /// engine's `deliver_readable` to know how many bytes of the RX
+    /// mbuf's payload to pin for the READABLE event.
+    pub in_order_delivered_from_seg: u32,
+    /// A6.5 Task 4c: mbufs drained from the reorder queue by
+    /// `drain_contiguous_from_mbuf` on this dispatch. The queue
+    /// transferred its per-segment refcount to each entry here; the
+    /// engine's `deliver_readable` consumes the list, wraps each in
+    /// an `MbufHandle`, and emits one READABLE event per entry. When
+    /// empty, no drain happened on this dispatch.
+    pub drained_mbufs: SmallVec<[crate::tcp_reassembly::DrainedMbuf; 4]>,
     pub connected: bool,
     pub closed: bool,
 }
@@ -276,6 +298,8 @@ impl Outcome {
             syn_retrans_timer_to_cancel: None,
             writable_hysteresis_fired: false,
             mbuf_ref_retained: false,
+            in_order_delivered_from_seg: 0,
+            drained_mbufs: SmallVec::new(),
             connected: false,
             closed: false,
         }
@@ -872,21 +896,53 @@ fn handle_established(
     // path (in-order delivery, pure-ACK, no OOO insert), this flag
     // stays false and the caller's rollback branch is skipped.
     let mut mbuf_ref_retained = false;
+    // A6.5 Task 4c: track the in-order bytes delivered directly from
+    // this segment's mbuf (vs. from the reorder queue drain). The
+    // engine's `deliver_readable` uses this to decide how many bytes
+    // of the RX mbuf's payload to pin for the READABLE event.
+    let mut in_order_delivered_from_seg = 0u32;
+    // A6.5 Task 4c: mbufs drained from the reorder queue by
+    // `drain_contiguous_from_mbuf` on gap-close. The queue transfers
+    // one refcount per entry to the caller; the engine wraps each in
+    // an `MbufHandle` and emits a READABLE event.
+    let mut drained_mbufs: SmallVec<[crate::tcp_reassembly::DrainedMbuf; 4]> = SmallVec::new();
     if !seg.payload.is_empty() {
         if seg.seq == conn.rcv_nxt {
             delivered = conn.recv.append(seg.payload);
             conn.rcv_nxt = conn.rcv_nxt.wrapping_add(delivered);
             buf_full_drop = (seg.payload.len() as u32).saturating_sub(delivered);
+            in_order_delivered_from_seg = delivered;
 
-            let (drained_bytes, drained_count) =
-                conn.recv.reorder.drain_contiguous_from(conn.rcv_nxt);
-            if !drained_bytes.is_empty() {
-                let appended = conn.recv.append(&drained_bytes);
+            // A6.5 Task 4c: zero-copy drain. Each `DrainedMbuf` carries
+            // a refcount ref handed off from the queue; the engine
+            // wraps them in `MbufHandle` and emits one READABLE per
+            // drained entry. We still append the drained bytes to
+            // `conn.recv.bytes` for flow-control accounting (the
+            // VecDeque's len participates in `free_space_total`);
+            // A6.6 retires that VecDeque entirely.
+            let drained = conn.recv.reorder.drain_contiguous_from_mbuf(conn.rcv_nxt);
+            let mut drained_count = 0u32;
+            for d in &drained {
+                // SAFETY: `d.mbuf` is live (queue held a refcount
+                // until this drain transferred it to the caller). The
+                // data range `[d.offset, d.offset + d.len)` is bounded
+                // by the mbuf's data_len at `insert_mbuf` time.
+                let payload_area = unsafe {
+                    let mbuf_ptr = d.mbuf.as_ptr();
+                    let base_ptr = sys::shim_rte_pktmbuf_data(mbuf_ptr) as *const u8;
+                    std::slice::from_raw_parts(
+                        base_ptr.add(d.offset as usize),
+                        d.len as usize,
+                    )
+                };
+                let appended = conn.recv.append(payload_area);
                 conn.rcv_nxt = conn.rcv_nxt.wrapping_add(appended);
-                buf_full_drop += (drained_bytes.len() as u32).saturating_sub(appended);
+                buf_full_drop += (d.len as u32).saturating_sub(appended);
                 delivered += appended;
+                drained_count += 1;
             }
             reassembly_hole_filled = drained_count;
+            drained_mbufs = drained;
         } else if seq_lt(conn.rcv_nxt, seg.seq) {
             let total_cap = conn.recv.free_space_total();
             if total_cap > 0 {
@@ -967,6 +1023,8 @@ fn handle_established(
         ts_recent_expired,
         writable_hysteresis_fired,
         mbuf_ref_retained,
+        in_order_delivered_from_seg,
+        drained_mbufs,
         ..Outcome::base()
     }
 }
@@ -1553,44 +1611,24 @@ mod tests {
         assert_eq!(c.last_sack_trigger, Some((5100, 5103)));
     }
 
-    #[test]
-    fn inorder_arrival_closes_hole_and_drains_reassembly() {
-        let mut c = est_conn(1000, 5000, 1024);
-        c.rcv_wnd = 4096;
-        let ooo = ParsedSegment {
-            src_port: 5000,
-            dst_port: 40000,
-            seq: 5010,
-            ack: 1001,
-            flags: TCP_ACK,
-            window: 65535,
-            header_len: 20,
-            payload: b"world",
-            options: &[],
-        };
-        let out_ooo = dispatch(&mut c, &ooo, &TEST_EDGES, TEST_SEND_BUF_BYTES, None);
-        assert_eq!(out_ooo.reassembly_queued_bytes, 5);
-        assert_eq!(c.rcv_nxt, 5001);
-
-        let inorder = ParsedSegment {
-            src_port: 5000,
-            dst_port: 40000,
-            seq: 5001,
-            ack: 1001,
-            flags: TCP_ACK | TCP_PSH,
-            window: 65535,
-            header_len: 20,
-            payload: b"ninebytes",
-            options: &[],
-        };
-        let out_in = dispatch(&mut c, &inorder, &TEST_EDGES, TEST_SEND_BUF_BYTES, None);
-        assert_eq!(out_in.delivered, 9 + 5);
-        assert_eq!(out_in.reassembly_hole_filled, 1);
-        assert_eq!(c.rcv_nxt, 5015);
-        assert!(c.recv.reorder.is_empty());
-        let got: Vec<u8> = c.recv.bytes.iter().copied().collect();
-        assert_eq!(&got, b"ninebytesworld");
-    }
+    // A6.5 Task 4c: the former `inorder_arrival_closes_hole_and_drains_reassembly`
+    // unit test was retired here because it relied on the legacy
+    // `insert(seq, &bytes)` path (Bytes-variant) followed by a drain.
+    // The drain now rejects Bytes entries by design (see
+    // `drain_mbuf_panics_on_bytes_variant`), and exercising the real
+    // MbufRef → drain loop from a pure-slice unit test requires a live
+    // `rte_mbuf` (buf_addr/data_off populated for `rte_pktmbuf_mtod`)
+    // which the unit-test harness does not have.
+    //
+    // Equivalent coverage now lives at two layers:
+    //   - OOO insert state: `established_ooo_segment_queues_into_reassembly`
+    //     (Bytes-variant, no drain — still valid).
+    //   - Gap-close drain + byte-level correctness:
+    //     `tcp_options_paws_reassembly_sack_tap` integration test, which
+    //     drives real mbufs end-to-end (RX decode → OOO insert → in-order
+    //     close → drain → READABLE event with bytes observed by the caller).
+    //   - Queue-layer drain contract: `tcp_reassembly::drain_mbuf_*` unit
+    //     tests (including the Bytes-variant panic contract).
 
     #[test]
     fn established_inorder_payload_does_not_flag_ooo() {

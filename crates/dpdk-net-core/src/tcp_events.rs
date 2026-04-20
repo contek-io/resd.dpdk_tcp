@@ -31,17 +31,25 @@ pub enum InternalEvent {
         rx_hw_ts_ns: u64,
         emitted_ts_ns: u64,
     },
-    /// `byte_len` bytes are available starting at the connection's
-    /// `recv.last_read_buf` scratch region. The caller promotes this
-    /// to a `(data, data_len)` view at the ABI boundary.
+    /// `payload_len` bytes are available starting at `payload_offset`
+    /// inside the mbuf at `conn.recv.last_read_mbufs[mbuf_idx]`. The
+    /// caller promotes this to a `(data, data_len)` view at the ABI
+    /// boundary by dereferencing the mbuf's data area and adding
+    /// `payload_offset`. The pin stays valid for the duration of the
+    /// event-emission window — until the next `dpdk_net_poll` clears
+    /// `last_read_mbufs` and drops every held `MbufHandle`.
     Readable {
         conn: ConnHandle,
-        /// Offset within `conn.recv.last_read_buf` where this event's bytes begin.
-        /// Multiple Readable events can fire per poll iteration; each one
-        /// describes a contiguous slice `last_read_buf[byte_offset..byte_offset+byte_len]`.
-        /// The buffer is cleared at the top of each `dpdk_net_poll`.
-        byte_offset: u32,
-        byte_len: u32,
+        /// A6.5 Task 4c: index into `conn.recv.last_read_mbufs`
+        /// identifying the mbuf whose payload region this event
+        /// references. One event per mbuf in A6.5; A6.6 will collapse
+        /// multi-segment mbufs into scatter-gather iovec events.
+        mbuf_idx: u32,
+        /// Offset (bytes) into the mbuf's data region where the
+        /// payload window starts.
+        payload_offset: u32,
+        /// Length (bytes) of the payload window.
+        payload_len: u32,
         rx_hw_ts_ns: u64,
         emitted_ts_ns: u64,
     },

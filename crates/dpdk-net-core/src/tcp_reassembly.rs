@@ -10,7 +10,7 @@
 //! mTCP-style `CanMerge` / `MergeFragments` semantics applied to
 //! copy-based `(seq, Vec<u8>)` entries.
 
-use resd_net_sys as sys;
+use dpdk_net_sys as sys;
 use smallvec::SmallVec;
 
 use crate::tcp_seq::{seq_le, seq_lt};
@@ -53,6 +53,31 @@ pub struct OooMbufRef {
 // lcore, so we add the marker impls to satisfy any container
 // bounds downstream.
 unsafe impl Send for OooMbufRef {}
+
+/// A6.5 Task 4c: drain return element. Carries one unit of refcount
+/// ownership transferred from the queue to the caller (the queue's
+/// per-segment ref becomes the caller's ref; no refcount op happens
+/// inside the drain on the kept path). Caller is responsible for
+/// releasing the refcount once the payload window is no longer needed
+/// — typically by wrapping the handed-off pointer in a
+/// [`crate::mempool::MbufHandle`] whose `Drop` decrements the count
+/// at the end of the event-emit window.
+///
+/// The `(offset, len)` pair describes the payload window within the
+/// mbuf's data region: `offset` is bytes from the start of the data
+/// area; `len` is the number of payload bytes that were retained past
+/// the drain's `rcv_nxt` cursor.
+#[derive(Debug)]
+pub struct DrainedMbuf {
+    pub mbuf: std::ptr::NonNull<sys::rte_mbuf>,
+    pub offset: u16,
+    pub len: u16,
+}
+
+// SAFETY: DrainedMbuf wraps a raw mbuf pointer; engine serializes
+// access on one lcore. Matches the `Send` story on `OooMbufRef` /
+// `Mbuf` / `Mempool`.
+unsafe impl Send for DrainedMbuf {}
 
 impl OooSegment {
     pub fn seq(&self) -> u32 {
@@ -387,7 +412,7 @@ impl ReorderQueue {
             // calling. We are bumping by a positive delta here, which is
             // always safe.
             unsafe {
-                sys::resd_rte_mbuf_refcnt_update(mbuf.as_ptr(), extra);
+                sys::shim_rte_mbuf_refcnt_update(mbuf.as_ptr(), extra);
             }
         }
         InsertOutcome {
@@ -440,18 +465,28 @@ impl ReorderQueue {
             // and return the mbuf to its mempool, which is the intended
             // end-of-life behavior.
             unsafe {
-                sys::resd_rte_mbuf_refcnt_update(m.mbuf.as_ptr(), -1);
+                sys::shim_rte_mbuf_refcnt_update(m.mbuf.as_ptr(), -1);
             }
         }
     }
 
-    /// Pop the contiguous prefix of segments whose seq range starts at
-    /// or before `rcv_nxt`. For each popped segment, yield the portion
-    /// of its payload that lies at or after `rcv_nxt`. Returns the
-    /// concatenated bytes and the number of segments drained.
-    pub fn drain_contiguous_from(&mut self, mut rcv_nxt: u32) -> (Vec<u8>, u32) {
-        let mut out = Vec::new();
-        let mut drained_segments = 0u32;
+    /// A6.5 Task 4c: zero-copy drain. Pop the contiguous prefix of
+    /// segments whose seq range starts at or before `rcv_nxt`. Returns
+    /// a `SmallVec` of `DrainedMbuf` refs; each entry transfers one
+    /// refcount from the queue to the caller (the queue's ref becomes
+    /// the caller's ref — no refcount bump or decrement happens inside
+    /// this function on the kept path; only stale segments fully
+    /// behind `rcv_nxt` decrement via `drop_segment_mbuf_ref`).
+    ///
+    /// Panics if a stored segment is the legacy `Bytes` variant — the
+    /// `Bytes` path is retired in Task 4d. Task 4c requires every
+    /// drain-producing path to go through `insert_mbuf`, which produces
+    /// `MbufRef` entries exclusively.
+    pub fn drain_contiguous_from_mbuf(
+        &mut self,
+        mut rcv_nxt: u32,
+    ) -> SmallVec<[DrainedMbuf; 4]> {
+        let mut out: SmallVec<[DrainedMbuf; 4]> = SmallVec::new();
 
         while !self.segments.is_empty() {
             let seg_seq = self.segments[0].seq();
@@ -466,43 +501,38 @@ impl ReorderQueue {
                 Self::drop_segment_mbuf_ref(&self.segments[0]);
                 self.total_bytes = self.total_bytes.saturating_sub(seg_len);
                 self.segments.remove(0);
-                drained_segments += 1;
                 continue;
             }
-            let skip = rcv_nxt.wrapping_sub(seg_seq) as usize;
-            match &self.segments[0] {
-                OooSegment::Bytes(b) => out.extend_from_slice(&b.payload[skip..]),
+            let skip = rcv_nxt.wrapping_sub(seg_seq) as u16;
+            let seg = self.segments.remove(0);
+            self.total_bytes = self.total_bytes.saturating_sub(seg_len);
+            match seg {
                 OooSegment::MbufRef(m) => {
-                    // A6.5 Task 4b shim: copy from the mbuf payload region.
-                    // Task 4c retires this by switching to a mbuf-list
-                    // return type so callers consume zero-copy refs. The
-                    // refcount decrement below (via drop_segment_mbuf_ref)
-                    // matches the insert-time up-bump.
-                    //
-                    // SAFETY: `m.mbuf` is still live (queue holds a
-                    // refcount). `m.offset + m.len` is bounded by the
-                    // mbuf's data_len at insert time; `skip <= m.len`
-                    // because `rcv_nxt < seg_end` (checked by the branch
-                    // above) and `seg_end - seg_seq == m.len`.
-                    let payload_area = unsafe {
-                        let mbuf_ptr = m.mbuf.as_ptr();
-                        let base_ptr =
-                            sys::resd_rte_pktmbuf_data(mbuf_ptr) as *const u8;
-                        std::slice::from_raw_parts(
-                            base_ptr.add(m.offset as usize),
-                            m.len as usize,
-                        )
-                    };
-                    out.extend_from_slice(&payload_area[skip..]);
+                    // Refcount handoff: queue's ref becomes caller's
+                    // ref. No refcount op here.
+                    out.push(DrainedMbuf {
+                        mbuf: m.mbuf,
+                        offset: m.offset + skip,
+                        len: m.len - skip,
+                    });
+                }
+                OooSegment::Bytes(_b) => {
+                    // The Bytes variant is still produced by the legacy
+                    // `insert()` path used by tcp_reassembly unit tests;
+                    // all engine-reachable drain paths go through
+                    // `insert_mbuf()` in Task 4b, which produces
+                    // `MbufRef` exclusively. Task 4d removes the Bytes
+                    // variant entirely. Panic here surfaces any
+                    // unexpected Bytes straggler in the drain path.
+                    panic!(
+                        "drain_contiguous_from_mbuf reached Bytes variant; \
+                         Task 4d not yet applied"
+                    );
                 }
             }
-            Self::drop_segment_mbuf_ref(&self.segments[0]);
             rcv_nxt = seg_end;
-            self.total_bytes = self.total_bytes.saturating_sub(seg_len);
-            self.segments.remove(0);
-            drained_segments += 1;
         }
-        (out, drained_segments)
+        out
     }
 }
 
@@ -621,65 +651,146 @@ mod tests {
         assert!(q.is_empty());
     }
 
+    // A6.5 Task 4c: `drain_contiguous_from_mbuf` unit tests. These tests
+    // exercise drain logic with MbufRef-variant segments only (the Bytes
+    // variant is retired from the drain path in Task 4c; panics on Bytes
+    // are caught here). Structural assertions only — the payload window
+    // `(offset, len)` is checked without dereferencing the fake mbuf
+    // pointer (which would be UB on `NonNull::dangling()`). Real-mbuf
+    // lifecycle is covered by the TAP integration tests + ahw_smoke.
+    //
+    // As with the `insert_mbuf_*` tests below, tests that store an
+    // `MbufRef` entry backed by `NonNull::dangling()` call
+    // `std::mem::forget(q)` at the end to bypass the `Drop` impl (which
+    // would decrement the refcount and thus deref the dangling pointer).
+
     #[test]
-    fn drain_with_no_contiguous_front_returns_empty() {
+    fn drain_mbuf_with_no_contiguous_front_returns_empty() {
         let mut q = ReorderQueue::new(1024);
-        q.insert(200, b"zzz");
-        let (bytes, n) = q.drain_contiguous_from(100);
-        assert!(bytes.is_empty());
-        assert_eq!(n, 0);
+        let fake_mbuf: std::ptr::NonNull<sys::rte_mbuf> = std::ptr::NonNull::dangling();
+        q.insert_mbuf(200, b"zzz", fake_mbuf, 64);
+        let drained = q.drain_contiguous_from_mbuf(100);
+        assert!(drained.is_empty());
         assert_eq!(q.len(), 1);
+        std::mem::forget(q);
     }
 
     #[test]
-    fn drain_single_adjacent_segment() {
+    fn drain_mbuf_single_adjacent_segment() {
         let mut q = ReorderQueue::new(1024);
-        q.insert(100, b"abc");
-        let (bytes, n) = q.drain_contiguous_from(100);
-        assert_eq!(&bytes, b"abc");
-        assert_eq!(n, 1);
+        let fake_mbuf: std::ptr::NonNull<sys::rte_mbuf> = std::ptr::NonNull::dangling();
+        q.insert_mbuf(100, b"abc", fake_mbuf, 64);
+        let drained = q.drain_contiguous_from_mbuf(100);
+        assert_eq!(drained.len(), 1);
+        assert_eq!(drained[0].offset, 64);
+        assert_eq!(drained[0].len, 3);
         assert!(q.is_empty());
         assert_eq!(q.total_bytes(), 0);
+        // Refcount handoff: drain transferred one ref to the caller.
+        // Forget `drained` so the caller's side of the handoff doesn't
+        // try to decrement; forget `q` so the Drop impl (which now has
+        // no segments) is a no-op. std::mem::forget on the SmallVec is
+        // safe because DrainedMbuf holds no owned resources itself.
+        std::mem::forget(drained);
     }
 
     #[test]
-    fn drain_chains_through_touching_segments() {
+    fn drain_mbuf_stops_at_gap() {
         let mut q = ReorderQueue::new(1024);
-        q.insert(100, b"aaa");
-        q.insert(103, b"bbb");
-        q.insert(200, b"zzz");
-        let (bytes, n) = q.drain_contiguous_from(100);
-        assert_eq!(&bytes, b"aaabbb");
-        assert_eq!(n, 1);
+        let fake_mbuf: std::ptr::NonNull<sys::rte_mbuf> = std::ptr::NonNull::dangling();
+        q.insert_mbuf(100, b"aaa", fake_mbuf, 10);
+        q.insert_mbuf(200, b"zzz", fake_mbuf, 20);
+        let drained = q.drain_contiguous_from_mbuf(100);
+        // Only the seq-100 entry drains; there's a gap [103, 200).
+        assert_eq!(drained.len(), 1);
+        assert_eq!(drained[0].offset, 10);
+        assert_eq!(drained[0].len, 3);
         assert_eq!(q.len(), 1);
         assert_eq!(q.segments()[0].seq(), 200);
+        std::mem::forget(drained);
+        // One MbufRef still in the queue; skip Drop to avoid UB deref.
+        std::mem::forget(q);
     }
 
     #[test]
-    fn drain_with_rcv_nxt_inside_segment_skips_prefix() {
+    fn drain_mbuf_chains_through_touching_segments() {
         let mut q = ReorderQueue::new(1024);
-        q.insert(100, b"abcdef");
-        let (bytes, n) = q.drain_contiguous_from(103);
-        assert_eq!(&bytes, b"def");
-        assert_eq!(n, 1);
+        let fake_mbuf: std::ptr::NonNull<sys::rte_mbuf> = std::ptr::NonNull::dangling();
+        // Adjacent MbufRef entries do NOT coalesce on insert (zero-copy
+        // contract), but DO drain together when rcv_nxt matches each
+        // one's start seq in turn.
+        q.insert_mbuf(100, b"aaa", fake_mbuf, 10);
+        q.insert_mbuf(103, b"bbb", fake_mbuf, 20);
+        q.insert_mbuf(200, b"zzz", fake_mbuf, 30);
+        let drained = q.drain_contiguous_from_mbuf(100);
+        assert_eq!(drained.len(), 2);
+        assert_eq!(drained[0].offset, 10);
+        assert_eq!(drained[0].len, 3);
+        assert_eq!(drained[1].offset, 20);
+        assert_eq!(drained[1].len, 3);
+        assert_eq!(q.len(), 1);
+        assert_eq!(q.segments()[0].seq(), 200);
+        std::mem::forget(drained);
+        std::mem::forget(q);
     }
 
     #[test]
-    fn drain_past_end_of_segment_drops_entirely() {
+    fn drain_mbuf_with_rcv_nxt_inside_segment_skips_prefix() {
+        let mut q = ReorderQueue::new(1024);
+        let fake_mbuf: std::ptr::NonNull<sys::rte_mbuf> = std::ptr::NonNull::dangling();
+        q.insert_mbuf(100, b"abcdef", fake_mbuf, 50);
+        let drained = q.drain_contiguous_from_mbuf(103);
+        assert_eq!(drained.len(), 1);
+        // skip = 3; offset bumps from 50 → 53; len shrinks from 6 → 3.
+        assert_eq!(drained[0].offset, 53);
+        assert_eq!(drained[0].len, 3);
+        std::mem::forget(drained);
+    }
+
+    #[test]
+    fn drain_mbuf_past_end_of_segment_drops_entirely() {
+        // When rcv_nxt is past the segment's end, the segment is stale
+        // and dropped via drop_segment_mbuf_ref — that call would deref
+        // the mbuf pointer to decrement the refcount. Use a real backing
+        // storage so the deref lands in valid memory (pattern mirrored
+        // from `insert_mbuf_spanning_multiple_existing_segments_...`).
+        let mut fake_mbuf_storage: Box<[u8; 256]> = Box::new([0u8; 256]);
+        let fake_mbuf: std::ptr::NonNull<sys::rte_mbuf> = unsafe {
+            std::ptr::NonNull::new_unchecked(
+                fake_mbuf_storage.as_mut_ptr() as *mut sys::rte_mbuf,
+            )
+        };
+        let mut q = ReorderQueue::new(1024);
+        q.insert_mbuf(100, b"abc", fake_mbuf, 10);
+        let drained = q.drain_contiguous_from_mbuf(200);
+        // Stale segment dropped (behind rcv_nxt), nothing handed off.
+        assert!(drained.is_empty());
+        assert!(q.is_empty());
+        drop(q);
+        // Force a read of the mutable binding so the compiler knows
+        // the storage was used; `_` suppresses the warning.
+        let _ = &mut fake_mbuf_storage;
+    }
+
+    #[test]
+    fn drain_mbuf_empty_queue_is_noop() {
+        let mut q = ReorderQueue::new(1024);
+        let drained = q.drain_contiguous_from_mbuf(500);
+        assert!(drained.is_empty());
+    }
+
+    #[test]
+    #[should_panic(expected = "Bytes variant")]
+    fn drain_mbuf_panics_on_bytes_variant() {
+        // Task 4c contract: the drain rejects any straggler Bytes
+        // segments. The legacy `insert` path (Bytes variant) is used
+        // only in A6.5 Task 6/7 unit tests that don't drain; any caller
+        // reaching drain with a Bytes entry has bypassed the MbufRef
+        // conversion and is a bug. Task 4d removes the Bytes variant
+        // entirely.
         let mut q = ReorderQueue::new(1024);
         q.insert(100, b"abc");
-        let (bytes, n) = q.drain_contiguous_from(200);
-        assert!(bytes.is_empty());
-        assert_eq!(n, 1);
-        assert!(q.is_empty());
-    }
-
-    #[test]
-    fn drain_empty_queue_is_noop() {
-        let mut q = ReorderQueue::new(1024);
-        let (bytes, n) = q.drain_contiguous_from(500);
-        assert!(bytes.is_empty());
-        assert_eq!(n, 0);
+        let _drained = q.drain_contiguous_from_mbuf(100);
     }
 
     // A6.5 Task 4b (Task 7): insert_mbuf unit tests. These tests exercise
