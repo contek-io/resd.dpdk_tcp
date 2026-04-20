@@ -543,8 +543,8 @@ fn knob_rtt_histogram_bucket_edges_us_override() {
 ///       way this knob's doc-comment claims (ON at default, OFF at 1).
 /// Functional bring-up behavior (the actual devarg emission + warn-line
 /// firing) is covered by T8's `dpdk_net_recommended_ena_devargs` unit
-/// tests and T9's `engine_new_warns_llq_overflow_risk_on_ena_without_large_hdr`
-/// + T11's real-ENA smoke.
+/// tests and T11's real-ENA smoke at `tests/ahw_smoke_ena_hw.rs`
+/// (asserts `llq_header_overflow_risk == 1` post-bring-up).
 #[test]
 fn knob_ena_large_llq_hdr_suppresses_overflow_risk_guard() {
     use dpdk_net_core::engine::EngineConfig;
