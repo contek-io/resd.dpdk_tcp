@@ -394,6 +394,11 @@ pub struct Engine {
     /// §7.6 scratch-reuse policy.
     pub(crate) tx_frame_scratch: RefCell<Vec<u8>>,
 
+    /// Per-poll scratch for copying a connection's timer-id list out
+    /// before cancel operations that would re-borrow the conn. A6.5
+    /// §7.6. N=8 covers observed P99 per-connection timer depth.
+    pub(crate) timer_ids_scratch: RefCell<SmallVec<[crate::tcp_timer_wheel::TimerId; 8]>>,
+
     /// A6 (spec §3.6 Site 3): snapshot of `counters.eth.rx_drop_nomem`
     /// at the top of `poll_once`; compared against the post-RX value at
     /// end-of-poll to emit exactly one `Error{err=-ENOMEM}` per iteration
@@ -869,6 +874,7 @@ impl Engine {
                     + crate::tcp_output::FRAME_HDRS_MIN
                     + 40,
             )),
+            timer_ids_scratch: RefCell::new(SmallVec::new()),
             rx_drop_nomem_prev: std::cell::Cell::new(0),
             tx_cksum_offload_active: outcome.tx_cksum_offload_active,
             rx_cksum_offload_active: outcome.rx_cksum_offload_active,
@@ -2301,12 +2307,19 @@ impl Engine {
         // transition so StateChange emission + state_trans[from][to]
         // counter bumps (spec §9.1 core TCP observability) are not
         // skipped.
+        // A6.5 Task 5: use Engine-owned SmallVec scratch instead of a
+        // per-call Vec. The RefMut guard is moved out of the block
+        // alongside `dropped_entries`; `timer_ids_scratch` is a distinct
+        // RefCell from `flow_table`, so the inner conn borrow drops with
+        // `ft` at the end of this block.
         let (timer_ids_to_cancel, dropped_entries) = {
             let mut ft = self.flow_table.borrow_mut();
             let Some(conn) = ft.get_mut(handle) else {
                 return;
             };
-            let mut ids: Vec<crate::tcp_timer_wheel::TimerId> = conn.timer_ids.to_vec();
+            let mut ids = self.timer_ids_scratch.borrow_mut();
+            ids.clear();
+            ids.extend_from_slice(&conn.timer_ids);
             if let Some(id) = conn.rto_timer_id.take() {
                 ids.push(id);
             }
@@ -2331,10 +2344,11 @@ impl Engine {
         // between `timer_ids` and the three named handles is benign.
         {
             let mut w = self.timer_wheel.borrow_mut();
-            for id in timer_ids_to_cancel {
-                w.cancel(id);
+            for id in timer_ids_to_cancel.iter() {
+                w.cancel(*id);
             }
         }
+        drop(timer_ids_to_cancel);
         // Phase 4: state transition via transition_conn — emits the
         // StateChange event and bumps state_trans[from][Closed], keeping
         // the observability contract intact on ETIMEDOUT force-close.
@@ -2411,10 +2425,14 @@ impl Engine {
             // A5: cancel any armed timers owned by this conn before
             // removing its slot. `cancel()` is idempotent (Task 5), so
             // overlap between `timer_ids` and named-handle fields is fine.
-            let to_cancel: Vec<crate::tcp_timer_wheel::TimerId> = {
+            // A6.5 Task 5: borrow Engine-owned scratch, clear, extend,
+            // drop before removing the slot.
+            let to_cancel = {
                 let ft = self.flow_table.borrow();
+                let mut ids = self.timer_ids_scratch.borrow_mut();
+                ids.clear();
                 if let Some(conn) = ft.get(h) {
-                    let mut ids: Vec<_> = conn.timer_ids.to_vec();
+                    ids.extend_from_slice(&conn.timer_ids);
                     if let Some(id) = conn.rto_timer_id {
                         ids.push(id);
                     }
@@ -2424,17 +2442,16 @@ impl Engine {
                     if let Some(id) = conn.syn_retrans_timer_id {
                         ids.push(id);
                     }
-                    ids
-                } else {
-                    Vec::new()
                 }
+                ids
             };
             {
                 let mut w = self.timer_wheel.borrow_mut();
-                for id in to_cancel {
-                    w.cancel(id);
+                for id in to_cancel.iter() {
+                    w.cancel(*id);
                 }
             }
+            drop(to_cancel);
             self.flow_table.borrow_mut().remove(h);
         }
     }
@@ -3049,10 +3066,14 @@ impl Engine {
                 // removing its slot. `cancel()` is idempotent (Task 5),
                 // so overlap between `timer_ids` and the named-handle
                 // fields is fine.
-                let to_cancel: Vec<crate::tcp_timer_wheel::TimerId> = {
+                // A6.5 Task 5: borrow Engine-owned scratch, clear, extend,
+                // drop before removing the slot.
+                let to_cancel = {
                     let ft = self.flow_table.borrow();
+                    let mut ids = self.timer_ids_scratch.borrow_mut();
+                    ids.clear();
                     if let Some(conn) = ft.get(handle) {
-                        let mut ids: Vec<_> = conn.timer_ids.to_vec();
+                        ids.extend_from_slice(&conn.timer_ids);
                         if let Some(id) = conn.rto_timer_id {
                             ids.push(id);
                         }
@@ -3062,17 +3083,16 @@ impl Engine {
                         if let Some(id) = conn.syn_retrans_timer_id {
                             ids.push(id);
                         }
-                        ids
-                    } else {
-                        Vec::new()
                     }
+                    ids
                 };
                 {
                     let mut w = self.timer_wheel.borrow_mut();
-                    for id in to_cancel {
-                        w.cancel(id);
+                    for id in to_cancel.iter() {
+                        w.cancel(*id);
                     }
                 }
+                drop(to_cancel);
                 self.flow_table.borrow_mut().remove(handle);
             }
         }
