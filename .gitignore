@@ -3,3 +3,4 @@
 Cargo.lock.bak
 /examples/cpp-consumer/build/
 .cache/
+/.worktrees/
