@@ -83,6 +83,24 @@ pub enum InternalEvent {
         cause: LossCause,
         emitted_ts_ns: u64,
     },
+    /// A6: public-timer-API fire. Emitted when an `ApiPublic` wheel node
+    /// fires via `advance_timer_wheel`. `timer_id` re-packs the wheel's
+    /// `TimerId`; `user_data` round-trips the caller's opaque payload.
+    /// No `conn` field — public timers are engine-level, not connection-
+    /// bound. `emitted_ts_ns` is sampled at fire (same convention as
+    /// RTO-fire per A5.5 §3.1).
+    ApiTimer {
+        timer_id: crate::tcp_timer_wheel::TimerId,
+        user_data: u64,
+        emitted_ts_ns: u64,
+    },
+    /// A6: send-buffer drained to ≤ `send_buffer_bytes / 2` after a
+    /// prior `send_bytes` refusal. Level-triggered, single-edge-per-
+    /// refusal-cycle. No payload.
+    Writable {
+        conn: ConnHandle,
+        emitted_ts_ns: u64,
+    },
 }
 
 pub struct EventQueue {
@@ -227,5 +245,38 @@ mod tests {
             cause: LossCause::Rto,
             emitted_ts_ns: 0,
         };
+    }
+
+    #[test]
+    fn api_timer_event_variant_shape() {
+        let id = crate::tcp_timer_wheel::TimerId { slot: 7, generation: 42 };
+        let e = InternalEvent::ApiTimer {
+            timer_id: id,
+            user_data: 0xABCD_1234_5678_BEEF,
+            emitted_ts_ns: 9_000,
+        };
+        match e {
+            InternalEvent::ApiTimer { timer_id, user_data, emitted_ts_ns } => {
+                assert_eq!(timer_id, id);
+                assert_eq!(user_data, 0xABCD_1234_5678_BEEF);
+                assert_eq!(emitted_ts_ns, 9_000);
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn writable_event_variant_shape() {
+        let e = InternalEvent::Writable {
+            conn: ConnHandle::default(),
+            emitted_ts_ns: 11_000,
+        };
+        match e {
+            InternalEvent::Writable { conn, emitted_ts_ns } => {
+                assert_eq!(conn, ConnHandle::default());
+                assert_eq!(emitted_ts_ns, 11_000);
+            }
+            _ => panic!("wrong variant"),
+        }
     }
 }

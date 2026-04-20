@@ -252,6 +252,19 @@ pub struct TcpConn {
     // emission so `handle_syn_sent` can seed SRTT from the SYN-ACK
     // RTT sample.
     pub syn_tx_ts_ns: u64,
+    /// A6 (spec §3.3): set when a prior `send_bytes` returned
+    /// `accepted < len`. Cleared when `WRITABLE` hysteresis fires
+    /// on `in_flight <= send_buffer_bytes / 2`.
+    pub send_refused_pending: bool,
+    /// A6 (spec §3.4): caller passed `RESD_NET_CLOSE_FORCE_TW_SKIP`
+    /// to `resd_net_close` AND the connection had `ts_enabled=true`
+    /// at close time. `reap_time_wait` short-circuits the 2×MSL wait
+    /// when this is set.
+    pub force_tw_skip: bool,
+    /// A6 (spec §3.8): per-connection RTT histogram — 16 × u32
+    /// buckets on one cacheline. Updated after each `rtt_est.sample()`
+    /// in `tcp_input.rs` (Task 15). Slow-path update (~5–10 ns).
+    pub rtt_histogram: crate::rtt_histogram::RttHistogram,
 }
 
 impl TcpConn {
@@ -339,6 +352,9 @@ impl TcpConn {
             tlp_recent_probes: [None; 5],
             tlp_recent_probes_next_slot: 0,
             syn_tx_ts_ns: 0,
+            send_refused_pending: false,
+            force_tw_skip: false,
+            rtt_histogram: crate::rtt_histogram::RttHistogram::default(),
         }
     }
 
@@ -433,8 +449,17 @@ impl TcpConn {
     /// (accept-side paths never set it). Bounds `(1..60_000_000)` match
     /// A5's data-ACK sampler so clock anomalies are rejected uniformly.
     /// Returns `true` iff the sample was absorbed.
+    ///
+    /// A6 Task 15 (spec §3.8): on absorption, update the per-conn RTT
+    /// histogram under the engine-wide `rtt_histogram_edges`. Kept on
+    /// the sample site so every sample-taking path (timestamp, Karn's,
+    /// SYN-seed) updates uniformly.
     #[inline]
-    pub fn maybe_seed_srtt_from_syn(&mut self, now_ns: u64) -> bool {
+    pub fn maybe_seed_srtt_from_syn(
+        &mut self,
+        now_ns: u64,
+        rtt_histogram_edges: &[u32; 15],
+    ) -> bool {
         if self.syn_retrans_count != 0 {
             return false;
         }
@@ -447,6 +472,10 @@ impl TcpConn {
         }
         self.rtt_est.sample(rtt_us);
         self.rack.update_min_rtt(rtt_us);
+        // A6 Task 15 (spec §3.8): per-conn RTT histogram update. Slow-path
+        // at sample cadence (not per-segment). 15-comparison ladder
+        // + one wrapping_add on cache-resident state.
+        self.rtt_histogram.update(rtt_us, rtt_histogram_edges);
         true
     }
 
@@ -708,6 +737,24 @@ mod tests {
         c.tlp_pto_srtt_multiplier_x100 = 200;
         let cfg = c.tlp_config(5_000);
         assert_eq!(cfg.floor_us, 0, "u32::MAX sentinel must project to 0");
+    }
+
+    #[test]
+    fn a6_new_fields_zero_init_after_new_client() {
+        let c = TcpConn::new_client(
+            FourTuple {
+                local_ip: 0x0a000002,
+                local_port: 40000,
+                peer_ip: 0x0a000001,
+                peer_port: 5000,
+            },
+            0, 1460, 1024, 2048, 5_000, 5_000, 1_000_000,
+        );
+        assert!(!c.send_refused_pending);
+        assert!(!c.force_tw_skip);
+        for b in c.rtt_histogram.buckets.iter() {
+            assert_eq!(*b, 0);
+        }
     }
 }
 
@@ -1014,6 +1061,7 @@ mod a5_5_dsack_attribution {
 #[cfg(test)]
 mod a5_5_syn_srtt_seed {
     use super::a5_5_stats_tests::make_test_conn;
+    use crate::engine::DEFAULT_RTT_HISTOGRAM_EDGES_US;
 
     #[test]
     fn syn_rtt_seed_absorbs_first_sample() {
@@ -1022,9 +1070,12 @@ mod a5_5_syn_srtt_seed {
         c.syn_retrans_count = 0;
         let now_ns = 1_000_000_000 + 50_000_000; // 50ms later
 
-        assert!(c.maybe_seed_srtt_from_syn(now_ns));
+        assert!(c.maybe_seed_srtt_from_syn(now_ns, &DEFAULT_RTT_HISTOGRAM_EDGES_US));
         assert!(c.rtt_est.srtt_us().is_some());
         assert!(c.rack.min_rtt_us > 0);
+        // A6 Task 15: histogram absorbed the 50ms sample (bucket 12 per
+        // default edges: 50000us > edges[11]=25000, ≤ edges[12]=50000).
+        assert_eq!(c.rtt_histogram.buckets[12], 1);
     }
 
     #[test]
@@ -1034,9 +1085,11 @@ mod a5_5_syn_srtt_seed {
         c.syn_retrans_count = 1; // SYN was retransmitted
         let now_ns = 1_000_000_000 + 50_000_000;
 
-        assert!(!c.maybe_seed_srtt_from_syn(now_ns));
+        assert!(!c.maybe_seed_srtt_from_syn(now_ns, &DEFAULT_RTT_HISTOGRAM_EDGES_US));
         assert!(c.rtt_est.srtt_us().is_none());
         assert_eq!(c.rack.min_rtt_us, 0);
+        // A6 Task 15: skipped sample → histogram untouched.
+        assert!(c.rtt_histogram.buckets.iter().all(|&b| b == 0));
     }
 
     #[test]
@@ -1046,9 +1099,10 @@ mod a5_5_syn_srtt_seed {
         c.syn_retrans_count = 0;
         let now_ns = 1_000_000_000;
 
-        assert!(!c.maybe_seed_srtt_from_syn(now_ns));
+        assert!(!c.maybe_seed_srtt_from_syn(now_ns, &DEFAULT_RTT_HISTOGRAM_EDGES_US));
         assert!(c.rtt_est.srtt_us().is_none());
         assert_eq!(c.rack.min_rtt_us, 0);
+        assert!(c.rtt_histogram.buckets.iter().all(|&b| b == 0));
     }
 
     #[test]
@@ -1059,8 +1113,9 @@ mod a5_5_syn_srtt_seed {
         // 61s later — above 60s upper bound.
         let now_ns = 1_000_000_000 + 61_000_000_000;
 
-        assert!(!c.maybe_seed_srtt_from_syn(now_ns));
+        assert!(!c.maybe_seed_srtt_from_syn(now_ns, &DEFAULT_RTT_HISTOGRAM_EDGES_US));
         assert!(c.rtt_est.srtt_us().is_none());
         assert_eq!(c.rack.min_rtt_us, 0);
+        assert!(c.rtt_histogram.buckets.iter().all(|&b| b == 0));
     }
 }

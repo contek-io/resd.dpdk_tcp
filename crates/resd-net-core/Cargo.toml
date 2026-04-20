@@ -10,14 +10,54 @@ libc.workspace = true
 thiserror.workspace = true
 
 [features]
-default = ["obs-poll-saturation"]
+default = [
+    "obs-poll-saturation",
+    "hw-verify-llq",
+    "hw-offload-tx-cksum",
+    "hw-offload-rx-cksum",
+    "hw-offload-mbuf-fast-free",
+    "hw-offload-rss-hash",
+    "hw-offload-rx-timestamp",
+]
 # Hot-path TCP payload byte counters. Default OFF — see spec §9.1.1.
 # Per-burst-batched increment in engine.rs (Tasks 25-26).
 obs-byte-counters = []
 # Hot-path poll-saturation counter (poll.iters_with_rx_burst_max).
 # Default ON — single conditional fetch_add per poll, no cheap alternative.
 obs-poll-saturation = []
-# Meta-feature for the A8 counter-coverage audit (`--features obs-all`).
+# A-HW hardware-offload compile-time gates. All default ON. Each gate
+# lives at the code site; struct fields stay present across all feature
+# sets (C ABI stability). A feature-off build compiles the offload code
+# path away entirely — see spec §8.4.
+#
+# `hw-verify-llq`: verify ENA Low-Latency Queue activation at bring-up
+# and bump `offload_missing_llq` if advertised-but-not-activated.
+hw-verify-llq = []
+# `hw-offload-tx-cksum`: request IPv4/TCP/UDP TX cksum offload; when
+# off, the TX path computes checksums on the CPU.
+hw-offload-tx-cksum = []
+# `hw-offload-rx-cksum`: request IPv4/TCP/UDP RX cksum validation;
+# when off, the RX path validates checksums on the CPU.
+hw-offload-rx-cksum = []
+# `hw-offload-mbuf-fast-free`: request the MBUF_FAST_FREE TX optimization
+# for single-segment packets from a single mempool.
+hw-offload-mbuf-fast-free = []
+# `hw-offload-rss-hash`: request RSS hash delivery in the mbuf and
+# consume it when present (used in future RSS-aware paths).
+hw-offload-rss-hash = []
+# `hw-offload-rx-timestamp`: request NIC-level RX timestamp dynfield;
+# expected to be absent on ENA (steady-state `offload_missing_rx_timestamp=1`).
+hw-offload-rx-timestamp = []
+# A10 offload-A/B convenience meta: every hw-* flag at once.
+hw-offloads-all = [
+    "hw-verify-llq",
+    "hw-offload-tx-cksum",
+    "hw-offload-rx-cksum",
+    "hw-offload-mbuf-fast-free",
+    "hw-offload-rss-hash",
+    "hw-offload-rx-timestamp",
+]
+# Meta for the A8 counter-coverage audit.
 obs-all = ["obs-byte-counters", "obs-poll-saturation"]
 
 [lints.rust]

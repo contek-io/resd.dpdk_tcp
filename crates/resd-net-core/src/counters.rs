@@ -18,7 +18,29 @@ pub struct EthCounters {
     pub rx_drop_unknown_ethertype: AtomicU64,
     pub rx_arp: AtomicU64,
     pub tx_arp: AtomicU64,
-    _pad: [u64; 4],
+    // A-HW additions — all slow-path per spec §9.1.1. Fields always
+    // allocated regardless of feature flags (C-ABI stability). See
+    // docs/superpowers/specs/2026-04-19-stage1-phase-a-hw-ena-offload-design.md §11.
+    /// Offload advertised-request-mismatch counters (one-shot at bring-up).
+    pub offload_missing_rx_cksum_ipv4: AtomicU64,
+    pub offload_missing_rx_cksum_tcp: AtomicU64,
+    pub offload_missing_rx_cksum_udp: AtomicU64,
+    pub offload_missing_tx_cksum_ipv4: AtomicU64,
+    pub offload_missing_tx_cksum_tcp: AtomicU64,
+    pub offload_missing_tx_cksum_udp: AtomicU64,
+    pub offload_missing_mbuf_fast_free: AtomicU64,
+    pub offload_missing_rss_hash: AtomicU64,
+    /// Fires only when driver is net_ena AND LLQ advertised-but-not-activated.
+    /// Expected 0 on ENA with default enable_llq=1. Feature-off builds never bump.
+    pub offload_missing_llq: AtomicU64,
+    /// Expected 1 on ENA (documented steady state — ENA does not register
+    /// the rte_dynfield_timestamp dynfield). 0 on mlx5/ice/future-gen ENA.
+    pub offload_missing_rx_timestamp: AtomicU64,
+    /// Per-packet drop counter for RX segments the NIC classified as
+    /// RTE_MBUF_F_RX_IP_CKSUM_BAD or RTE_MBUF_F_RX_L4_CKSUM_BAD. Expected 0
+    /// on well-formed traffic. Not an offload-missing counter.
+    pub rx_drop_cksum_bad: AtomicU64,
+    _pad: [AtomicU64; 9],
 }
 
 #[repr(C, align(64))]
@@ -140,7 +162,23 @@ pub struct TcpCounters {
     /// A5.5 Task 11/12: TLP probe retroactively classified as spurious via
     /// DSACK (RFC 8985 §7.4 / spec §3.4). Declared here; wired in Task 12.
     pub tx_tlp_spurious: AtomicU64,
-    _pad: [u64; 1],
+    // --- A6 additions (all slow-path per §9.1.1 rule 1) ---
+    /// A6: public-timer-API fire. Incremented once per `ApiPublic`
+    /// wheel node firing through `advance_timer_wheel` — a slow-path
+    /// boundary (not per-segment / per-burst / per-poll).
+    pub tx_api_timers_fired: AtomicU64,
+    /// A6: RFC 7323 §5.5 24-day `TS.Recent` expiration fired on an
+    /// inbound segment's PAWS gate. Effectively zero on healthy
+    /// trading traffic; nonzero is operationally interesting.
+    pub ts_recent_expired: AtomicU64,
+    /// A6: `drain_tx_pending_data` called `rte_eth_tx_burst`. One
+    /// fetch_add per drain (per end-of-poll + per `resd_net_flush`).
+    pub tx_flush_bursts: AtomicU64,
+    /// A6: aggregate `sent` count summed across every `tx_flush_bursts`
+    /// call. Useful to compute mean-batch-size = tx_flush_batched_pkts
+    /// / tx_flush_bursts; values near 1 mean the data path isn't
+    /// actually batching.
+    pub tx_flush_batched_pkts: AtomicU64,
 }
 
 #[repr(C, align(64))]
@@ -462,5 +500,14 @@ mod a5_5_tests {
     fn tlp_counters_tx_tlp_spurious_exists_and_zero_initialized() {
         let c = Counters::new();
         assert_eq!(c.tcp.tx_tlp_spurious.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn a6_new_tcp_counters_exist_and_zero() {
+        let c = Counters::new();
+        assert_eq!(c.tcp.tx_api_timers_fired.load(Ordering::Relaxed), 0);
+        assert_eq!(c.tcp.ts_recent_expired.load(Ordering::Relaxed), 0);
+        assert_eq!(c.tcp.tx_flush_bursts.load(Ordering::Relaxed), 0);
+        assert_eq!(c.tcp.tx_flush_batched_pkts.load(Ordering::Relaxed), 0);
     }
 }

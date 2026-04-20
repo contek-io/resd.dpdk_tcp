@@ -225,6 +225,12 @@
 
 ---
 
+## A5.6 — Per-connection RTT histogram (ABSORBED INTO A6)
+
+**Status:** Absorbed into A6 on 2026-04-19 — A5.6 did not ship as a standalone phase. All scoped content (16×u32 histogram on `TcpConn`, runtime-configurable edges, `resd_net_conn_rtt_histogram` getter, wraparound contract, cacheline placement, default edges) was folded into A6's design spec §3.8 and implementation plan tasks 3 (field + module), 6 (edges validation), 15 (update hook), 18 (ABI getter), 20 (ABI config field). See `docs/superpowers/specs/2026-04-19-stage1-phase-a6-public-api-completeness-design.md` and `docs/superpowers/plans/2026-04-19-stage1-phase-a6-public-api-completeness.md`. The original A5.6 design spec at `docs/superpowers/specs/2026-04-19-stage1-phase-a5-6-rtt-histogram-design.md` is retained as design-input reference only.
+
+---
+
 ## A-HW — ENA hardware offload enablement
 
 **Numbering note:** Inserted between A5 and A6 after the Stage 1 deployment environment was pinned down as AWS ENA on AMD EPYC Milan (spec §8.1–§8.5). Uses the non-numeric "A-HW" tag rather than renumbering A6–A12 because existing per-phase plan files (notably the in-progress A4 plan) already reference A5 / A6 / A8 / A10 by number.
@@ -239,7 +245,7 @@
 
   | Feature flag | Default | Gates |
   |---|---|---|
-  | `hw-offload-llq` | ON | Passes `enable_llq=1` to the ENA PMD devargs; with the feature off, passes `enable_llq=0` so LLQ is explicitly disabled |
+  | `hw-verify-llq` | ON | Engine verifies LLQ activation at EAL init via PMD log-scrape + `dev_info.default_rxportconf` / `default_txportconf` inspection; fails hard if ENA advertised LLQ capability but LLQ did not activate. The `enable_llq=X` devarg stays **application-owned** (ENA PMD default is `enable_llq=1`) — this flag controls the engine's verification discipline, not activation. With feature off, verification is skipped. See A-HW spec §5 |
   | `hw-offload-tx-cksum` | ON | TX IPv4+TCP+UDP checksum offload bits + pseudo-header-only checksum in `tcp_output.rs` / `l3_ip.rs`; with feature off, software full-fold stays on the TX path |
   | `hw-offload-rx-cksum` | ON | RX IPv4+TCP+UDP checksum offload bits + `mbuf.ol_flags` inspection in `tcp_input.rs` / `l3_ip.rs`; with feature off, software verify runs on the RX path |
   | `hw-offload-mbuf-fast-free` | ON | `RTE_ETH_TX_OFFLOAD_MBUF_FAST_FREE` bit in `txmode.offloads` |
@@ -255,7 +261,7 @@
   - For each offload that is compile-time enabled, AND the requested bit against `dev_info.*_offload_capa`; WARN + one-shot counter per requested-but-unadvertised capability (`eth.offload_missing_<name>`); software path stays reachable (runtime capability gate per §8.5).
   - Populate `rte_eth_conf.rxmode.offloads` / `txmode.offloads` with bits that are both compile-time enabled AND runtime advertised.
   - When `hw-offload-rss-hash` is on: populate `rte_eth_conf.rx_adv_conf.rss_conf = { rss_hf: RTE_ETH_RSS_NONFRAG_IPV4_TCP | RTE_ETH_RSS_NONFRAG_IPV6_TCP, rss_key: NULL }` (NULL key → PMD default Toeplitz key); on single queue, program the RSS indirection table so every hash lands on queue 0.
-- LLQ verification (when `hw-offload-llq` on): parse PMD startup log + read `dev_info.default_rxportconf` / `default_txportconf` signals; fail-hard if the device advertises LLQ capability but LLQ did not activate at bring-up.
+- LLQ verification (when `hw-verify-llq` on): parse PMD startup log + read `dev_info.default_rxportconf` / `default_txportconf` signals; fail-hard if the device advertises LLQ capability but LLQ did not activate at bring-up.
 - `tcp_output.rs` / `l3_ip.rs` TX checksum split, compile-gated by `hw-offload-tx-cksum`:
   - Feature ON: set `mbuf.ol_flags |= RTE_MBUF_F_TX_IPV4 | RTE_MBUF_F_TX_IP_CKSUM | RTE_MBUF_F_TX_TCP_CKSUM` (and UDP analog); set `mbuf.l2_len = 14`, `mbuf.l3_len = 20`, `mbuf.l4_len = tcp_hdr_len`; write **only** the TCP / UDP pseudo-header checksum per RFC 9293 §3.1. Runtime-fallback branch (if the PMD didn't advertise the capability) reverts to full-fold for that engine instance only.
   - Feature OFF: software full-fold on the TX path; no offload bits set.
@@ -292,26 +298,31 @@
 
 ---
 
-## A6 — Public API surface completeness + per-connection RTT histogram
+## A6 — Public API surface completeness + per-conn RTT histogram (COMPLETE)
 
-**Merge note:** This phase absorbs what was briefly carved as A5.6 (per-connection RTT histogram). Both items land under one brainstorm, one plan, one review gate, one tag — they share `engine.rs` + `api.rs` + `include/resd_net.h` touch points, and a single phase keeps the cbindgen regen + ABI-audit cycle coherent. A5.6's design spec (`docs/superpowers/specs/2026-04-19-stage1-phase-a5-6-rtt-histogram-design.md`) is retained as design-input; A6's own spec subsumes its content.
+**Status:** Complete 2026-04-20. Design spec: `docs/superpowers/specs/2026-04-19-stage1-phase-a6-public-api-completeness-design.md`. Implementation plan: `docs/superpowers/plans/2026-04-19-stage1-phase-a6-public-api-completeness.md`. Ship tag: `phase-a6-complete`. Review reports: `docs/superpowers/reviews/phase-a6-mtcp-compare.md` + `docs/superpowers/reviews/phase-a6-rfc-compliance.md` (both PASS, zero open `[ ]`). A5.6 absorbed into A6 (see row above). Final task count: 22 implementation tasks + 1 phase-gate task = 23.
 
-**Goal:** Finalize the public C ABI per §4: `resd_net_flush` actually flushes, `WRITABLE` events on send-buffer drain, timer API (`timer_add`/`cancel` + `TIMER` event), `resd_net_close(flags)` with `FORCE_TW_SKIP` + RFC 6191 guard, poll event-overflow queueing, mempool exhaustion error paths, `preset=rfc_compliance` runtime switch. **Plus** the per-connection RTT histogram getter so applications can observe RTT distribution shape across app-chosen time windows (complements A5.5's scalar `stats()` getter).
+**Goal:** Finalize the public C ABI per §4: `resd_net_flush` actually flushes via data-segment TX ring batching, `WRITABLE` events on send-buffer drain (level-triggered hysteresis at `send_buffer_bytes/2`), timer API (`timer_add`/`cancel` + `TIMER` event layered on the A5 wheel), `resd_net_close(flags)` with `FORCE_TW_SKIP` under `ts_enabled` prerequisite + `-EPERM` event when prereq not met, mempool exhaustion error paths (per-occurrence on retransmit; edge-triggered per-poll on RX), `preset=rfc_compliance` runtime switch. Also: per-connection RTT histogram (16×u32 cacheline-aligned buckets, runtime-configurable edges). RFC 7323 §5.5 24-day `TS.Recent` lazy expiration (no timer needed) landed from A5/A5.5 deferral list.
 
-**Spec refs:** §4, §4.2 contracts, §6.5 TIME_WAIT shortening, §7.4 timer wheel + per-conn timer list + tombstone cancel, §9.3 error events, §9.1.1 counter policy (per-conn histogram is slow-path per segment-ACK rate).
+**Spec refs:** §4 (API), §4.2 contracts (flush data-only, timer_cancel -ENOENT-collapse, close EPERM event), §6.5 TIME_WAIT shortening (ts_enabled prerequisite + client-side RFC 6191 analog), §7.4 timer wheel (reused from A5), §9.1 four A6 counters, §9.3 ENOMEM emission sites, §6.4 `AD-A6-force-tw-skip` new accepted deviation.
 
-**Deliverables:**
-
-Public API completeness (A6-core):
-- Timer wheel implemented (hashed, 8 levels × 256 buckets, 10µs resolution).
-- Per-conn timer list for O(k) cancel on close.
-- `resd_net_timer_add` / `resd_net_timer_cancel` / `TIMER` event plumbed through.
-- `resd_net_flush` drains TX batch via exactly one `rte_eth_tx_burst`.
-- Send-buffer backpressure: `resd_net_send` returns partial; `RESD_NET_EVT_WRITABLE` on drain.
-- `resd_net_close` accepts flags bitmask; `FORCE_TW_SKIP` honored only under RFC 6191 §4.2 conditions, otherwise emits `RESD_NET_EVT_ERROR{err=EPERM_TW_REQUIRED}`.
-- Engine event queue with FIFO overflow semantics documented in §4.2.
-- `preset` field on `engine_config` switches defaults (nagle on, delayed-ACK on, min_rto=200, initial_rto=1000, cc_mode=reno).
-- Integration tests for each API contract edge case.
+**Deliverables (landed):**
+- Public timer API extern fns + `InternalEvent::ApiTimer` wiring + `TimerKind::ApiPublic` fire branch.
+- Engine-scope `tx_pending_data` ring + `drain_tx_pending_data` helper + `resd_net_flush` body; control frames stay inline per spec §3.2 option (c).
+- `RESD_NET_EVT_WRITABLE` hysteresis: `send_refused_pending` bit on `TcpConn`; ACK-prune path fires once per refusal cycle when in_flight ≤ send_buffer_bytes/2.
+- `resd_net_close(flags)` honors `FORCE_TW_SKIP` bit; `ts_enabled==true` sets `c.force_tw_skip`; `reap_time_wait` short-circuits for force_tw_skip; `ts_enabled==false` emits `Error{err=-EPERM}` + normal 2×MSL.
+- Engine event queue FIFO drop-oldest + soft-cap contract (reused from A5.5 Task 5; A6 verified A6 variants preserve FIFO).
+- `preset=rfc_compliance` engine-create override: `tcp_nagle=true`, `tcp_delayed_ack=true`, `cc_mode=1` (Reno), `tcp_min_rto_us=200_000`, `tcp_initial_rto_us=1_000_000`; `preset>=2` rejected with null-return.
+- `preset` constants `RESD_NET_PRESET_LATENCY=0` / `RESD_NET_PRESET_RFC_COMPLIANCE=1` emitted as C #defines.
+- RX-mempool-drop edge-triggered `Error{err=-ENOMEM}` event (1/poll iteration max) via `rx_drop_nomem_prev` snapshot.
+- Retransmit `Error{err=-ENOMEM}` emission at all 4 alloc-fail sites inside the retransmit function.
+- Per-connection `RttHistogram` (16×u32, `#[repr(C, align(64))]`, compile-time size/align pinned to 64 B); update hook after every `rtt_est.sample` site (tcp_input.rs + SYN-ACK seed path); engine-wide edges config field with validation (non-monotonic → null-return); ABI POD `resd_net_tcp_rtt_histogram_t` + extern `resd_net_conn_rtt_histogram`; default edges tuned for trading-exchange RTT range (50µs–500ms log-spaced).
+- RFC 7323 §5.5 24-day `TS.Recent` lazy expiration at PAWS gate + `ts_recent_age` backfilled at all 3 write sites (fixed latent A5-era debt).
+- Four new slow-path `tcp.*` counters: `tx_api_timers_fired`, `ts_recent_expired`, `tx_flush_bursts`, `tx_flush_batched_pkts`.
+- Integration test file `tests/tcp_a6_public_api_tap.rs` (17 pure in-process tests pinning the public-API contracts end-to-end at the TcpConn / Engine / EventQueue level).
+- Knob-coverage audit extended (3 new entries: preset, FORCE_TW_SKIP, rtt_histogram_bucket_edges_us).
+- Sibling audit `tests/per-conn-histogram-coverage.rs` covering all 16 default buckets.
+- Parent-spec updates: §4, §4.2, §6.4 (new `AD-A6-force-tw-skip` row), §6.5, §9.1, §9.3. A5.5 citation nits corrected inline ("RFC 6298 §3.3" → "§2.2 + §3 (Karn's rule)"; "RFC 8985 §7.4 (RTT-sample gate)" → "§7.3 step 2").
 
 Per-connection RTT histogram (merged from A5.6):
 - Per-conn `rtt_histogram: [u32; 16]` field on `TcpConn` (exactly 64 B, one cacheline). Updated inside `rtt_est.sample()` via a 15-comparison bucket-selection ladder + `wrapping_add(1)`. Cost: ~5–10 ns per RTT sample; no atomic (single-lcore RTC model).
@@ -329,7 +340,7 @@ Per-connection RTT histogram (merged from A5.6):
 
 **Dependencies:** A5 + A5.5 (the histogram hooks into A5's `rtt_est.sample()` call site which A5.5 extended; public API additions build on A5.5's event + stats infrastructure).
 
-**Rough scale:** ~23 tasks (~20 for A6-core + ~3 for RTT histogram).
+**Final task count:** 22 implementation + 1 phase-gate = 23 tasks. Matches roadmap budget ("~20 A6-core + 3 histogram").
 
 ---
 
@@ -566,7 +577,7 @@ Group 3 — audit artifacts:
 - `tools/bench-e2e/` — request/response RTT harness with HW-timestamp attribution buckets and per-measurement sum-identity assertion.
 - `tools/bench-stress/` — netem + FaultInjector scenario runner for §11.4 matrix.
 - `tools/bench-vs-linux/` — dual-stack comparison vs Linux TCP with tap-jitter baseline subtraction.
-- `tools/bench-offload-ab/` — per-offload A/B harness that consumes A-HW's `hw-offload-*` cargo feature flags (`hw-offload-llq`, `hw-offload-tx-cksum`, `hw-offload-rx-cksum`, `hw-offload-mbuf-fast-free`, `hw-offload-rss-hash`) by rebuilding the engine once per feature-combination and running a 128 B / 128 B request-response micro-workload on the ENA target host.
+- `tools/bench-offload-ab/` — per-offload A/B harness that consumes A-HW's feature flags (`hw-verify-llq`, `hw-offload-tx-cksum`, `hw-offload-rx-cksum`, `hw-offload-mbuf-fast-free`, `hw-offload-rss-hash`) by rebuilding the engine once per feature-combination and running a 128 B / 128 B request-response micro-workload on the ENA target host. Note `hw-verify-llq` is a verification-discipline gate, not an offload-enable gate — its A/B toggles whether the engine enforces LLQ-active at bring-up, not whether LLQ is configured (the ENA PMD's `enable_llq=X` devarg stays application-owned).
   - Config matrix: `baseline` (no features), per-offload-only (one feature each), `full` (all default features). Additional compositions optional if any single-offload result is ambiguous.
   - Workload: ≥ 10 000 round-trips per config post-warmup (drop first 1 000); fresh engine bring-up between configs with `rte_eal_cleanup`; same RNG seed across runs.
   - Measurement discipline: same preconditions as §11.1 (isolcpus, governor, C-states, TSC invariant, no thermal throttle during the run). Harness fails-fast on any precondition miss.

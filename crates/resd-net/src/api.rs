@@ -51,6 +51,11 @@ pub struct resd_net_engine_config_t {
     /// A5.5 event-queue overflow guard (§3.2 / §5.1). Default 4096;
     /// must be >= 64. Queue drops oldest on overflow.
     pub event_queue_soft_cap: u32,
+    /// A6 (spec §5.1, §3.8): RTT histogram bucket edges, µs. 15 strictly
+    /// monotonically increasing edges define 16 buckets. All-zero input
+    /// means "use the stack's trading-tuned defaults" (see spec §3.8.2).
+    /// Non-monotonic rejected at `resd_net_engine_create` with null-return.
+    pub rtt_histogram_bucket_edges_us: [u32; 15],
 }
 
 #[repr(C)]
@@ -203,6 +208,21 @@ pub struct resd_net_conn_stats_t {
     pub rto_us: u32,
 }
 
+/// A6 (spec §3.8, §5.2): per-connection RTT histogram snapshot POD.
+/// Exactly 64 B — one cacheline. The cbindgen header emits the
+/// wraparound-semantics doc-comment from the core `rtt_histogram.rs`
+/// alongside this struct; see that module for the full contract.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct resd_net_tcp_rtt_histogram_t {
+    pub bucket: [u32; 16],
+}
+
+const _: () = {
+    use std::mem::size_of;
+    assert!(size_of::<resd_net_tcp_rtt_histogram_t>() == 64);
+};
+
 /// Counters struct — exposed to application via resd_net_counters().
 /// Fields are plain u64 on the C ABI for clean cbindgen emission, but
 /// internally the stack writes them as AtomicU64 (Relaxed). AtomicU64
@@ -226,7 +246,20 @@ pub struct resd_net_eth_counters_t {
     pub rx_drop_unknown_ethertype: u64,
     pub rx_arp: u64,
     pub tx_arp: u64,
-    pub _pad: [u64; 4],
+    // A-HW additions — mirror of resd_net_core::counters::EthCounters.
+    // Slow-path, always allocated regardless of feature flags.
+    pub offload_missing_rx_cksum_ipv4: u64,
+    pub offload_missing_rx_cksum_tcp: u64,
+    pub offload_missing_rx_cksum_udp: u64,
+    pub offload_missing_tx_cksum_ipv4: u64,
+    pub offload_missing_tx_cksum_tcp: u64,
+    pub offload_missing_tx_cksum_udp: u64,
+    pub offload_missing_mbuf_fast_free: u64,
+    pub offload_missing_rss_hash: u64,
+    pub offload_missing_llq: u64,
+    pub offload_missing_rx_timestamp: u64,
+    pub rx_drop_cksum_bad: u64,
+    pub _pad: [u64; 9],
 }
 #[repr(C, align(64))]
 pub struct resd_net_ip_counters_t {
@@ -310,7 +343,12 @@ pub struct resd_net_tcp_counters_t {
     pub rx_dsack: u64,
     /// A5.5 Task 11/12 — see core counters.rs for the full field doc.
     pub tx_tlp_spurious: u64,
-    pub _pad: [u64; 1],
+    // A6 additions — see core counters.rs for field docs. Declaration
+    // order must match `resd_net_core::counters::TcpCounters` exactly.
+    pub tx_api_timers_fired: u64,
+    pub ts_recent_expired: u64,
+    pub tx_flush_bursts: u64,
+    pub tx_flush_batched_pkts: u64,
 }
 #[repr(C, align(64))]
 pub struct resd_net_poll_counters_t {

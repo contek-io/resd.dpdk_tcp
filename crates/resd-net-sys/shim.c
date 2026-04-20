@@ -80,3 +80,60 @@ void resd_rte_mbuf_refcnt_update(struct rte_mbuf *m, int16_t v) {
 uint16_t resd_rte_pktmbuf_nb_segs(const struct rte_mbuf *m) {
     return m->nb_segs;
 }
+
+/* A-HW Task 7: TX offload metadata setters/getters.
+ *
+ * `struct rte_mbuf` is opaque in the Rust bindings (packed anonymous
+ * unions defeat bindgen's layout engine), so the Rust-side finalizer
+ * OR-s ol_flags and sets the l2/l3/l4_len triple through these shims.
+ * The getters back unit-test assertions; production callers only need
+ * the setters. */
+void resd_rte_mbuf_or_ol_flags(struct rte_mbuf *m, uint64_t flags) {
+    m->ol_flags |= flags;
+}
+
+void resd_rte_mbuf_set_tx_lens(struct rte_mbuf *m, uint16_t l2, uint16_t l3, uint16_t l4) {
+    m->l2_len = l2;
+    m->l3_len = l3;
+    m->l4_len = l4;
+}
+
+uint64_t resd_rte_mbuf_get_ol_flags(const struct rte_mbuf *m) {
+    return m->ol_flags;
+}
+
+uint16_t resd_rte_mbuf_get_l2_len(const struct rte_mbuf *m) {
+    return (uint16_t)m->l2_len;
+}
+
+uint16_t resd_rte_mbuf_get_l3_len(const struct rte_mbuf *m) {
+    return (uint16_t)m->l3_len;
+}
+
+uint16_t resd_rte_mbuf_get_l4_len(const struct rte_mbuf *m) {
+    return (uint16_t)m->l4_len;
+}
+
+/* A-HW Task 9: RSS hash accessor. `mbuf.hash` is a nested anonymous
+ * union in rte_mbuf.h which bindgen does not expose cleanly, so the
+ * Rust RX hot path reads `hash.rss` via this shim. Paired with the
+ * flow_table::hash_bucket_for_lookup selector — only called when the
+ * `hw-offload-rss-hash` feature is compiled in. */
+uint32_t resd_rte_mbuf_get_rss_hash(const struct rte_mbuf *m) {
+    return m->hash.rss;
+}
+
+/* A-HW Task 10: NIC-provided RX timestamp dynfield reader.
+ *
+ * The dynamic field offset comes from
+ * rte_mbuf_dynfield_lookup("rte_dynfield_timestamp") at engine_create.
+ * Reading it in Rust would require raw pointer arithmetic on the
+ * opaque mbuf; doing the arithmetic in C is type-checked at compile
+ * time (char* byte indexing + uint64_t load) and the one-liner keeps
+ * the unsafe surface minimal on the Rust side.
+ *
+ * Only called when both the dynfield AND the dynflag lookup succeeded
+ * (see Engine::hw_rx_ts_ns); ENA never reaches this path per spec §10.5. */
+uint64_t resd_rte_mbuf_read_dynfield_u64(const struct rte_mbuf *m, int32_t offset) {
+    return *(const uint64_t *)((const char *)m + offset);
+}

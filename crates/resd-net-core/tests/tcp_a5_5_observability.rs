@@ -65,7 +65,9 @@ fn emitted_ts_ns_of(ev: &InternalEvent) -> u64 {
         | InternalEvent::StateChange { emitted_ts_ns, .. }
         | InternalEvent::Error { emitted_ts_ns, .. }
         | InternalEvent::TcpRetrans { emitted_ts_ns, .. }
-        | InternalEvent::TcpLossDetected { emitted_ts_ns, .. } => *emitted_ts_ns,
+        | InternalEvent::TcpLossDetected { emitted_ts_ns, .. }
+        | InternalEvent::ApiTimer { emitted_ts_ns, .. }
+        | InternalEvent::Writable { emitted_ts_ns, .. } => *emitted_ts_ns,
     }
 }
 
@@ -225,7 +227,9 @@ fn integration_event_queue_preserves_emitted_ts_ns_across_fifo_span() {
             | InternalEvent::StateChange { emitted_ts_ns, .. }
             | InternalEvent::Error { emitted_ts_ns, .. }
             | InternalEvent::TcpRetrans { emitted_ts_ns, .. }
-            | InternalEvent::TcpLossDetected { emitted_ts_ns, .. } => emitted_ts_ns,
+            | InternalEvent::TcpLossDetected { emitted_ts_ns, .. }
+            | InternalEvent::ApiTimer { emitted_ts_ns, .. }
+            | InternalEvent::Writable { emitted_ts_ns, .. } => emitted_ts_ns,
         };
         got.push(t);
     }

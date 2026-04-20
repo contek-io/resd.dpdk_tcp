@@ -35,6 +35,11 @@ int main() {
     memset(cfg.gateway_mac, 0, sizeof(cfg.gateway_mac));
     cfg.garp_interval_sec = 0;
     cfg.event_queue_soft_cap = 4096;
+    // A6 Task 20: all-zero bucket edges select the stack's trading-tuned
+    // defaults (spec §3.8.2). Applications that need custom edges fill
+    // in 15 strictly-monotonic µs values here before engine create.
+    memset(cfg.rtt_histogram_bucket_edges_us, 0,
+        sizeof(cfg.rtt_histogram_bucket_edges_us));
 
     // Initialize EAL first. Uses DPDK TAP vdev so no real NIC is required.
     const char* eal_args[] = {

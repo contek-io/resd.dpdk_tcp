@@ -212,6 +212,171 @@ fn tcp_checksum_split(
     internet_checksum(&buf)
 }
 
+/// Pseudo-header-only TCP checksum per RFC 9293 §3.1. Used by A-HW's
+/// TX offload path: software writes ONLY the 12-byte pseudo-header
+/// fold into the TCP cksum field; the PMD folds in TCP header +
+/// payload at wire time when `RTE_MBUF_F_TX_TCP_CKSUM` is set.
+///
+/// `tcp_seg_len` is the pseudo-header `tcp_length` field: the sum of
+/// header-bytes and payload-bytes on the wire. For a 20-byte TCP header
+/// with N bytes payload, tcp_seg_len = 20 + N.
+pub fn tcp_pseudo_header_checksum(src_ip: u32, dst_ip: u32, tcp_seg_len: u32) -> u16 {
+    let mut buf = [0u8; 12];
+    buf[0..4].copy_from_slice(&src_ip.to_be_bytes());
+    buf[4..8].copy_from_slice(&dst_ip.to_be_bytes());
+    buf[8] = 0;
+    buf[9] = IPPROTO_TCP;
+    buf[10..12].copy_from_slice(&(tcp_seg_len as u16).to_be_bytes());
+    internet_checksum(&buf)
+}
+
+/// A-HW Task 7 pure-function helper. Rewrites the TCP and IPv4 checksum
+/// fields inside a full Ethernet+IPv4+TCP frame for the TX-offload path:
+///   - TCP cksum (frame bytes `ETH_HDR_LEN + IPV4_HDR_MIN + 16..+18`)
+///     is overwritten with the pseudo-header-only fold from
+///     `tcp_pseudo_header_checksum`.
+///   - IPv4 cksum (frame bytes `ETH_HDR_LEN + 10..+12`) is zeroed.
+///
+/// `frame_bytes` must start at the Ethernet header and be at least
+/// `ETH_HDR_LEN + IPV4_HDR_MIN + TCP_HDR_MIN` long — the caller always
+/// has a full segment because `build_segment` / `build_retrans_header`
+/// ran first. Returns `false` when the slice is too short (defensive;
+/// production call sites never hit this branch).
+///
+/// `tcp_hdr_len` is the TCP header length including options (>=20).
+/// `payload_for_csum_len` is the payload byte count that will ship on
+/// the wire (= seg.payload.len() for build_segment; the chained data
+/// mbuf's data_len for build_retrans_header).
+///
+/// Split out from `tx_offload_finalize` so unit tests can exercise the
+/// memory-rewrite logic against a plain `&mut [u8]` without constructing
+/// an opaque `rte_mbuf`. Spec §6.2.
+#[cfg(feature = "hw-offload-tx-cksum")]
+pub fn tx_offload_rewrite_cksums(
+    frame_bytes: &mut [u8],
+    src_ip: u32,
+    dst_ip: u32,
+    tcp_hdr_len: usize,
+    payload_for_csum_len: u32,
+) -> bool {
+    let min_len = ETH_HDR_LEN + IPV4_HDR_MIN + TCP_HDR_MIN;
+    if frame_bytes.len() < min_len {
+        return false;
+    }
+    let pseudo_len = (tcp_hdr_len as u32).wrapping_add(payload_for_csum_len);
+    let pseudo = tcp_pseudo_header_checksum(src_ip, dst_ip, pseudo_len);
+    let tcp_cksum_off = ETH_HDR_LEN + IPV4_HDR_MIN + 16;
+    frame_bytes[tcp_cksum_off] = (pseudo >> 8) as u8;
+    frame_bytes[tcp_cksum_off + 1] = (pseudo & 0xff) as u8;
+    let ip_cksum_off = ETH_HDR_LEN + 10;
+    frame_bytes[ip_cksum_off] = 0;
+    frame_bytes[ip_cksum_off + 1] = 0;
+    true
+}
+
+/// A-HW TX offload finalizer. When `offload_active == true` AND the
+/// `hw-offload-tx-cksum` feature is compiled in:
+///   1. Sets `mbuf.ol_flags |= RTE_MBUF_F_TX_IPV4 | RTE_MBUF_F_TX_IP_CKSUM
+///      | RTE_MBUF_F_TX_TCP_CKSUM`.
+///   2. Sets `mbuf.l2_len = 14`, `mbuf.l3_len = 20`, `mbuf.l4_len = tcp_hdr_len`.
+///   3. Overwrites the TCP checksum field with the pseudo-header-only
+///      fold (the PMD folds in TCP header + payload at wire time).
+///   4. Zeros the IPv4 header checksum field (PMD computes it).
+///
+/// When `offload_active == false` OR the feature is compile-off: no-op.
+/// The caller's `build_segment` / `build_retrans_header` already produced
+/// software full-fold TCP + IPv4 checksums; the NIC transmits exactly
+/// those bytes.
+///
+/// `payload_for_csum_len` is the payload byte count that will ship on
+/// the wire — `seg.payload.len() as u32` for `build_segment` callers,
+/// the chained data mbuf's `data_len` for `build_retrans_header`.
+///
+/// # Safety
+/// `mbuf` must be a valid pointer to a live `rte_mbuf` whose data buffer
+/// contains at least ETH(14) + IPv4(20) + TCP-header bytes already
+/// populated by `build_segment` (or `build_retrans_header` for the
+/// header mbuf of a chained retransmit). Caller must hold exclusive
+/// access to the mbuf for the duration of this call. In the hot path
+/// this is satisfied by the ownership rules around build_segment +
+/// rte_eth_tx_burst: the mbuf was just freshly allocated from a
+/// per-engine mempool and no other code has a pointer to it yet.
+///
+/// Spec §6.2.
+#[cfg(feature = "hw-offload-tx-cksum")]
+pub unsafe fn tx_offload_finalize(
+    mbuf: *mut resd_net_sys::rte_mbuf,
+    seg: &SegmentTx,
+    payload_for_csum_len: u32,
+    offload_active: bool,
+) {
+    if !offload_active || mbuf.is_null() {
+        return;
+    }
+    use crate::dpdk_consts::{
+        RTE_MBUF_F_TX_IP_CKSUM, RTE_MBUF_F_TX_IPV4, RTE_MBUF_F_TX_TCP_CKSUM,
+    };
+    let opts_len = seg.options.encoded_len();
+    let tcp_hdr_len = TCP_HDR_MIN + opts_len;
+
+    // rte_mbuf is opaque to bindgen (packed anonymous unions), so the
+    // ol_flags / l2/l3/l4_len metadata goes through sys-crate shims.
+    // Safety: `mbuf` is a valid pointer per the caller's contract.
+    unsafe {
+        resd_net_sys::resd_rte_mbuf_or_ol_flags(
+            mbuf,
+            RTE_MBUF_F_TX_IPV4 | RTE_MBUF_F_TX_IP_CKSUM | RTE_MBUF_F_TX_TCP_CKSUM,
+        );
+        resd_net_sys::resd_rte_mbuf_set_tx_lens(
+            mbuf,
+            ETH_HDR_LEN as u16,
+            IPV4_HDR_MIN as u16,
+            tcp_hdr_len as u16,
+        );
+    }
+
+    // Overwrite TCP cksum + zero IPv4 cksum in the mbuf's data buffer.
+    // Safety: the caller guarantees the data buffer holds at least
+    // ETH_HDR_LEN + IPV4_HDR_MIN + TCP_HDR_MIN bytes populated by
+    // build_segment / build_retrans_header. data_len reflects the
+    // filled region, so the slice length is well-defined.
+    let data_ptr = unsafe { resd_net_sys::resd_rte_pktmbuf_data(mbuf) } as *mut u8;
+    let data_len = unsafe { resd_net_sys::resd_rte_pktmbuf_data_len(mbuf) } as usize;
+    debug_assert!(
+        !data_ptr.is_null(),
+        "live TX mbuf must have a valid data pointer"
+    );
+    debug_assert!(
+        data_len >= ETH_HDR_LEN + IPV4_HDR_MIN + TCP_HDR_MIN,
+        "TX mbuf must have a full Eth+IPv4+TCP header populated before finalize"
+    );
+    let frame = unsafe { std::slice::from_raw_parts_mut(data_ptr, data_len) };
+    let _ = tx_offload_rewrite_cksums(
+        frame,
+        seg.src_ip,
+        seg.dst_ip,
+        tcp_hdr_len,
+        payload_for_csum_len,
+    );
+}
+
+/// Feature-off variant. `hw-offload-tx-cksum` compiled out ⇒ the
+/// finalizer is a no-op and the software full-fold checksums that
+/// `build_segment` already wrote stay on the wire.
+///
+/// # Safety
+/// No memory is read or written; `unsafe` only to match the feature-on
+/// signature so TX call sites compile unchanged across feature configs.
+#[cfg(not(feature = "hw-offload-tx-cksum"))]
+pub unsafe fn tx_offload_finalize(
+    _mbuf: *mut resd_net_sys::rte_mbuf,
+    _seg: &SegmentTx,
+    _payload_for_csum_len: u32,
+    _offload_active: bool,
+) {
+    // No-op. Spec §6.4.
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -378,5 +543,115 @@ mod tests {
         };
         let mut out = [0u8; 30];
         assert!(build_retrans_header(&seg, b"payload", &mut out).is_none());
+    }
+
+    #[test]
+    fn pseudo_header_only_cksum_matches_manual_fold() {
+        use crate::l3_ip::internet_checksum;
+        let src_ip: u32 = 0x0a000001;
+        let dst_ip: u32 = 0x0a000002;
+        let tcp_seg_len: u32 = 40;
+
+        let mut pseudo = Vec::with_capacity(12);
+        pseudo.extend_from_slice(&src_ip.to_be_bytes());
+        pseudo.extend_from_slice(&dst_ip.to_be_bytes());
+        pseudo.push(0);
+        pseudo.push(crate::l3_ip::IPPROTO_TCP);
+        pseudo.extend_from_slice(&(tcp_seg_len as u16).to_be_bytes());
+        let manual = internet_checksum(&pseudo);
+
+        let helper = tcp_pseudo_header_checksum(src_ip, dst_ip, tcp_seg_len);
+        assert_eq!(helper, manual,
+            "tcp_pseudo_header_checksum must match manual fold of the 12-byte pseudo-header");
+    }
+
+    // A-HW Task 7: tx_offload_finalize exercises the memory-rewrite path
+    // via the pure `tx_offload_rewrite_cksums` helper, which is testable
+    // against a plain byte buffer without synthesizing an opaque rte_mbuf.
+    // The ol_flags / l2-l4_len triple flows through sys-crate shims that
+    // require a real mempool-allocated mbuf to call meaningfully; those
+    // paths are covered by an integration smoke test under A-HW Task 13.
+    //
+    // The feature-off (offload_active=false) no-op path is covered by the
+    // null-pointer short-circuit: the finalizer never dereferences when
+    // offload_active is false, so a null mbuf pointer is safe.
+
+    #[cfg(feature = "hw-offload-tx-cksum")]
+    #[test]
+    fn tx_offload_rewrite_cksums_writes_pseudo_and_zeroes_ip() {
+        // Build a full segment with build_segment, then rewrite cksum
+        // fields via the finalizer helper and verify bytes match the
+        // expected pseudo-header-only TCP cksum + zero IPv4 cksum.
+        let seg = base();
+        let mut frame = [0u8; 128];
+        let n = build_segment(&seg, &mut frame).expect("build_segment");
+        let opts_len = seg.options.encoded_len();
+        let tcp_hdr_len = TCP_HDR_MIN + opts_len;
+        let payload_len = seg.payload.len() as u32;
+
+        let ok = tx_offload_rewrite_cksums(
+            &mut frame[..n],
+            seg.src_ip,
+            seg.dst_ip,
+            tcp_hdr_len,
+            payload_len,
+        );
+        assert!(ok);
+
+        // IPv4 header cksum zeroed.
+        let ip_cksum_off = ETH_HDR_LEN + 10;
+        assert_eq!(frame[ip_cksum_off], 0);
+        assert_eq!(frame[ip_cksum_off + 1], 0);
+
+        // TCP cksum field == pseudo-header-only fold.
+        let tcp_cksum_off = ETH_HDR_LEN + IPV4_HDR_MIN + 16;
+        let pseudo_len = tcp_hdr_len as u32 + payload_len;
+        let expected = tcp_pseudo_header_checksum(seg.src_ip, seg.dst_ip, pseudo_len);
+        let actual = u16::from_be_bytes([frame[tcp_cksum_off], frame[tcp_cksum_off + 1]]);
+        assert_eq!(actual, expected);
+    }
+
+    #[cfg(feature = "hw-offload-tx-cksum")]
+    #[test]
+    fn tx_offload_rewrite_cksums_rejects_short_frame() {
+        let mut frame = [0u8; ETH_HDR_LEN + IPV4_HDR_MIN + TCP_HDR_MIN - 1];
+        let ok = tx_offload_rewrite_cksums(&mut frame, 0x0a000001, 0x0a000002, 20, 0);
+        assert!(!ok, "short frame must be rejected by rewrite helper");
+    }
+
+    #[cfg(feature = "hw-offload-tx-cksum")]
+    #[test]
+    fn tx_offload_finalize_noop_on_null_mbuf() {
+        // offload_active == true but a null mbuf pointer hits the early
+        // return. This also exercises the unsafe fn contract: caller may
+        // pass null safely; nothing is dereferenced.
+        let seg = base();
+        unsafe {
+            tx_offload_finalize(std::ptr::null_mut(), &seg, 128, true);
+        }
+    }
+
+    #[cfg(feature = "hw-offload-tx-cksum")]
+    #[test]
+    fn tx_offload_finalize_noop_when_offload_inactive() {
+        // offload_active == false ⇒ early return. With a null mbuf we
+        // also verify the function does not dereference when inactive.
+        let seg = base();
+        unsafe {
+            tx_offload_finalize(std::ptr::null_mut(), &seg, 128, false);
+        }
+    }
+
+    // Feature-off build — the finalizer is a no-op stub. Exercise the
+    // no-op signature to confirm it compiles + links across the feature
+    // matrix. Runs only when hw-offload-tx-cksum is compile-off.
+    #[cfg(not(feature = "hw-offload-tx-cksum"))]
+    #[test]
+    fn tx_offload_finalize_feature_off_is_noop() {
+        let seg = base();
+        unsafe {
+            tx_offload_finalize(std::ptr::null_mut(), &seg, 128, true);
+            tx_offload_finalize(std::ptr::null_mut(), &seg, 128, false);
+        }
     }
 }

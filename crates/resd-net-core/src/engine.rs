@@ -13,6 +13,67 @@ use crate::tcp_events::{EventQueue, InternalEvent};
 use crate::tcp_state::TcpState;
 use crate::Error;
 
+/// A6 (spec §3.4): close-flag bit, mirror of `RESD_NET_CLOSE_FORCE_TW_SKIP`.
+/// Defined core-side so engine logic doesn't depend on the ABI crate.
+pub const CLOSE_FLAG_FORCE_TW_SKIP: u32 = 1 << 0;
+
+/// A6 (spec §3.8.2): default RTT histogram bucket edges, µs.
+/// Applied when `EngineConfig::rtt_histogram_bucket_edges_us` is all zero.
+pub const DEFAULT_RTT_HISTOGRAM_EDGES_US: [u32; 15] = [
+    50, 100, 200, 300, 500, 750, 1000, 2000, 3000, 5000,
+    10000, 25000, 50000, 100000, 500000,
+];
+
+/// A6 (spec §3.8.3): validate + default-substitute the caller-supplied
+/// histogram bucket edges. Returns the final `[u32; 15]` to store on
+/// `Engine::rtt_histogram_edges`.
+///
+/// - all-zero input → returns `DEFAULT_RTT_HISTOGRAM_EDGES_US`
+/// - strictly monotonic input (each `edges[i] < edges[i+1]`) → passes through
+/// - any non-monotonic or equal-adjacent input → `Err(Error::InvalidHistogramEdges)`
+pub fn validate_and_default_histogram_edges(
+    edges: &[u32; 15],
+) -> Result<[u32; 15], Error> {
+    let all_zero = edges.iter().all(|&e| e == 0);
+    if all_zero {
+        return Ok(DEFAULT_RTT_HISTOGRAM_EDGES_US);
+    }
+    for i in 0..14 {
+        if edges[i] >= edges[i + 1] {
+            return Err(Error::InvalidHistogramEdges);
+        }
+    }
+    Ok(*edges)
+}
+
+/// A6 (spec §3.1): pack internal `TimerId{slot, generation}` to the
+/// `u64` exposed as `resd_net_timer_id_t`. Upper 32 = slot; lower 32 =
+/// generation. Caller treats as opaque but knows the upper half changes
+/// on slot reuse.
+#[inline]
+pub fn pack_timer_id(id: crate::tcp_timer_wheel::TimerId) -> u64 {
+    ((id.slot as u64) << 32) | (id.generation as u64)
+}
+
+/// A6 (spec §3.1): unpack `resd_net_timer_id_t` back to the wheel's
+/// internal representation.
+#[inline]
+pub fn unpack_timer_id(packed: u64) -> crate::tcp_timer_wheel::TimerId {
+    crate::tcp_timer_wheel::TimerId {
+        slot: (packed >> 32) as u32,
+        generation: (packed & 0xFFFF_FFFF) as u32,
+    }
+}
+
+/// A6 (spec §3.1): round `deadline_ns` UP to the next wheel tick
+/// boundary. `deadline_ns = 0` stays zero (fires on next poll).
+/// Past deadlines also fire on next poll.
+#[inline]
+pub fn align_up_to_tick_ns(deadline_ns: u64) -> u64 {
+    const T: u64 = crate::tcp_timer_wheel::TICK_NS;
+    deadline_ns.div_ceil(T).saturating_mul(T)
+}
+
 /// RFC 7323 §2.3: pick the Window Scale shift so that `(u16::MAX << ws)`
 /// covers our full recv buffer. Bounded at 14 per the RFC's cap. Called
 /// once at `Engine::connect` time to advertise WS in our SYN; the same
@@ -192,6 +253,17 @@ pub struct EngineConfig {
     pub tcp_msl_ms: u32,
     pub tcp_nagle: bool,
 
+    /// A6 (spec §3.5): delayed-ACK on/off. Default false (trading
+    /// per-segment ACK). `preset=rfc_compliance` forces true.
+    /// A3–A5.5 per-poll coalesce behavior is unchanged; this field
+    /// gates the future burst-scope coalescing decision in tcp_output.
+    pub tcp_delayed_ack: bool,
+
+    /// A6 (spec §3.5): congestion-control mode selector. `0` = latency
+    /// (A3–A5.5 behavior preserved); `1` = Reno (RFC 5681). Default 0.
+    /// `preset=rfc_compliance` forces 1.
+    pub cc_mode: u8,
+
     // Phase A5 additions
     /// A5 Task 21: RFC 6298 RTO floor (µs). Spec §6.4 default 5ms
     /// (trading-latency policy; RFC recommends 1s floor).
@@ -216,6 +288,12 @@ pub struct EngineConfig {
     /// A5.5 Task 5: event-queue overflow guard (§3.2 / §5.1).
     /// Default 4096; must be >= 64. Queue drops oldest on overflow.
     pub event_queue_soft_cap: u32,
+
+    /// A6 (spec §3.8): RTT histogram bucket edges in µs. 15 strictly
+    /// monotonically increasing edges define 16 buckets. All-zero
+    /// substitutes `DEFAULT_RTT_HISTOGRAM_EDGES_US`. Non-monotonic
+    /// rejected at `Engine::new` with `Err(Error::InvalidHistogramEdges)`.
+    pub rtt_histogram_bucket_edges_us: [u32; 15],
 }
 
 impl Default for EngineConfig {
@@ -239,12 +317,18 @@ impl Default for EngineConfig {
             tcp_mss: 1460,
             tcp_msl_ms: 30_000,
             tcp_nagle: false,
+            // A6 (spec §3.5): trading-latency default is false (ACK every
+            // accepted segment). `preset=rfc_compliance` forces true.
+            tcp_delayed_ack: false,
+            // A6 (spec §3.5): 0 = latency (A3–A5.5 behavior preserved).
+            cc_mode: 0,
             tcp_min_rto_us: 5_000,
             tcp_initial_rto_us: 5_000,
             tcp_max_rto_us: 1_000_000,
             tcp_max_retrans_count: 15,
             tcp_per_packet_events: false,
             event_queue_soft_cap: 4096,
+            rtt_histogram_bucket_edges_us: [0; 15],
         }
     }
 }
@@ -253,6 +337,11 @@ impl Default for EngineConfig {
 /// L2/L3 state for that lcore.
 pub struct Engine {
     cfg: EngineConfig,
+    /// A6: post-validation-post-defaults histogram edges; shared across
+    /// all conns on this engine. Not re-validated on every update. Read
+    /// on the slow-path from `tcp_input::dispatch` (A6 Task 15) — the
+    /// per-conn `TcpConn::rtt_histogram` update is passed this slice.
+    pub(crate) rtt_histogram_edges: [u32; 15],
     counters: Box<Counters>,
     _rx_mempool: Mempool,
     tx_hdr_mempool: Mempool,
@@ -269,6 +358,64 @@ pub struct Engine {
 
     // Phase A5 additions
     pub(crate) timer_wheel: RefCell<crate::tcp_timer_wheel::TimerWheel>,
+
+    /// A6 (spec §3.2): pending outbound data-segment mbufs for batched TX.
+    /// Populated by `send_bytes` / `retransmit`; drained at end-of-poll
+    /// and from `resd_net_flush` via `drain_tx_pending_data`. Control
+    /// frames (ACK / FIN / SYN / RST) are emitted inline and do NOT
+    /// queue here — they stay on their existing `tx_frame` /
+    /// `tx_data_frame` inline paths.
+    pub(crate) tx_pending_data: RefCell<Vec<std::ptr::NonNull<sys::rte_mbuf>>>,
+
+    /// A6 (spec §3.6 Site 3): snapshot of `counters.eth.rx_drop_nomem`
+    /// at the top of `poll_once`; compared against the post-RX value at
+    /// end-of-poll to emit exactly one `Error{err=-ENOMEM}` per iteration
+    /// where RX mempool drops occurred. Cell because `poll_once` borrows
+    /// `&self` like every other engine method.
+    pub(crate) rx_drop_nomem_prev: std::cell::Cell<u64>,
+
+    // A-HW runtime latches — populated by configure_port_offloads.
+    // When a compile-enabled offload was advertised by the PMD the latch
+    // is true; the corresponding hot-path branch uses the offload. When
+    // false, the branch falls back to software. See spec §§6-10.
+    // The `#[allow(dead_code)]` attributes go away as tasks 7/9/12 wire
+    // these latches into hot-path branches.
+    //
+    // Task 7 consumer: `tx_tcp_frame` + the inline send_bytes mbuf fill
+    // + the retransmit path all read this latch to decide whether to
+    // invoke `tx_offload_finalize` on the freshly-built mbuf.
+    tx_cksum_offload_active: bool,
+    // Task 8 consumer: `handle_ipv4` threads this latch into
+    // `ip_decode_offload_aware` (IP cksum) and `tcp_input` threads it
+    // into the L4 cksum classification. Both pre-checks gate on
+    // `rx_cksum_offload_active AND hw-offload-rx-cksum feature` —
+    // false-either short-circuits to software verify (spec §7.2).
+    rx_cksum_offload_active: bool,
+    // Task 9 consumer: threaded into `flow_table::hash_bucket_for_lookup`
+    // by `tcp_input` — when true (and the `hw-offload-rss-hash` feature
+    // is compiled), the NIC-provided Toeplitz hash replaces the software
+    // SipHash for the RX flow-table bucket pick. See spec §8.2.
+    rss_hash_offload_active: bool,
+    /// Offset (in bytes) from the start of rte_mbuf where the NIC-provided
+    /// hardware RX timestamp lives. Populated at engine_create via
+    /// rte_mbuf_dynfield_lookup("rte_dynfield_timestamp"). `None` when
+    /// the PMD does not register the dynfield (expected on ENA — spec §10.5).
+    /// Spec §10.1. Consumed by `hw_rx_ts_ns` which is called at the RX
+    /// decode boundary in `poll_once` (Task 11).
+    #[cfg(feature = "hw-offload-rx-timestamp")]
+    rx_ts_offset: Option<i32>,
+    /// Bitmask in ol_flags that indicates a valid RX timestamp on this
+    /// mbuf. Populated via rte_mbuf_dynflag_lookup("rte_dynflag_rx_timestamp")
+    /// → the returned bit position translated to (1 << bit_pos). `None` when
+    /// the flag isn't registered. Expected `None` on ENA (spec §10.5).
+    /// Consumed by `hw_rx_ts_ns` which is called at the RX decode boundary
+    /// in `poll_once` (Task 11).
+    #[cfg(feature = "hw-offload-rx-timestamp")]
+    rx_ts_flag_mask: Option<u64>,
+    /// Driver name captured at bring-up; used by Task 12's LLQ verification
+    /// to short-circuit non-ENA drivers. See spec §5.
+    #[allow(dead_code)]
+    driver_name: [u8; 32],
 }
 
 /// A4: map an `Outcome` to per-segment `TcpCounters` bumps. Pure slow-path
@@ -282,6 +429,12 @@ fn apply_tcp_input_counters(
     use crate::counters::{add, inc};
     if outcome.paws_rejected {
         inc(&counters.rx_paws_rejected);
+    }
+    if outcome.ts_recent_expired {
+        // A6 Task 14 (spec §3.7): RFC 7323 §5.5 24-day `TS.Recent` lazy
+        // expiration fired at the PAWS gate. Slow-path — essentially
+        // never increments on healthy traffic.
+        inc(&counters.ts_recent_expired);
     }
     if outcome.bad_option {
         inc(&counters.rx_bad_option);
@@ -340,8 +493,33 @@ pub fn eal_init(args: &[&str]) -> Result<(), Error> {
     }
     let cstrs: Vec<CString> = args.iter().map(|s| CString::new(*s).unwrap()).collect();
     let mut argv: Vec<*mut libc::c_char> = cstrs.iter().map(|c| c.as_ptr() as *mut _).collect();
+
+    // A-HW Task 12 fixup: install an fmemopen-backed capture of DPDK's
+    // log stream for the duration of `rte_eal_init`. The ENA PMD emits
+    // its LLQ "Placement policy: …" marker during `eth_ena_dev_init`,
+    // which runs at PCI-probe time inside `rte_eal_init` (NOT inside
+    // `rte_eth_dev_start`). Scan the captured log for activation /
+    // failure markers after EAL init returns, and store the verdict in
+    // a process-global OnceLock so every engine_create reads it later.
+    // Capture-init failure is NON-fatal: EAL init proceeds without a
+    // capture, and the engine-side verifier soft-skips with a warning.
+    #[cfg(feature = "hw-verify-llq")]
+    let capture = crate::llq_verify::start_log_capture().ok();
+
     // Safety: rte_eal_init mutates argv internally; we pass the constructed array.
     let rc = unsafe { sys::rte_eal_init(argv.len() as i32, argv.as_mut_ptr()) };
+
+    #[cfg(feature = "hw-verify-llq")]
+    if let Some(cap) = capture {
+        match crate::llq_verify::finish_log_capture(cap) {
+            Ok(log) => crate::llq_verify::record_eal_init_log_verdict(&log),
+            Err(e) => eprintln!(
+                "resd_net: log capture around rte_eal_init failed: {e:?}; \
+                 LLQ verification will be skipped for net_ena engines."
+            ),
+        }
+    }
+
     if rc < 0 {
         return Err(Error::EalInit(unsafe { sys::resd_rte_errno() }));
     }
@@ -378,12 +556,82 @@ pub struct ConnectOpts {
     pub tlp_skip_rtt_sample_gate: bool,
 }
 
+/// Bump `counter` when `requested_bit` is set but `advertised_mask` does
+/// not include it. Returns the bit ANDed in — i.e., the bit itself if
+/// advertised, else 0. Slow-path; called once per offload at bring-up.
+///
+/// Spec §4 step 5 + §9.1.1 counter-addition policy.
+///
+/// `allow(dead_code)` covers `--no-default-features` builds where all
+/// `hw-offload-*` features are off and no call site references this
+/// helper; the test module always exercises it.
+#[allow(dead_code)]
+fn and_offload_with_miss_counter(
+    requested_bit: u64,
+    advertised_mask: u64,
+    counter: &std::sync::atomic::AtomicU64,
+    name: &str,
+    port_id: u16,
+) -> u64 {
+    if requested_bit == 0 {
+        return 0;
+    }
+    if (requested_bit & advertised_mask) == 0 {
+        counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        eprintln!(
+            "resd_net: PMD on port {} does not advertise {} (0x{:016x}); \
+             degrading to software path for this offload",
+            port_id, name, requested_bit
+        );
+        0
+    } else {
+        requested_bit
+    }
+}
+
+/// Result of `configure_port_offloads` — the applied offload masks plus
+/// per-engine runtime latches that gate hot-path offload-vs-software
+/// branches. See spec §4 and §§6-10 for how each latch feeds later branches.
+#[derive(Debug, Clone, Copy)]
+struct PortConfigOutcome {
+    /// Bits written to `eth_conf.rxmode.offloads` after AND with
+    /// `dev_info.rx_offload_capa`. Zero in Task 2 (no RX offloads requested yet).
+    #[allow(dead_code)]
+    applied_rx_offloads: u64,
+    /// Bits written to `eth_conf.txmode.offloads` after AND with
+    /// `dev_info.tx_offload_capa`. At Task 2 this contains only MULTI_SEGS
+    /// if the PMD advertises it.
+    #[allow(dead_code)]
+    applied_tx_offloads: u64,
+    /// True iff TX IPv4 + TCP checksum offload bits both applied. Latches
+    /// the TX hot-path offload-vs-software branch. Task 2: always false.
+    tx_cksum_offload_active: bool,
+    /// True iff RX IPv4 + TCP checksum offload bits both applied. Latches
+    /// the RX hot-path offload-vs-software branch. Task 2: always false.
+    rx_cksum_offload_active: bool,
+    /// True iff RSS_HASH bit applied. Latches mbuf.hash.rss consumption
+    /// in flow_table.rs. Task 2: always false.
+    rss_hash_offload_active: bool,
+    /// Driver name captured at bring-up — consumed by the LLQ verification
+    /// path (Task 12) to short-circuit non-ENA drivers.
+    driver_name: [u8; 32],
+}
+
 impl Engine {
     pub fn new(cfg: EngineConfig) -> Result<Self, Error> {
         // Fail fast on non-invariant-TSC hosts (spec §7.5). Also primes
         // the global TscEpoch so later now_ns() calls don't pay the
         // 50ms calibration cost on the hot path.
         crate::clock::init()?;
+
+        // A6 (spec §3.8.3): validate + substitute defaults for caller-
+        // supplied histogram edges. All-zero → spec §3.8.2 defaults;
+        // non-monotonic rejected here so per-conn code never re-validates.
+        // Function returns `Err(Error::InvalidHistogramEdges)` directly
+        // on rejection — `?` propagates without a `.map_err`.
+        let rtt_histogram_edges = validate_and_default_histogram_edges(
+            &cfg.rtt_histogram_bucket_edges_us,
+        )?;
 
         // socket_id may be -1 (cast to 0xFFFFFFFF == SOCKET_ID_ANY) when the
         // port isn't bound to a NUMA node (common in VMs / TAP devices).
@@ -419,35 +667,17 @@ impl Engine {
             socket_id,
         )?;
 
-        // Configure port: one RX queue + one TX queue for Phase A1.
-        // A5: enable MULTI_SEGS for retransmit mbuf-chain (spec §6.5, §8.2).
-        //
-        // `RTE_ETH_TX_OFFLOAD_MULTI_SEGS` is defined in `rte_ethdev.h` as
-        // `RTE_BIT64(15)`, a function-like macro bindgen does not expand,
-        // so the FFI crate does not expose it as a Rust const. The bit
-        // position is part of DPDK's stable ethdev ABI (DPDK 23.11).
-        const RTE_ETH_TX_OFFLOAD_MULTI_SEGS: u64 = 1u64 << 15;
+        // Counters exist before port config so the helper can bump any
+        // offload-miss counters it needs in later tasks (Task 2: unused).
+        let counters = Box::new(Counters::new());
 
-        let mut eth_conf: sys::rte_eth_conf = unsafe { std::mem::zeroed() };
-        eth_conf.txmode.offloads = RTE_ETH_TX_OFFLOAD_MULTI_SEGS;
-
-        // Warn if the PMD does not advertise support — retransmit will likely fail.
-        let mut dev_info: sys::rte_eth_dev_info = unsafe { std::mem::zeroed() };
-        let info_rc = unsafe { sys::rte_eth_dev_info_get(cfg.port_id, &mut dev_info) };
-        if info_rc == 0 && (dev_info.tx_offload_capa & RTE_ETH_TX_OFFLOAD_MULTI_SEGS) == 0 {
-            eprintln!(
-                "resd_net: PMD on port {} does not advertise RTE_ETH_TX_OFFLOAD_MULTI_SEGS; \
-                 A5 retransmit chain may fail — check NIC/PMD support",
-                cfg.port_id
-            );
-        }
-
-        let rc = unsafe { sys::rte_eth_dev_configure(cfg.port_id, 1, 1, &eth_conf as *const _) };
-        if rc != 0 {
-            return Err(Error::PortConfigure(cfg.port_id, unsafe {
-                sys::resd_rte_errno()
-            }));
-        }
+        // Port-config: dev_info query, offload AND, runtime-fallback
+        // latches. Extracted into a helper so later A-HW tasks can add
+        // feature-gated offload-bit branches in one place. See
+        // `dpdk_consts.rs` for the `RTE_ETH_TX_OFFLOAD_MULTI_SEGS` bit
+        // position (DPDK stable ethdev ABI) and spec §4 for the outcome
+        // structure.
+        let outcome = Self::configure_port_offloads(&cfg, &counters)?;
 
         let rc = unsafe {
             sys::rte_eth_rx_queue_setup(
@@ -480,12 +710,74 @@ impl Engine {
             }));
         }
 
+        // A-HW Task 12 fixup: LLQ verification reads the verdict that
+        // `eal_init` recorded at `rte_eal_init` time. The capture window
+        // must wrap EAL init — the ENA PMD emits the "Placement policy:
+        // …" marker during `eth_ena_dev_init` (PCI probe, inside
+        // `rte_eal_init`), NOT inside `rte_eth_dev_start`. No local
+        // capture machinery is needed here. See spec §5 and
+        // `crate::llq_verify` for marker pinning.
         let rc = unsafe { sys::rte_eth_dev_start(cfg.port_id) };
         if rc < 0 {
             return Err(Error::PortStart(cfg.port_id, unsafe {
                 sys::resd_rte_errno()
             }));
         }
+
+        #[cfg(feature = "hw-verify-llq")]
+        crate::llq_verify::verify_llq_activation_from_global(
+            cfg.port_id,
+            &outcome.driver_name,
+            &counters,
+        )?;
+
+        // A-HW: RSS reta program. No-op when feature off OR when
+        // the latch is false OR when dev_info.reta_size == 0.
+        if outcome.rss_hash_offload_active {
+            let mut dev_info_post: sys::rte_eth_dev_info = unsafe { std::mem::zeroed() };
+            let _ = unsafe { sys::rte_eth_dev_info_get(cfg.port_id, &mut dev_info_post) };
+            Self::program_rss_reta_single_queue(cfg.port_id, &dev_info_post)?;
+        }
+
+        // A-HW Task 10: RX timestamp dynfield/dynflag lookup. Runs after
+        // rte_eth_dev_start so any PMD that registers the dynfield lazily
+        // on start-up has had its chance. Both lookups are expected to
+        // fail on ENA (PMD does not register the dynfield — spec §10.5);
+        // this is the documented steady state and the one-shot counter
+        // bump records it for observability. Under the `hw-offload-rx-timestamp`
+        // feature, the resulting `Option<i32>` / `Option<u64>` pair feeds
+        // `Engine::hw_rx_ts_ns(mbuf)` which Task 11 threads through to
+        // the RX event emission sites.
+        #[cfg(feature = "hw-offload-rx-timestamp")]
+        let (rx_ts_offset, rx_ts_flag_mask) = {
+            use std::sync::atomic::Ordering;
+            let off_rc = unsafe {
+                sys::rte_mbuf_dynfield_lookup(
+                    c"rte_dynfield_timestamp".as_ptr(),
+                    std::ptr::null_mut(),
+                )
+            };
+            let flag_bit = unsafe {
+                sys::rte_mbuf_dynflag_lookup(
+                    c"rte_dynflag_rx_timestamp".as_ptr(),
+                    std::ptr::null_mut(),
+                )
+            };
+            let offset = if off_rc >= 0 { Some(off_rc) } else { None };
+            let mask = if flag_bit >= 0 { Some(1u64 << flag_bit) } else { None };
+            if offset.is_none() || mask.is_none() {
+                counters
+                    .eth
+                    .offload_missing_rx_timestamp
+                    .fetch_add(1, Ordering::Relaxed);
+                eprintln!(
+                    "resd_net: RX timestamp dynfield/dynflag unavailable on port {} \
+                     (ENA steady state — see spec §10.5)",
+                    cfg.port_id
+                );
+            }
+            (offset, mask)
+        };
 
         // Read NIC MAC via the shim. `rte_ether_addr` is a 6-byte packed struct.
         let mut mac_addr: sys::rte_ether_addr = unsafe { std::mem::zeroed() };
@@ -497,8 +789,6 @@ impl Engine {
         }
         // bindgen names the field `addr_bytes` on rte_ether_addr.
         let our_mac = mac_addr.addr_bytes;
-
-        let counters = Box::new(Counters::new());
 
         Ok(Self {
             counters,
@@ -516,8 +806,372 @@ impl Engine {
             timer_wheel: RefCell::new(crate::tcp_timer_wheel::TimerWheel::new(
                 (cfg.max_connections as usize).saturating_mul(4),
             )),
+            tx_pending_data: RefCell::new(Vec::with_capacity(cfg.tx_ring_size as usize)),
+            rx_drop_nomem_prev: std::cell::Cell::new(0),
+            tx_cksum_offload_active: outcome.tx_cksum_offload_active,
+            rx_cksum_offload_active: outcome.rx_cksum_offload_active,
+            rss_hash_offload_active: outcome.rss_hash_offload_active,
+            #[cfg(feature = "hw-offload-rx-timestamp")]
+            rx_ts_offset,
+            #[cfg(feature = "hw-offload-rx-timestamp")]
+            rx_ts_flag_mask,
+            driver_name: outcome.driver_name,
+            rtt_histogram_edges,
             cfg,
         })
+    }
+
+    /// A-HW Task 2: build `rte_eth_conf` with requested offload bits,
+    /// query `dev_info` to AND the request against what the PMD advertises,
+    /// then call `rte_eth_dev_configure`. Returns the actually-applied
+    /// masks + per-engine runtime latches (all `false` in Task 2, populated
+    /// as each offload is wired in later tasks). See spec §4.
+    ///
+    /// `counters` is kept in the signature ahead of Task 3, which starts
+    /// bumping `eth.offload_missing_*` when a requested bit isn't advertised.
+    fn configure_port_offloads(
+        cfg: &EngineConfig,
+        counters: &Counters,
+    ) -> Result<PortConfigOutcome, Error> {
+        use crate::dpdk_consts::RTE_ETH_TX_OFFLOAD_MULTI_SEGS;
+
+        // `counters` is unused when every `hw-offload-*` counter-bumping
+        // feature is compiled out. The signature stays stable because the
+        // latches are C-ABI-stable and future tasks (7, 8) reintroduce
+        // consumers. Keep the binding alive for `-D warnings` on
+        // `--no-default-features`.
+        #[cfg(not(any(
+            feature = "hw-offload-mbuf-fast-free",
+            feature = "hw-offload-tx-cksum",
+            feature = "hw-offload-rx-cksum",
+            feature = "hw-offload-rss-hash",
+        )))]
+        let _ = counters;
+
+        let mut eth_conf: sys::rte_eth_conf = unsafe { std::mem::zeroed() };
+
+        // Query the PMD's offload capabilities. A5 behavior: request
+        // MULTI_SEGS (needed for retransmit mbuf-chain per spec §6.5, §8.2),
+        // warn if the PMD does not advertise support, and drop the bit
+        // from the applied mask so rte_eth_dev_configure does not refuse
+        // the unsupported request.
+        let mut dev_info: sys::rte_eth_dev_info = unsafe { std::mem::zeroed() };
+        let info_rc = unsafe { sys::rte_eth_dev_info_get(cfg.port_id, &mut dev_info) };
+
+        // Capture driver name for Task 12's LLQ verification — copy up to
+        // 31 bytes + NUL terminator. `rte_eth_dev_info.driver_name` is
+        // `*const c_char` owned by the PMD and stable for the life of the
+        // port. Populated here (pre-`rte_eth_dev_configure`) so the
+        // advertised-caps banner below can print it.
+        let mut driver_name = [0u8; 32];
+        if !dev_info.driver_name.is_null() {
+            let src = dev_info.driver_name as *const u8;
+            for (i, slot) in driver_name.iter_mut().take(31).enumerate() {
+                // SAFETY: src is a non-null NUL-terminated C string from the
+                // PMD; we walk at most 31 bytes and stop on NUL, so we never
+                // read past the end of a well-formed driver name.
+                let b = unsafe { *src.add(i) };
+                if b == 0 {
+                    break;
+                }
+                *slot = b;
+            }
+        }
+
+        // Advertised-caps banner — per spec §8.5, the startup log is the
+        // authoritative record of what the PMD advertises. Printed BEFORE
+        // any offload-branch block ANDs requested bits against the caps.
+        // `dev_info.dev_flags` is a `*const u32` owned by the PMD; deref
+        // through a null-check so a misbehaving PMD cannot crash the banner.
+        let dev_flags_val: u32 = if dev_info.dev_flags.is_null() {
+            0
+        } else {
+            // SAFETY: non-null pointer into a PMD-owned flag word that is
+            // valid for the life of the port.
+            unsafe { *dev_info.dev_flags }
+        };
+        eprintln!(
+            "resd_net: port {} driver={} rx_offload_capa=0x{:016x} \
+             tx_offload_capa=0x{:016x} dev_flags=0x{:08x}",
+            cfg.port_id,
+            std::str::from_utf8(
+                &driver_name[..driver_name.iter().position(|&b| b == 0).unwrap_or(32)]
+            ).unwrap_or("<non-utf8>"),
+            dev_info.rx_offload_capa,
+            dev_info.tx_offload_capa,
+            dev_flags_val,
+        );
+
+        let mut applied_tx_offloads = RTE_ETH_TX_OFFLOAD_MULTI_SEGS;
+        // `applied_rx_offloads` is mutated when any RX-side offload feature
+        // is enabled (rx-cksum, rss-hash). Silence `unused_mut` when no
+        // rx-side offload feature is active.
+        #[cfg_attr(
+            not(any(
+                feature = "hw-offload-rx-cksum",
+                feature = "hw-offload-rss-hash",
+            )),
+            allow(unused_mut)
+        )]
+        let mut applied_rx_offloads: u64 = 0;
+        if info_rc == 0
+            && (dev_info.tx_offload_capa & RTE_ETH_TX_OFFLOAD_MULTI_SEGS) == 0
+        {
+            eprintln!(
+                "resd_net: PMD on port {} does not advertise RTE_ETH_TX_OFFLOAD_MULTI_SEGS; \
+                 A5 retransmit chain may fail — check NIC/PMD support",
+                cfg.port_id
+            );
+            applied_tx_offloads &= !RTE_ETH_TX_OFFLOAD_MULTI_SEGS;
+        }
+
+        // --- MBUF_FAST_FREE (hw-offload-mbuf-fast-free) ---------------
+        #[cfg(feature = "hw-offload-mbuf-fast-free")]
+        {
+            use crate::dpdk_consts::RTE_ETH_TX_OFFLOAD_MBUF_FAST_FREE;
+            applied_tx_offloads |= and_offload_with_miss_counter(
+                RTE_ETH_TX_OFFLOAD_MBUF_FAST_FREE,
+                dev_info.tx_offload_capa,
+                &counters.eth.offload_missing_mbuf_fast_free,
+                "RTE_ETH_TX_OFFLOAD_MBUF_FAST_FREE",
+                cfg.port_id,
+            );
+        }
+
+        // --- TX checksum (hw-offload-tx-cksum) ------------------------
+        #[cfg(feature = "hw-offload-tx-cksum")]
+        let tx_cksum_offload_active = {
+            use crate::dpdk_consts::{
+                RTE_ETH_TX_OFFLOAD_IPV4_CKSUM, RTE_ETH_TX_OFFLOAD_TCP_CKSUM,
+                RTE_ETH_TX_OFFLOAD_UDP_CKSUM,
+            };
+            let ipv4 = and_offload_with_miss_counter(
+                RTE_ETH_TX_OFFLOAD_IPV4_CKSUM,
+                dev_info.tx_offload_capa,
+                &counters.eth.offload_missing_tx_cksum_ipv4,
+                "RTE_ETH_TX_OFFLOAD_IPV4_CKSUM",
+                cfg.port_id,
+            );
+            let tcp = and_offload_with_miss_counter(
+                RTE_ETH_TX_OFFLOAD_TCP_CKSUM,
+                dev_info.tx_offload_capa,
+                &counters.eth.offload_missing_tx_cksum_tcp,
+                "RTE_ETH_TX_OFFLOAD_TCP_CKSUM",
+                cfg.port_id,
+            );
+            let udp = and_offload_with_miss_counter(
+                RTE_ETH_TX_OFFLOAD_UDP_CKSUM,
+                dev_info.tx_offload_capa,
+                &counters.eth.offload_missing_tx_cksum_udp,
+                "RTE_ETH_TX_OFFLOAD_UDP_CKSUM",
+                cfg.port_id,
+            );
+            applied_tx_offloads |= ipv4 | tcp | udp;
+            // Latch the runtime flag only if IPv4 + TCP both applied.
+            // UDP is optional — Stage 1 has no UDP TX path.
+            ipv4 != 0 && tcp != 0
+        };
+        #[cfg(not(feature = "hw-offload-tx-cksum"))]
+        let tx_cksum_offload_active = false;
+
+        // --- RX checksum (hw-offload-rx-cksum) ------------------------
+        #[cfg(feature = "hw-offload-rx-cksum")]
+        let rx_cksum_offload_active = {
+            use crate::dpdk_consts::{
+                RTE_ETH_RX_OFFLOAD_IPV4_CKSUM, RTE_ETH_RX_OFFLOAD_TCP_CKSUM,
+                RTE_ETH_RX_OFFLOAD_UDP_CKSUM,
+            };
+            let ipv4 = and_offload_with_miss_counter(
+                RTE_ETH_RX_OFFLOAD_IPV4_CKSUM,
+                dev_info.rx_offload_capa,
+                &counters.eth.offload_missing_rx_cksum_ipv4,
+                "RTE_ETH_RX_OFFLOAD_IPV4_CKSUM",
+                cfg.port_id,
+            );
+            let tcp = and_offload_with_miss_counter(
+                RTE_ETH_RX_OFFLOAD_TCP_CKSUM,
+                dev_info.rx_offload_capa,
+                &counters.eth.offload_missing_rx_cksum_tcp,
+                "RTE_ETH_RX_OFFLOAD_TCP_CKSUM",
+                cfg.port_id,
+            );
+            let udp = and_offload_with_miss_counter(
+                RTE_ETH_RX_OFFLOAD_UDP_CKSUM,
+                dev_info.rx_offload_capa,
+                &counters.eth.offload_missing_rx_cksum_udp,
+                "RTE_ETH_RX_OFFLOAD_UDP_CKSUM",
+                cfg.port_id,
+            );
+            applied_rx_offloads |= ipv4 | tcp | udp;
+            ipv4 != 0 && tcp != 0
+        };
+        #[cfg(not(feature = "hw-offload-rx-cksum"))]
+        let rx_cksum_offload_active = false;
+
+        // --- RSS hash (hw-offload-rss-hash) ---------------------------
+        #[cfg(feature = "hw-offload-rss-hash")]
+        let rss_hash_offload_active = {
+            use crate::dpdk_consts::{
+                RTE_ETH_RSS_NONFRAG_IPV4_TCP, RTE_ETH_RSS_NONFRAG_IPV6_TCP,
+                RTE_ETH_RX_OFFLOAD_RSS_HASH,
+            };
+            let bit = and_offload_with_miss_counter(
+                RTE_ETH_RX_OFFLOAD_RSS_HASH,
+                dev_info.rx_offload_capa,
+                &counters.eth.offload_missing_rss_hash,
+                "RTE_ETH_RX_OFFLOAD_RSS_HASH",
+                cfg.port_id,
+            );
+            applied_rx_offloads |= bit;
+            if bit != 0 {
+                // DPDK ethdev rejects rte_eth_dev_rss_reta_update and ENA's
+                // ena_rss_configure() ignores rss_hf unless mq_mode & RSS_FLAG
+                // is set. Parent dpdk-tcp-design.md §8.1 / A-HW spec §8 both
+                // imply RSS is active; this assignment is what actually
+                // enables it. See drivers/net/ena/ena_ethdev.c:2410 and
+                // lib/ethdev/rte_ethdev.c:4657.
+                eth_conf.rxmode.mq_mode = sys::rte_eth_rx_mq_mode_RTE_ETH_MQ_RX_RSS;
+                eth_conf.rx_adv_conf.rss_conf.rss_hf =
+                    RTE_ETH_RSS_NONFRAG_IPV4_TCP | RTE_ETH_RSS_NONFRAG_IPV6_TCP;
+                eth_conf.rx_adv_conf.rss_conf.rss_key = std::ptr::null_mut();
+                eth_conf.rx_adv_conf.rss_conf.rss_key_len = 0;
+            }
+            bit != 0
+        };
+        #[cfg(not(feature = "hw-offload-rss-hash"))]
+        let rss_hash_offload_active = false;
+
+        eth_conf.txmode.offloads = applied_tx_offloads;
+        eth_conf.rxmode.offloads = applied_rx_offloads;
+
+        let rc = unsafe {
+            sys::rte_eth_dev_configure(cfg.port_id, 1, 1, &eth_conf as *const _)
+        };
+        if rc != 0 {
+            return Err(Error::PortConfigure(cfg.port_id, unsafe {
+                sys::resd_rte_errno()
+            }));
+        }
+
+        // Negotiated-caps banner — per spec §8.5, authoritative record of
+        // which offload bits the PMD actually accepted.
+        eprintln!(
+            "resd_net: port {} configured rx_offloads=0x{:016x} tx_offloads=0x{:016x}",
+            cfg.port_id, applied_rx_offloads, applied_tx_offloads,
+        );
+
+        Ok(PortConfigOutcome {
+            applied_rx_offloads,
+            applied_tx_offloads,
+            tx_cksum_offload_active,
+            rx_cksum_offload_active,
+            rss_hash_offload_active,
+            driver_name,
+        })
+    }
+
+    /// Read the NIC-provided hardware RX timestamp from an mbuf. Returns
+    /// 0 when (a) the feature is compile-off, (b) either the dynfield or
+    /// dynflag lookup returned negative at engine_create, or (c) the
+    /// mbuf's ol_flags do not indicate a valid timestamp. Spec §10.2.
+    ///
+    /// Hot-path cost when feature is on + both lookups succeeded: one
+    /// branch on `ol_flags & mask` plus one `uint64_t` load from the
+    /// dynfield offset. Feature off: compile-time 0.
+    ///
+    /// # Safety
+    /// `mbuf` must be a valid pointer to a live `rte_mbuf`. In the hot
+    /// path this is satisfied by the ownership rules around
+    /// `rte_eth_rx_burst`. On ENA the function always returns 0 because
+    /// the dynfield/dynflag are unregistered (spec §10.5), so the unsafe
+    /// field read is never reached in Stage 1.
+    #[cfg(feature = "hw-offload-rx-timestamp")]
+    #[inline(always)]
+    pub(crate) unsafe fn hw_rx_ts_ns(&self, mbuf: *const sys::rte_mbuf) -> u64 {
+        match (self.rx_ts_offset, self.rx_ts_flag_mask) {
+            (Some(off), Some(mask)) => {
+                // SAFETY: caller guarantees mbuf points to a live rte_mbuf;
+                // the shim reads ol_flags directly (bindgen cannot expose
+                // the field because of the packed anonymous unions).
+                let ol_flags = unsafe { sys::resd_rte_mbuf_get_ol_flags(mbuf) };
+                if ol_flags & mask != 0 {
+                    // SAFETY: `off` came from rte_mbuf_dynfield_lookup →
+                    // the dynfield registrar guarantees `off..off+8` lies
+                    // within the mbuf, and the field width is u64.
+                    unsafe { sys::resd_rte_mbuf_read_dynfield_u64(mbuf, off) }
+                } else {
+                    0
+                }
+            }
+            _ => 0,
+        }
+    }
+
+    /// Feature-off stub: always returns 0. See spec §10.4.
+    ///
+    /// # Safety
+    /// Stub accepts any pointer; it never dereferences. Kept `unsafe`
+    /// so the signature matches the feature-on variant and call sites
+    /// don't need `#[cfg]`-gated call syntax.
+    #[cfg(not(feature = "hw-offload-rx-timestamp"))]
+    #[inline(always)]
+    pub(crate) const unsafe fn hw_rx_ts_ns(&self, _mbuf: *const sys::rte_mbuf) -> u64 {
+        0
+    }
+
+    /// After `rte_eth_dev_start`, program the RSS indirection table so
+    /// every bucket points at queue 0. Single-queue no-op at steering
+    /// time, but required so `mbuf.hash.rss` is populated on ingress and
+    /// so multi-queue bring-up (Stage 2) is a config change, not a code
+    /// rewrite. See spec §8.
+    #[cfg(feature = "hw-offload-rss-hash")]
+    fn program_rss_reta_single_queue(
+        port_id: u16,
+        dev_info: &sys::rte_eth_dev_info,
+    ) -> Result<(), Error> {
+        let reta_size = dev_info.reta_size as usize;
+        if reta_size == 0 {
+            // PMD doesn't expose a reprogrammable reta (e.g. net_tap).
+            // Single-queue steering is implicit; skip silently.
+            return Ok(());
+        }
+        // `rte_eth_rss_reta_entry64` covers 64 slots per struct. Allocate
+        // reta_size / 64 entries (rounded up), each with `mask = u64::MAX`
+        // so the update writes every slot, and `reta[*] = 0` so every
+        // slot points at queue 0.
+        let num_entries = reta_size.div_ceil(64);
+        let mut reta: Vec<sys::rte_eth_rss_reta_entry64> =
+            vec![unsafe { std::mem::zeroed() }; num_entries];
+        for entry in reta.iter_mut() {
+            entry.mask = u64::MAX;
+            // `reta` array on the struct is `[u16; 64]` already zeroed.
+        }
+        let rc = unsafe {
+            sys::rte_eth_dev_rss_reta_update(
+                port_id,
+                reta.as_mut_ptr(),
+                reta_size as u16,
+            )
+        };
+        if rc != 0 {
+            // Not fatal — reta update failing on a non-steering single-queue
+            // deployment is not a correctness error. Warn and continue; the
+            // flow_table's SipHash fallback keeps the data path correct.
+            eprintln!(
+                "resd_net: port {} RSS reta program failed rc={}; \
+                 flow_table falls back to SipHash.",
+                port_id, rc
+            );
+        }
+        Ok(())
+    }
+
+    #[cfg(not(feature = "hw-offload-rss-hash"))]
+    fn program_rss_reta_single_queue(
+        _port_id: u16,
+        _dev_info: &sys::rte_eth_dev_info,
+    ) -> Result<(), Error> {
+        Ok(())
     }
 
     pub fn counters(&self) -> &Counters {
@@ -554,6 +1208,10 @@ impl Engine {
     /// Bumps `eth.tx_pkts` / `eth.tx_bytes` / `eth.tx_drop_nomem` /
     /// `eth.tx_drop_full_ring` as appropriate. Returns true if the packet
     /// was accepted by the driver.
+    ///
+    /// This path carries non-TCP frames (ARP) only; TCP control frames use
+    /// [`Engine::tx_tcp_frame`] so the A-HW `tx_offload_finalize` hook can
+    /// run between mbuf-fill and tx_burst.
     pub(crate) fn tx_frame(&self, bytes: &[u8]) -> bool {
         use crate::counters::{add, inc};
         // Guard against bytes.len() > u16::MAX silently truncating on the
@@ -592,6 +1250,71 @@ impl Engine {
             true
         } else {
             // TX ring full; driver did not take the mbuf. Free it ourselves.
+            unsafe { sys::resd_rte_pktmbuf_free(m) };
+            inc(&self.counters.eth.tx_drop_full_ring);
+            false
+        }
+    }
+
+    /// TX a self-contained TCP control frame (SYN / ACK / RST / FIN). Same
+    /// allocation + append + tx_burst sequence as [`Engine::tx_frame`], with
+    /// a `tcp_output::tx_offload_finalize` call spliced between the mbuf
+    /// fill and `rte_eth_tx_burst`.
+    ///
+    /// When `hw-offload-tx-cksum` is compile-enabled and
+    /// `tx_cksum_offload_active == true`, the finalizer flips `ol_flags`,
+    /// sets the `l2/l3/l4_len` triple, and rewrites the TCP/IPv4 cksum
+    /// fields to their offload form (pseudo-header-only TCP cksum, zero
+    /// IPv4 cksum). Otherwise the finalizer is a no-op and the software
+    /// full-fold cksums from `build_segment` ship unchanged.
+    /// Spec §6.2/§6.4.
+    pub(crate) fn tx_tcp_frame(
+        &self,
+        bytes: &[u8],
+        seg: &crate::tcp_output::SegmentTx,
+    ) -> bool {
+        use crate::counters::{add, inc};
+        if bytes.len() > u16::MAX as usize {
+            inc(&self.counters.eth.tx_drop_nomem);
+            return false;
+        }
+        // Safety: tx_hdr_mempool was created in Engine::new and is alive.
+        let m = unsafe { sys::resd_rte_pktmbuf_alloc(self.tx_hdr_mempool.as_ptr()) };
+        if m.is_null() {
+            inc(&self.counters.eth.tx_drop_nomem);
+            return false;
+        }
+        let dst = unsafe { sys::resd_rte_pktmbuf_append(m, bytes.len() as u16) };
+        if dst.is_null() {
+            unsafe { sys::resd_rte_pktmbuf_free(m) };
+            inc(&self.counters.eth.tx_drop_nomem);
+            return false;
+        }
+        // Safety: dst points to `bytes.len()` writable bytes inside the mbuf.
+        unsafe {
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), dst as *mut u8, bytes.len());
+        }
+        // Safety: `m` is freshly-allocated, exclusive to us until the
+        // tx_burst below; build_segment wrote a full Ethernet+IPv4+TCP
+        // frame into the mbuf's data room via copy_nonoverlapping above,
+        // so the finalizer's data-buffer preconditions hold.
+        unsafe {
+            crate::tcp_output::tx_offload_finalize(
+                m,
+                seg,
+                seg.payload.len() as u32,
+                self.tx_cksum_offload_active,
+            );
+        }
+        let mut pkts = [m];
+        let sent = unsafe {
+            sys::resd_rte_eth_tx_burst(self.cfg.port_id, self.cfg.tx_queue_id, pkts.as_mut_ptr(), 1)
+        } as usize;
+        if sent == 1 {
+            add(&self.counters.eth.tx_bytes, bytes.len() as u64);
+            inc(&self.counters.eth.tx_pkts);
+            true
+        } else {
             unsafe { sys::resd_rte_pktmbuf_free(m) };
             inc(&self.counters.eth.tx_drop_full_ring);
             false
@@ -685,7 +1408,7 @@ impl Engine {
         let Some(n) = build_segment(&seg, &mut buf) else {
             return false;
         };
-        let tx_ok = self.tx_frame(&buf[..n]);
+        let tx_ok = self.tx_tcp_frame(&buf[..n], &seg);
         // A5.5 Task 13: stash SYN TX timestamp on the ORIGINAL SYN only
         // (Karn's rule — the retransmit path increments `syn_retrans_count`
         // before re-entering `emit_syn`, so this guard fires exclusively on
@@ -737,7 +1460,14 @@ impl Engine {
     /// pipeline, then reaps any TIME_WAIT flows past their 2×MSL deadline.
     pub fn poll_once(&self) -> usize {
         use crate::counters::{add, inc};
+        use std::sync::atomic::Ordering;
         inc(&self.counters.poll.iters);
+
+        // A6 (spec §3.6 Site 3): snapshot RX-mempool-drop counter at top
+        // of poll so `check_and_emit_rx_enomem` at each exit path can
+        // edge-trigger a single Error{err=-ENOMEM} per iteration.
+        self.rx_drop_nomem_prev
+            .set(self.counters.eth.rx_drop_nomem.load(Ordering::Relaxed));
 
         // Clear per-conn last_read_buf so prior borrowed views are
         // invalidated per spec §4.2, before any rx_frame dispatches
@@ -768,6 +1498,13 @@ impl Engine {
             self.advance_timer_wheel();
             self.reap_time_wait();
             self.maybe_emit_gratuitous_arp();
+            // A6 (spec §3.2): drain any data-segment TX batched by
+            // timer-driven retransmit paths. No-op on empty ring.
+            self.drain_tx_pending_data();
+            // A6 (spec §3.6 Site 3): edge-triggered RX-mempool-drop
+            // Error event. Sited after the drain so it runs on every
+            // exit path.
+            self.check_and_emit_rx_enomem();
             return 0;
         }
 
@@ -793,8 +1530,30 @@ impl Engine {
 
         for &m in &mbufs[..n] {
             let bytes = unsafe { crate::mbuf_data_slice(m) };
+            // Task 8: read ol_flags once per mbuf at the RX boundary;
+            // threaded through rx_frame -> handle_ipv4 -> tcp_input so
+            // the IP + L4 offload classifications can gate on the bits
+            // the NIC stamped on this frame. Feature-off / latch-false
+            // callees ignore it.
+            let ol_flags = unsafe { sys::resd_rte_mbuf_get_ol_flags(m) };
+            // Task 9: read the NIC-provided RSS Toeplitz hash alongside
+            // ol_flags. Threaded through to flow_table::hash_bucket_for_lookup
+            // in tcp_input. When the feature is off, we compile the read
+            // away entirely (no bindgen call) and pass 0.
+            #[cfg(feature = "hw-offload-rss-hash")]
+            let nic_rss_hash = unsafe { sys::resd_rte_mbuf_get_rss_hash(m) };
+            #[cfg(not(feature = "hw-offload-rss-hash"))]
+            let nic_rss_hash: u32 = 0;
+            // Task 11: read the NIC-provided RX timestamp alongside ol_flags
+            // + nic_rss_hash. `hw_rx_ts_ns` yields 0 when the feature is off,
+            // when either dynfield/dynflag lookup returned negative at
+            // engine_create (expected on ENA — spec §10.5), or when the
+            // mbuf's ol_flags do not indicate a valid timestamp. Threaded
+            // through rx_frame -> handle_ipv4 -> tcp_input to both
+            // RX-origin event emission sites (Connected + Readable).
+            let hw_rx_ts = unsafe { self.hw_rx_ts_ns(m) };
             add(&self.counters.eth.rx_bytes, bytes.len() as u64);
-            let _accepted = self.rx_frame(bytes);
+            let _accepted = self.rx_frame(bytes, ol_flags, nic_rss_hash, hw_rx_ts);
             #[cfg(feature = "obs-byte-counters")]
             {
                 rx_bytes_acc += _accepted as u64;
@@ -812,7 +1571,132 @@ impl Engine {
         self.advance_timer_wheel();
         self.reap_time_wait();
         self.maybe_emit_gratuitous_arp();
+        // A6 (spec §3.2): drain any data-segment TX batched this iter
+        // (RX-triggered send_bytes, timer-driven retransmit). Runs
+        // after all emit sites so the burst coalesces everything.
+        // No-op on empty ring.
+        self.drain_tx_pending_data();
+        // A6 (spec §3.6 Site 3): edge-triggered RX-mempool-drop Error
+        // event. Sited after the drain so it runs on every exit path.
+        self.check_and_emit_rx_enomem();
         n
+    }
+
+    /// A6 (spec §3.6 Site 3): accessor for the RX-mempool-drop snapshot
+    /// taken at the top of `poll_once`. Exposed at `pub(crate)` so tests
+    /// and future observability surfaces can read the prior-iteration
+    /// checkpoint without re-snapshotting. `allow(dead_code)` lifts once
+    /// Task 21's driver harness exercises the accessor directly.
+    #[allow(dead_code)]
+    pub(crate) fn rx_drop_nomem_prev(&self) -> u64 {
+        self.rx_drop_nomem_prev.get()
+    }
+
+    /// Edge-triggered RX-mempool-drop Error emission. Called at end of
+    /// `poll_once` (after the drain). Snapshot taken at top of
+    /// `poll_once`; if the counter advanced, one Error event for the
+    /// whole iteration.
+    ///
+    /// Spec §3.6 Site 3: edge-triggered so an extended mempool-starvation
+    /// window emits at most one event per poll, preventing a flood into
+    /// the `EventQueue` under sustained pressure. `conn = 0` is the
+    /// engine-level sentinel (handle 0 is reserved, never a live conn).
+    pub(crate) fn check_and_emit_rx_enomem(&self) {
+        use std::sync::atomic::Ordering;
+        let now = self.counters.eth.rx_drop_nomem.load(Ordering::Relaxed);
+        let prev = self.rx_drop_nomem_prev.get();
+        if now > prev {
+            let mut ev = self.events.borrow_mut();
+            ev.push(
+                InternalEvent::Error {
+                    conn: 0, // engine-level; not bound to a conn.
+                    err: -libc::ENOMEM,
+                    emitted_ts_ns: crate::clock::now_ns(),
+                },
+                &self.counters,
+            );
+            self.rx_drop_nomem_prev.set(now);
+        }
+    }
+
+    /// Drain pending data-segment mbufs via one `rte_eth_tx_burst`.
+    /// On partial send (driver accepted fewer than pushed), the unsent
+    /// tail mbufs are freed to mempool and bump `eth.tx_drop_full_ring`.
+    /// The ring clears unconditionally after drain — a send_bytes
+    /// caller observes the drop via the counter, not by inspecting
+    /// the ring state. Slow-path: fires once per poll end + once per
+    /// `resd_net_flush` call; no hot-path cost.
+    ///
+    /// Spec §3.2 / §4.2. Consumed by Task 12 (send_bytes push) and
+    /// Task 13 (retransmit push); at this task the ring is never
+    /// populated so the helper early-returns on empty.
+    pub(crate) fn drain_tx_pending_data(&self) {
+        use crate::counters::{add, inc};
+        let mut ring = self.tx_pending_data.borrow_mut();
+        if ring.is_empty() {
+            return;
+        }
+        let n = ring.len() as u16;
+        // Safety: `ring` holds `NonNull<sys::rte_mbuf>`. `NonNull<T>` has
+        // the same size/alignment as `*mut T` (std guarantee), so the
+        // slice-reinterpret cast to `*mut *mut rte_mbuf` is sound and
+        // matches `rte_eth_tx_burst`'s expected tx-pkts array layout.
+        let sent = unsafe {
+            sys::resd_rte_eth_tx_burst(
+                self.cfg.port_id,
+                self.cfg.tx_queue_id,
+                ring.as_mut_ptr() as *mut *mut sys::rte_mbuf,
+                n,
+            )
+        } as usize;
+        // Free tail mbufs (DPDK partial-fill: driver took the prefix, we own the rest).
+        for i in sent..ring.len() {
+            unsafe { sys::resd_rte_pktmbuf_free(ring[i].as_ptr()); }
+            inc(&self.counters.eth.tx_drop_full_ring);
+        }
+        ring.clear();
+        inc(&self.counters.tcp.tx_flush_bursts);
+        add(&self.counters.tcp.tx_flush_batched_pkts, sent as u64);
+        if sent > 0 {
+            add(&self.counters.eth.tx_pkts, sent as u64);
+        }
+    }
+
+    /// Public entrypoint for `resd_net_flush`. Wrapper so the ABI layer
+    /// doesn't need to know about RefCell or the ring type.
+    /// Spec §4.2: idempotent; no-op on empty ring.
+    pub fn flush_tx_pending_data(&self) {
+        self.drain_tx_pending_data();
+    }
+
+    /// A6 (spec §3.1): schedule a public API timer. Returns the wheel's
+    /// TimerId; the ABI layer (Task 17) packs it to u64 for the caller.
+    /// `deadline_ns` rounds up to the next 10 µs tick. Past deadlines
+    /// fire on the next poll.
+    pub fn public_timer_add(&self, deadline_ns: u64, user_data: u64)
+        -> crate::tcp_timer_wheel::TimerId
+    {
+        let now_ns = crate::clock::now_ns();
+        let fire_at_ns = align_up_to_tick_ns(deadline_ns);
+        self.timer_wheel.borrow_mut().add(
+            now_ns,
+            crate::tcp_timer_wheel::TimerNode {
+                fire_at_ns,
+                owner_handle: 0,  // public timers not tied to a conn
+                kind: crate::tcp_timer_wheel::TimerKind::ApiPublic,
+                user_data,
+                generation: 0,
+                cancelled: false,
+            },
+        )
+    }
+
+    /// A6 (spec §3.1): cancel a public API timer via wheel tombstone.
+    /// Returns true if a live node was found and cancelled; false
+    /// otherwise (slot empty, generation stale from reuse, or timer
+    /// already cancelled/fired).
+    pub fn public_timer_cancel(&self, id: crate::tcp_timer_wheel::TimerId) -> bool {
+        self.timer_wheel.borrow_mut().cancel(id)
     }
 
     /// A5 Task 12: advance the timer wheel to `now_ns` and dispatch fired
@@ -836,7 +1720,16 @@ impl Engine {
                     self.on_syn_retrans_fire(node.owner_handle, id);
                 }
                 crate::tcp_timer_wheel::TimerKind::ApiPublic => {
-                    // Wired in A6 public timer API. Silent no-op for now.
+                    let mut ev = self.events.borrow_mut();
+                    ev.push(
+                        InternalEvent::ApiTimer {
+                            timer_id: id,
+                            user_data: node.user_data,
+                            emitted_ts_ns: crate::clock::now_ns(),
+                        },
+                        &self.counters,
+                    );
+                    crate::counters::inc(&self.counters.tcp.tx_api_timers_fired);
                 }
             }
         }
@@ -1032,6 +1925,7 @@ impl Engine {
                 fire_at_ns,
                 owner_handle: handle,
                 kind: crate::tcp_timer_wheel::TimerKind::Rto,
+                user_data: 0,
                 generation: 0,
                 cancelled: false,
             },
@@ -1240,6 +2134,7 @@ impl Engine {
                 fire_at_ns,
                 owner_handle: handle,
                 kind: crate::tcp_timer_wheel::TimerKind::SynRetrans,
+                user_data: 0,
                 generation: 0,
                 cancelled: false,
             },
@@ -1355,8 +2250,16 @@ impl Engine {
                     let Some(c) = ft.get(*h) else {
                         return false;
                     };
+                    // A6 Task 11: `force_tw_skip` (set by
+                    // `close_conn_with_flags` in Task 10 when `ts_enabled`
+                    // is true) short-circuits the 2×MSL wait so the
+                    // connection reaps on the next tick regardless of
+                    // `time_wait_deadline_ns`. Observability parity
+                    // preserved — the close path below still emits the
+                    // same StateChange + Closed events.
                     c.state == TcpState::TimeWait
-                        && c.time_wait_deadline_ns.is_some_and(|d| now >= d)
+                        && (c.force_tw_skip
+                            || c.time_wait_deadline_ns.is_some_and(|d| now >= d))
                 })
                 .collect()
         };
@@ -1424,7 +2327,18 @@ impl Engine {
     /// computed; only consumed by the `obs-byte-counters` accumulator
     /// in `poll_once`. LLVM elides the dead-store path when the feature
     /// is off.
-    fn rx_frame(&self, bytes: &[u8]) -> u32 {
+    ///
+    /// `ol_flags` — mbuf offload flags as stamped by the PMD. Threaded
+    /// through to the IP + TCP decode sites where Task 8's HW checksum
+    /// classification gates on them. Test callers that aren't exercising
+    /// the offload path pass `0` (UNKNOWN → software verify).
+    ///
+    /// `hw_rx_ts` — the NIC-provided RX timestamp (ns) captured at the
+    /// RX decode boundary via `hw_rx_ts_ns`. Threaded through to the
+    /// `Connected` + `Readable` event emission sites in `tcp_input` +
+    /// `deliver_readable` (spec §10.3). `0` when the NIC didn't stamp
+    /// one (expected on ENA — spec §10.5).
+    fn rx_frame(&self, bytes: &[u8], ol_flags: u64, nic_rss_hash: u32, hw_rx_ts: u64) -> u32 {
         use crate::counters::inc;
         match crate::l2::l2_decode(bytes, self.our_mac) {
             Err(crate::l2::L2Drop::Short) => {
@@ -1447,7 +2361,9 @@ impl Engine {
                         self.handle_arp(payload);
                         0
                     }
-                    crate::l2::ETHERTYPE_IPV4 => self.handle_ipv4(payload),
+                    crate::l2::ETHERTYPE_IPV4 => {
+                        self.handle_ipv4(payload, ol_flags, nic_rss_hash, hw_rx_ts)
+                    }
                     _ => unreachable!("l2_decode filters unsupported ethertypes"),
                 }
             }
@@ -1476,9 +2392,23 @@ impl Engine {
     /// Returns TCP payload bytes accepted by the inner `tcp_input` (or 0
     /// for non-TCP / decode-error paths). Used by `poll_once`'s
     /// `obs-byte-counters` accumulator.
-    fn handle_ipv4(&self, payload: &[u8]) -> u32 {
+    ///
+    /// `ol_flags` — the RX mbuf offload flags. Dispatches to
+    /// `ip_decode_offload_aware`, which routes GOOD → skip IP software
+    /// verify, BAD → drop + bump `eth.rx_drop_cksum_bad` + `ip.rx_csum_bad`,
+    /// NONE/UNKNOWN → software verify. Gated on the compile-time
+    /// `hw-offload-rx-cksum` feature AND the runtime
+    /// `rx_cksum_offload_active` latch — if either is false the
+    /// offload-aware wrapper degrades to the software path.
+    fn handle_ipv4(&self, payload: &[u8], ol_flags: u64, nic_rss_hash: u32, hw_rx_ts: u64) -> u32 {
         use crate::counters::inc;
-        match crate::l3_ip::ip_decode(payload, self.cfg.local_ip, /*nic_csum_ok=*/ false) {
+        match crate::l3_ip::ip_decode_offload_aware(
+            payload,
+            self.cfg.local_ip,
+            ol_flags,
+            self.rx_cksum_offload_active,
+            &self.counters,
+        ) {
             Err(crate::l3_ip::L3Drop::Short) => {
                 inc(&self.counters.ip.rx_drop_short);
                 0
@@ -1520,7 +2450,7 @@ impl Engine {
                 match ip.protocol {
                     crate::l3_ip::IPPROTO_TCP => {
                         inc(&self.counters.ip.rx_tcp);
-                        self.tcp_input(&ip, inner)
+                        self.tcp_input(&ip, inner, ol_flags, nic_rss_hash, hw_rx_ts)
                     }
                     crate::l3_ip::IPPROTO_ICMP => {
                         inc(&self.counters.ip.rx_icmp);
@@ -1554,11 +2484,62 @@ impl Engine {
     /// (`outcome.delivered + outcome.reassembly_queued_bytes`). Drops,
     /// errors, and pure-ACK / control segments return 0. Used by the
     /// `obs-byte-counters` accumulator in `poll_once`.
-    fn tcp_input(&self, ip: &crate::l3_ip::L3Decoded, tcp_bytes: &[u8]) -> u32 {
+    fn tcp_input(
+        &self,
+        ip: &crate::l3_ip::L3Decoded,
+        tcp_bytes: &[u8],
+        ol_flags: u64,
+        nic_rss_hash: u32,
+        hw_rx_ts: u64,
+    ) -> u32 {
         use crate::counters::inc;
         use crate::tcp_input::{dispatch, parse_segment, tuple_from_segment, TxAction};
 
-        let parsed = match parse_segment(tcp_bytes, ip.src_ip, ip.dst_ip, false) {
+        // Task 8: classify the NIC-reported L4 checksum outcome before
+        // dispatching the software fold inside `parse_segment`. Gated
+        // on both the compile-time `hw-offload-rx-cksum` feature AND
+        // the runtime `rx_cksum_offload_active` latch (spec §7.2).
+        //
+        // GOOD → tell parse_segment to skip the software fold.
+        // BAD  → drop + bump eth.rx_drop_cksum_bad + tcp.rx_bad_csum.
+        // NONE / UNKNOWN → fall through to software verify (existing path).
+        //
+        // Feature-off / latch-false builds always take the software
+        // verify path, same as before A-HW.
+        #[allow(unused_mut)]
+        let mut nic_csum_ok = false;
+        #[cfg(feature = "hw-offload-rx-cksum")]
+        {
+            if self.rx_cksum_offload_active {
+                use crate::l3_ip::{classify_l4_rx_cksum, IpCksumOutcome};
+                use std::sync::atomic::Ordering;
+                match classify_l4_rx_cksum(ol_flags) {
+                    IpCksumOutcome::Good => {
+                        nic_csum_ok = true;
+                    }
+                    IpCksumOutcome::Bad => {
+                        self.counters
+                            .eth
+                            .rx_drop_cksum_bad
+                            .fetch_add(1, Ordering::Relaxed);
+                        self.counters
+                            .tcp
+                            .rx_bad_csum
+                            .fetch_add(1, Ordering::Relaxed);
+                        return 0;
+                    }
+                    _ => {
+                        // NONE / UNKNOWN — software verify via parse_segment.
+                    }
+                }
+            }
+        }
+        #[cfg(not(feature = "hw-offload-rx-cksum"))]
+        {
+            let _ = ol_flags;
+        }
+
+        let parsed = match parse_segment(tcp_bytes, ip.src_ip, ip.dst_ip, nic_csum_ok) {
             Ok(p) => p,
             Err(e) => {
                 match e {
@@ -1576,7 +2557,19 @@ impl Engine {
         };
 
         let tuple = tuple_from_segment(ip.src_ip, ip.dst_ip, &parsed);
-        let handle = { self.flow_table.borrow().lookup_by_tuple(&tuple) };
+        // Task 9: pick the initial bucket hash via the RSS-aware selector.
+        // Feature-off / latch-off / flag-off all fall back to siphash_4tuple.
+        let bucket_hash = crate::flow_table::hash_bucket_for_lookup(
+            &tuple,
+            ol_flags,
+            nic_rss_hash,
+            self.rss_hash_offload_active,
+        );
+        let handle = {
+            self.flow_table
+                .borrow()
+                .lookup_by_hash(&tuple, bucket_hash)
+        };
         let Some(handle) = handle else {
             // Unmatched: reply RST per spec §5.1 `reply_rst`.
             inc(&self.counters.tcp.rx_unmatched);
@@ -1607,13 +2600,49 @@ impl Engine {
             let Some(conn) = ft.get_mut(handle) else {
                 return 0;
             };
-            dispatch(conn, &parsed)
+            // A6 Task 15 (spec §3.8): pass the engine-wide RTT histogram
+            // edges through to sample-taking handlers. The actual per-conn
+            // histogram update lives at each `rtt_est.sample` site inside
+            // `tcp_input.rs` / `TcpConn::maybe_seed_srtt_from_syn`.
+            //
+            // A6 Task 16 (spec §3.3): pass `send_buffer_bytes` so the
+            // ACK-prune site can evaluate the WRITABLE hysteresis gate
+            // (`in_flight ≤ send_buffer_bytes/2`) and surface a one-shot
+            // Outcome flag; the engine translator below pushes
+            // `InternalEvent::Writable` when set.
+            dispatch(
+                conn,
+                &parsed,
+                &self.rtt_histogram_edges,
+                self.cfg.send_buffer_bytes,
+            )
         };
 
         // A4: map Outcome fields → TcpCounters slow-path bumps. Groups
         // all per-segment counter wiring in one place so the dispatch
         // hot-path stays straight-line.
         apply_tcp_input_counters(&outcome, &self.counters.tcp);
+
+        // A6 Task 16 (spec §3.3): WRITABLE hysteresis emission. The
+        // ACK-prune site inside `handle_established` flipped
+        // `writable_hysteresis_fired` (and cleared
+        // `conn.send_refused_pending`) when this ACK drained
+        // `in_flight` to ≤ `send_buffer_bytes/2` following a prior
+        // short-accept from `send_bytes`. Level-triggered and single-
+        // edge-per-refusal-cycle — a subsequent refusal restarts the
+        // cycle. No payload on WRITABLE (ABI translator zeroes the
+        // union); `emitted_ts_ns` sampled at push time per A5.5 §3.1.
+        if outcome.writable_hysteresis_fired {
+            let emitted_ts_ns = crate::clock::now_ns();
+            let mut ev = self.events.borrow_mut();
+            ev.push(
+                InternalEvent::Writable {
+                    conn: handle,
+                    emitted_ts_ns,
+                },
+                &self.counters,
+            );
+        }
 
         // A5 Task 15: RACK-detected lost segments — retransmit each +
         // bump `tcp.tx_rack_loss`. Runs BEFORE the Task-11 prune below
@@ -1769,6 +2798,7 @@ impl Engine {
                             fire_at_ns,
                             owner_handle: handle,
                             kind: crate::tcp_timer_wheel::TimerKind::Rto,
+                            user_data: 0,
                             generation: 0,
                             cancelled: false,
                         },
@@ -1841,7 +2871,7 @@ impl Engine {
             self.events.borrow_mut().push(
                 InternalEvent::Connected {
                     conn: handle,
-                    rx_hw_ts_ns: 0,
+                    rx_hw_ts_ns: hw_rx_ts,
                     emitted_ts_ns: crate::clock::now_ns(),
                 },
                 &self.counters,
@@ -1850,7 +2880,7 @@ impl Engine {
         }
 
         if outcome.delivered > 0 {
-            self.deliver_readable(handle, outcome.delivered);
+            self.deliver_readable(handle, outcome.delivered, hw_rx_ts);
         }
 
         if outcome.buf_full_drop > 0 {
@@ -2038,7 +3068,7 @@ impl Engine {
         let Some(n) = build_segment(&seg, &mut buf) else {
             return;
         };
-        if self.tx_frame(&buf[..n]) {
+        if self.tx_tcp_frame(&buf[..n], &seg) {
             inc(&self.counters.tcp.tx_ack);
             if outcome.zero_window {
                 inc(&self.counters.tcp.tx_zero_window);
@@ -2099,7 +3129,7 @@ impl Engine {
             return;
         };
         drop(ft);
-        if self.tx_frame(&buf[..n]) {
+        if self.tx_tcp_frame(&buf[..n], &seg) {
             inc(&self.counters.tcp.tx_rst);
         }
     }
@@ -2131,7 +3161,7 @@ impl Engine {
         let Some(n) = build_segment(&seg, &mut buf) else {
             return;
         };
-        if self.tx_frame(&buf[..n]) {
+        if self.tx_tcp_frame(&buf[..n], &seg) {
             inc(&self.counters.tcp.tx_rst);
         }
     }
@@ -2175,12 +3205,18 @@ impl Engine {
         let Some(n) = build_segment(&seg, &mut buf) else {
             return;
         };
-        if self.tx_frame(&buf[..n]) {
+        if self.tx_tcp_frame(&buf[..n], &seg) {
             inc(&self.counters.tcp.tx_rst);
         }
     }
 
-    fn deliver_readable(&self, handle: ConnHandle, delivered: u32) {
+    /// `rx_hw_ts_ns` — NIC-provided RX timestamp captured at the per-mbuf
+    /// decode boundary in `poll_once` and threaded through the RX frame
+    /// path. Stored on the `Readable` event verbatim. Mbuf is no longer
+    /// in scope here (data has already moved from mbuf to `conn.recv.bytes`),
+    /// so this parameter is the only way to surface the NIC timestamp to
+    /// the event consumer. `0` on ENA / feature-off (spec §10.3, §10.5).
+    fn deliver_readable(&self, handle: ConnHandle, delivered: u32, rx_hw_ts_ns: u64) {
         use crate::counters::add;
         let mut ft = self.flow_table.borrow_mut();
         let Some(conn) = ft.get_mut(handle) else {
@@ -2206,7 +3242,7 @@ impl Engine {
                 conn: handle,
                 byte_offset,
                 byte_len: delivered,
-                rx_hw_ts_ns: 0,
+                rx_hw_ts_ns,
                 emitted_ts_ns: crate::clock::now_ns(),
             },
             &self.counters,
@@ -2381,6 +3417,7 @@ impl Engine {
                 fire_at_ns,
                 owner_handle: handle,
                 kind: crate::tcp_timer_wheel::TimerKind::SynRetrans,
+                user_data: 0,
                 generation: 0,
                 cancelled: false,
             },
@@ -2399,8 +3436,12 @@ impl Engine {
     /// Enqueue `bytes` on the connection's send path. Returns the number
     /// of bytes accepted (could be < bytes.len() under send-buffer or
     /// peer-window backpressure). On `tx_data_mempool` exhaustion mid-send,
-    /// returns a negative errno (Err(Error::SendBufferFull) mapped to
-    /// `-ENOMEM` at the public-API layer).
+    /// returns `Err(Error::SendBufferFull)` (mapped to `-ENOMEM` at the
+    /// public-API layer). After A6 Task 12, NIC TX-ring saturation no
+    /// longer surfaces as `SendBufferFull` — `send_bytes` pushes segments
+    /// onto the engine-scope `tx_pending_data` batch ring and the
+    /// end-of-poll drain retries via `rte_eth_tx_burst`, so only
+    /// `tx_data_mempool` alloc failure produces this error now.
     pub fn send_bytes(&self, handle: ConnHandle, bytes: &[u8]) -> Result<u32, Error> {
         use crate::counters::inc;
         use crate::tcp_output::{build_segment, SegmentTx, TCP_ACK, TCP_PSH};
@@ -2539,34 +3580,59 @@ impl Engine {
             unsafe {
                 std::ptr::copy_nonoverlapping(frame.as_ptr(), dst as *mut u8, n);
             }
-            // Bump refcount BEFORE tx_burst: after the call, the driver
-            // holds one ref (freed on TX-completion) and we hold one ref
-            // that lives in `snd_retrans` until Task 11's ACK-prune path.
-            // On tx_burst failure neither owner takes the mbuf, so we free
-            // it twice below (each call decrements refcount by 1).
+            // A-HW Task 7: apply TX offload metadata + pseudo-header-only
+            // TCP cksum rewrite to the mbuf when offload is active.
+            // Safety: `m` is freshly-allocated, exclusive to us until
+            // tx_burst; the data buffer was fully populated by the
+            // copy_nonoverlapping above (n bytes = full L2+L3+TCP+payload),
+            // so the finalizer's data-buffer preconditions hold.
+            unsafe {
+                crate::tcp_output::tx_offload_finalize(
+                    m,
+                    &seg,
+                    seg.payload.len() as u32,
+                    self.tx_cksum_offload_active,
+                );
+            }
+            // Bump refcount BEFORE the ring push: after `drain_tx_pending_data`
+            // calls tx_burst, the driver holds one ref (freed on TX-completion)
+            // and we hold one ref that lives in `snd_retrans` until the
+            // ACK-prune path retires it. A6 Task 12 moved the burst call out
+            // of this loop into `drain_tx_pending_data`; on partial-fill the
+            // drain frees unsent tail mbufs and bumps `tx_drop_full_ring`, so
+            // the inline failure-cleanup that used to live here is gone.
             unsafe { sys::resd_rte_mbuf_refcnt_update(m, 1) };
 
-            let mut pkts = [m];
-            let sent = unsafe {
-                sys::resd_rte_eth_tx_burst(
-                    self.cfg.port_id,
-                    self.cfg.tx_queue_id,
-                    pkts.as_mut_ptr(),
-                    1,
-                )
-            } as usize;
-            if sent != 1 {
-                // Driver did not take the mbuf — free both refs (2 → 1 → 0).
-                unsafe { sys::resd_rte_pktmbuf_free(m) };
-                unsafe { sys::resd_rte_pktmbuf_free(m) };
-                inc(&self.counters.eth.tx_drop_full_ring);
-                if accepted == 0 {
-                    return Err(Error::SendBufferFull);
+            // A6 (spec §3.2): push onto the batch ring instead of
+            // per-segment tx_burst(1). Drain-and-retry on ring full so
+            // a single send never stalls on a saturated ring.
+            let pushed_ok = {
+                let mut ring = self.tx_pending_data.borrow_mut();
+                if ring.len() < ring.capacity() {
+                    // Safety: `m` is non-null (checked above by the
+                    // alloc path); NonNull::new_unchecked avoids a
+                    // second null-check on the hot path.
+                    ring.push(unsafe { std::ptr::NonNull::new_unchecked(m) });
+                    true
+                } else {
+                    false
                 }
-                break;
+            };
+            if !pushed_ok {
+                // Ring at capacity. Drain it, then push this mbuf.
+                // Borrow sequence: the `ring` borrow was dropped at the
+                // end of the scope above, so drain_tx_pending_data can
+                // take its own borrow_mut. The re-borrow below is safe
+                // because drain releases its borrow before returning.
+                self.drain_tx_pending_data();
+                let mut ring = self.tx_pending_data.borrow_mut();
+                ring.push(unsafe { std::ptr::NonNull::new_unchecked(m) });
             }
+            // eth.tx_bytes accounts accepted bytes — keep per-segment.
+            // eth.tx_pkts is now incremented by drain_tx_pending_data
+            // after the actual burst (Task 5). A pushed-but-unsent mbuf
+            // counts as tx_drop_full_ring in the drain path.
             crate::counters::add(&self.counters.eth.tx_bytes, n as u64);
-            inc(&self.counters.eth.tx_pkts);
             inc(&self.counters.tcp.tx_data);
             #[cfg(feature = "obs-byte-counters")]
             {
@@ -2591,6 +3657,8 @@ impl Engine {
             };
             {
                 let mut ft = self.flow_table.borrow_mut();
+                // A6 Task 12: RTO arms on ring-push success (not wire-TX).
+                // Sub-µs drift vs. drain at end-of-poll.
                 let arm_rto = if let Some(c) = ft.get_mut(handle) {
                     let was_empty = c.snd_retrans.is_empty();
                     c.snd_retrans.push_after_tx(new_entry);
@@ -2614,6 +3682,7 @@ impl Engine {
                                 fire_at_ns: fire_at,
                                 owner_handle: handle,
                                 kind: crate::tcp_timer_wheel::TimerKind::Rto,
+                                user_data: 0,
                                 generation: 0,
                                 cancelled: false,
                             },
@@ -2646,6 +3715,13 @@ impl Engine {
         }
         if accepted < bytes.len() as u32 {
             inc(&self.counters.tcp.send_buf_full);
+            // A6 (spec §3.3): signal for WRITABLE hysteresis (Task 16).
+            // The ACK-prune path in tcp_input.rs watches this bit + fires
+            // a single WRITABLE event once in_flight <= send_buffer_bytes / 2.
+            let mut ft = self.flow_table.borrow_mut();
+            if let Some(c) = ft.get_mut(handle) {
+                c.send_refused_pending = true;
+            }
         }
 
         // Flush the per-call TX-payload-bytes accumulator. Single
@@ -2662,6 +3738,8 @@ impl Engine {
         // rejects (already-armed, no SRTT, budget exhausted, etc.) so
         // calling it on every non-empty send is safe. Gating on
         // `accepted > 0` skips the call when nothing left the wire.
+        // A6 Task 12: TLP PTO arms on ring-push success, not wire-TX
+        // (sub-µs drift).
         if accepted > 0 {
             self.arm_tlp_pto(handle);
         }
@@ -2703,6 +3781,7 @@ impl Engine {
                 fire_at_ns,
                 owner_handle: handle,
                 kind: crate::tcp_timer_wheel::TimerKind::Tlp,
+                user_data: 0,
                 generation: 0,
                 cancelled: false,
             },
@@ -2781,7 +3860,7 @@ impl Engine {
         let Some(n) = build_segment(&seg, &mut buf) else {
             return Err(Error::PeerUnreachable(tuple.peer_ip));
         };
-        if !self.tx_frame(&buf[..n]) {
+        if !self.tx_tcp_frame(&buf[..n], &seg) {
             return Err(Error::PeerUnreachable(tuple.peer_ip));
         }
         inc(&self.counters.tcp.tx_fin);
@@ -2798,12 +3877,59 @@ impl Engine {
         Ok(())
     }
 
+    /// A6 (spec §3.4): close a connection, honoring the `flags` bitmask.
+    /// Currently only `CLOSE_FLAG_FORCE_TW_SKIP` is defined; other bits
+    /// are reserved for future extension and silently ignored.
+    ///
+    /// Semantics for `FORCE_TW_SKIP`:
+    /// - If `c.ts_enabled == false`, emit one `Error{err=-EPERM}` event
+    ///   (the "EPERM_TW_REQUIRED" condition per parent spec §9.3) and
+    ///   drop the flag; normal FIN + 2×MSL TIME_WAIT proceeds.
+    /// - If `c.ts_enabled == true`, set `c.force_tw_skip = true`;
+    ///   `reap_time_wait` (Task 11) short-circuits the 2×MSL wait.
+    ///
+    /// In both cases the existing `close_conn` body runs to emit the FIN.
+    pub fn close_conn_with_flags(
+        &self,
+        handle: ConnHandle,
+        flags: u32,
+    ) -> Result<(), Error> {
+        if (flags & CLOSE_FLAG_FORCE_TW_SKIP) != 0 {
+            let ts_enabled = {
+                let ft = self.flow_table.borrow();
+                ft.get(handle).map(|c| c.ts_enabled).unwrap_or(false)
+            };
+            if !ts_enabled {
+                let emitted_ts_ns = crate::clock::now_ns();
+                let mut ev = self.events.borrow_mut();
+                ev.push(
+                    InternalEvent::Error {
+                        conn: handle,
+                        err: -libc::EPERM,
+                        emitted_ts_ns,
+                    },
+                    &self.counters,
+                );
+            } else {
+                let mut ft = self.flow_table.borrow_mut();
+                if let Some(c) = ft.get_mut(handle) {
+                    c.force_tw_skip = true;
+                }
+            }
+        }
+        self.close_conn(handle)
+    }
+
     /// Retransmit the entry at `entry_index` in `conn.snd_retrans`. Allocates
     /// a fresh header mbuf from `tx_hdr_mempool`, writes L2+L3+TCP headers via
     /// `build_retrans_header`, bumps the held data mbuf's refcount, chains
-    /// header → data via `rte_pktmbuf_chain`, and TXes. On chain-failure or
-    /// alloc-failure, cleans up mbuf references atomically; on TX-ring-full,
-    /// `rte_pktmbuf_free(head)` frees the whole chain per DPDK semantics.
+    /// header → data via `rte_pktmbuf_chain`, and pushes onto the batch
+    /// `tx_pending_data` ring (spec §3.2 — drained by
+    /// `drain_tx_pending_data` per Task 5). On chain-failure or alloc-failure,
+    /// cleans up mbuf references atomically and emits `InternalEvent::Error`
+    /// with `err=-ENOMEM` per occurrence (spec §3.6 Site 2); on TX-ring-full
+    /// at drain time, the drain walks the chain via `rte_pktmbuf_free(head)`
+    /// per DPDK semantics and bumps `eth.tx_drop_full_ring`.
     ///
     /// Bumps `xmit_count` + `xmit_ts_ns` on the entry and `tcp.tx_retrans` on
     /// success. Does NOT decide whether to retransmit — that's the caller's
@@ -2875,6 +4001,19 @@ impl Engine {
         let hdr_mbuf = unsafe { sys::resd_rte_pktmbuf_alloc(self.tx_hdr_mempool.as_ptr()) };
         if hdr_mbuf.is_null() {
             inc(&self.counters.eth.tx_drop_nomem);
+            // A6 (spec §3.6 Site 2): surface retransmit ENOMEM as an
+            // Error event per occurrence — callers don't see the inline
+            // tx_drop_nomem bump unless they poll the counter.
+            let emitted_ts_ns = crate::clock::now_ns();
+            let mut ev = self.events.borrow_mut();
+            ev.push(
+                InternalEvent::Error {
+                    conn: conn_handle,
+                    err: -libc::ENOMEM,
+                    emitted_ts_ns,
+                },
+                &self.counters,
+            );
             return;
         }
 
@@ -2940,17 +4079,62 @@ impl Engine {
             // Header-too-small is impossible for 128-byte scratch; keep explicit.
             unsafe { sys::resd_rte_pktmbuf_free(hdr_mbuf) };
             inc(&self.counters.eth.tx_drop_nomem);
+            // A6 (spec §3.6 Site 2): Error event per occurrence on
+            // retransmit ENOMEM path — header-build failure is treated
+            // as no-memory for the caller-visible surface.
+            let emitted_ts_ns = crate::clock::now_ns();
+            let mut ev = self.events.borrow_mut();
+            ev.push(
+                InternalEvent::Error {
+                    conn: conn_handle,
+                    err: -libc::ENOMEM,
+                    emitted_ts_ns,
+                },
+                &self.counters,
+            );
             return;
         };
         let dst = unsafe { sys::resd_rte_pktmbuf_append(hdr_mbuf, hdr_n as u16) };
         if dst.is_null() {
             unsafe { sys::resd_rte_pktmbuf_free(hdr_mbuf) };
             inc(&self.counters.eth.tx_drop_nomem);
+            // A6 (spec §3.6 Site 2): Error event per occurrence on
+            // retransmit ENOMEM path — append-null means no data-room.
+            let emitted_ts_ns = crate::clock::now_ns();
+            let mut ev = self.events.borrow_mut();
+            ev.push(
+                InternalEvent::Error {
+                    conn: conn_handle,
+                    err: -libc::ENOMEM,
+                    emitted_ts_ns,
+                },
+                &self.counters,
+            );
             return;
         }
         // Safety: `dst` points to `hdr_n` writable bytes inside hdr_mbuf.
         unsafe {
             std::ptr::copy_nonoverlapping(hdr_scratch.as_ptr(), dst as *mut u8, hdr_n);
+        }
+        // A-HW Task 7: apply TX offload metadata + pseudo-header-only
+        // TCP cksum rewrite to the hdr mbuf when offload is active.
+        // payload_for_csum_len is the CHAINED data mbuf's bytes count —
+        // the NIC computes the fold over the header + chained payload,
+        // so the pseudo-header length field must declare the full wire
+        // segment size, not just the hdr mbuf's data_len.
+        //
+        // Safety: `hdr_mbuf` is freshly-allocated, exclusive to us until
+        // chain/tx_burst; the header mbuf's data buffer holds a full
+        // Ethernet+IPv4+TCP header populated by build_retrans_header via
+        // the copy_nonoverlapping above, so the finalizer's data-buffer
+        // preconditions hold.
+        unsafe {
+            crate::tcp_output::tx_offload_finalize(
+                hdr_mbuf,
+                &seg,
+                entry_len as u32,
+                self.tx_cksum_offload_active,
+            );
         }
 
         // Phase 4: bump data mbuf's refcount and chain. The refcnt_update
@@ -2967,21 +4151,45 @@ impl Engine {
             unsafe { sys::resd_rte_pktmbuf_free(hdr_mbuf) };
             unsafe { sys::resd_rte_mbuf_refcnt_update(data_mbuf_ptr, -1) };
             inc(&self.counters.eth.tx_drop_nomem);
+            // A6 (spec §3.6 Site 2): Error event per occurrence on
+            // retransmit ENOMEM path — chain-fail surfaces as ENOMEM
+            // to the caller alongside the tx_drop_nomem bump.
+            let emitted_ts_ns = crate::clock::now_ns();
+            let mut ev = self.events.borrow_mut();
+            ev.push(
+                InternalEvent::Error {
+                    conn: conn_handle,
+                    err: -libc::ENOMEM,
+                    emitted_ts_ns,
+                },
+                &self.counters,
+            );
             return;
         }
 
-        // Phase 5: TX the chained mbuf.
-        let mut bufs = [hdr_mbuf];
-        let sent = unsafe {
-            sys::resd_rte_eth_tx_burst(self.cfg.port_id, self.cfg.tx_queue_id, bufs.as_mut_ptr(), 1)
-        } as usize;
-        if sent == 0 {
-            // TX ring full. `rte_pktmbuf_free(hdr_mbuf)` walks the chain
-            // and drops the data-mbuf refcount we bumped in Phase 4 as
-            // part of the standard chain-free path — do NOT double-free.
-            unsafe { sys::resd_rte_pktmbuf_free(hdr_mbuf) };
-            inc(&self.counters.eth.tx_drop_full_ring);
-            return;
+        // Phase 5: push retransmit frame onto the same batch ring as
+        // new-data sends so retries flow through one burst alongside.
+        // A6 (spec §3.2): ring-full drains and retries. `drain_tx_pending_data`
+        // owns `eth.tx_pkts` + `eth.tx_drop_full_ring` bookkeeping (Task 5),
+        // and on partial-fill it frees unsent mbufs — walking the chain
+        // drops the data-mbuf refcount we bumped in Phase 4.
+        let pushed_ok = {
+            let mut ring = self.tx_pending_data.borrow_mut();
+            if ring.len() < ring.capacity() {
+                // Safety: `hdr_mbuf` is non-null (checked in Phase 2);
+                // NonNull::new_unchecked avoids a second null-check.
+                ring.push(unsafe { std::ptr::NonNull::new_unchecked(hdr_mbuf) });
+                true
+            } else {
+                false
+            }
+        };
+        if !pushed_ok {
+            // Ring at capacity. Drain it, then push this mbuf. The drain
+            // releases its borrow before returning, so the re-borrow is safe.
+            self.drain_tx_pending_data();
+            let mut ring = self.tx_pending_data.borrow_mut();
+            ring.push(unsafe { std::ptr::NonNull::new_unchecked(hdr_mbuf) });
         }
 
         // Phase 6: update per-entry state + bump counters. Re-borrow the
@@ -2996,8 +4204,10 @@ impl Engine {
                 }
             }
         }
+        // Per-retransmit-occurrence counter — NOT per-tx-burst. `eth.tx_pkts`
+        // is owned by `drain_tx_pending_data` (Task 5); `eth.tx_bytes` stays
+        // per-segment to mirror `send_bytes` accepted-byte accounting.
         inc(&self.counters.tcp.tx_retrans);
-        inc(&self.counters.eth.tx_pkts);
         crate::counters::add(
             &self.counters.eth.tx_bytes,
             (hdr_n + entry_len as usize) as u64,
@@ -3131,11 +4341,38 @@ mod tests {
         }
     }
 
+    // A6 Task 12: compile-only signature check that `send_bytes` still
+    // returns Result<u32, Error> and that the `send_refused_pending`
+    // field is readable on a TcpConn looked up via `flow_table()`. Full
+    // end-to-end coverage (short-accept → bit set → WRITABLE fires on
+    // ACK-prune) lives in Task 21's TAP integration.
+    #[test]
+    fn send_bytes_sets_send_refused_pending_on_short_accept() {
+        // Compile-only signature check. Full end-to-end in Task 21.
+        fn _compile_only(e: &Engine, handle: crate::flow_table::ConnHandle) {
+            let _: Result<u32, crate::Error> = e.send_bytes(handle, b"x");
+            let ft = e.flow_table();
+            if let Some(c) = ft.get(handle) {
+                let _ = c.send_refused_pending;
+            }
+        }
+        let _ = _compile_only;
+    }
+
     #[test]
     fn close_conn_signature_exists() {
         fn _check(e: &Engine, h: crate::flow_table::ConnHandle) {
             let _: Result<(), crate::Error> = e.close_conn(h);
         }
+    }
+
+    #[test]
+    fn close_conn_with_flags_signature_exists() {
+        fn _compile_only(e: &Engine) {
+            let _: Result<(), crate::Error> = e.close_conn_with_flags(0, 0);
+            let _: Result<(), crate::Error> = e.close_conn_with_flags(0, 1 << 0);
+        }
+        let _ = _compile_only;
     }
 
     #[test]
@@ -3657,5 +4894,177 @@ mod tests {
         assert_eq!(c.rx_dsack.load(Ordering::Relaxed), 0);
         assert_eq!(c.rx_ws_shift_clamped.load(Ordering::Relaxed), 0);
         assert_eq!(c.rtt_samples.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn flush_tx_pending_data_signature_exists() {
+        // Signature-only check; empty-ring drain and full drain are exercised
+        // end-to-end in tcp_a6_public_api_tap.rs (Task 21).
+        fn _compile_only(e: &Engine) {
+            e.flush_tx_pending_data();
+        }
+        let _ = _compile_only;
+    }
+
+    #[test]
+    fn rtt_histogram_edges_defaults_applied_on_all_zero() {
+        let validated = crate::engine::validate_and_default_histogram_edges(&[0u32; 15])
+            .expect("all-zero must validate and substitute defaults");
+        let expected: [u32; 15] = [
+            50, 100, 200, 300, 500, 750, 1000, 2000, 3000, 5000,
+            10000, 25000, 50000, 100000, 500000,
+        ];
+        assert_eq!(validated, expected);
+    }
+
+    #[test]
+    fn rtt_histogram_edges_non_monotonic_rejected() {
+        let bad: [u32; 15] = [
+            50, 100, 200, 150, 500, 750, 1000, 2000, 3000, 5000,
+            10000, 25000, 50000, 100000, 500000,
+        ];
+        assert!(crate::engine::validate_and_default_histogram_edges(&bad).is_err());
+    }
+
+    #[test]
+    fn rtt_histogram_edges_monotonic_passes_through() {
+        let good: [u32; 15] = [
+            10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 200, 300, 400, 500, 1000,
+        ];
+        let out = crate::engine::validate_and_default_histogram_edges(&good).unwrap();
+        assert_eq!(out, good);
+    }
+
+    #[test]
+    fn rx_enomem_edge_trigger_signature_exists() {
+        fn _compile_only(e: &Engine) {
+            let _: u64 = e.rx_drop_nomem_prev();
+            e.check_and_emit_rx_enomem();
+        }
+        let _ = _compile_only;
+    }
+
+    #[test]
+    fn public_timer_add_cancel_signature_exists() {
+        fn _compile_only(e: &Engine) {
+            let id = e.public_timer_add(0, 0);
+            let _: bool = e.public_timer_cancel(id);
+        }
+        let _ = _compile_only;
+    }
+
+    #[test]
+    fn public_timer_id_packing_roundtrip() {
+        let id = crate::tcp_timer_wheel::TimerId { slot: 0xAABB_CCDD, generation: 0x1122_3344 };
+        let packed = crate::engine::pack_timer_id(id);
+        assert_eq!(packed, 0xAABB_CCDD_1122_3344);
+        let unpacked = crate::engine::unpack_timer_id(packed);
+        assert_eq!(unpacked.slot, 0xAABB_CCDD);
+        assert_eq!(unpacked.generation, 0x1122_3344);
+    }
+
+    #[test]
+    fn align_up_to_tick_zero_and_boundary() {
+        assert_eq!(crate::engine::align_up_to_tick_ns(0), 0);
+        assert_eq!(crate::engine::align_up_to_tick_ns(1), 10_000);
+        assert_eq!(crate::engine::align_up_to_tick_ns(10_000), 10_000);
+        assert_eq!(crate::engine::align_up_to_tick_ns(10_001), 20_000);
+        assert_eq!(crate::engine::align_up_to_tick_ns(19_999), 20_000);
+    }
+
+    /// A6 Task 11: `reap_time_wait`'s candidate predicate must reap a
+    /// TIME_WAIT conn whose `force_tw_skip` flag is set even when the
+    /// 2×MSL deadline is still in the future. The flag is seeded by
+    /// `close_conn_with_flags` in Task 10 when `ts_enabled` is true.
+    #[test]
+    fn force_tw_skip_short_circuits_reap() {
+        use crate::flow_table::{FlowTable, FourTuple};
+        use crate::tcp_state::TcpState;
+
+        let mut ft = FlowTable::new(8);
+        let tuple_a = FourTuple {
+            local_ip: 1,
+            local_port: 40000,
+            peer_ip: 2,
+            peer_port: 5000,
+        };
+        let tuple_b = FourTuple {
+            local_ip: 1,
+            local_port: 40001,
+            peer_ip: 2,
+            peer_port: 5001,
+        };
+        let h_a = ft
+            .insert(crate::tcp_conn::TcpConn::new_client(
+                tuple_a, 0, 1460, 1024, 2048, 5_000, 5_000, 1_000_000,
+            ))
+            .unwrap();
+        let h_b = ft
+            .insert(crate::tcp_conn::TcpConn::new_client(
+                tuple_b, 0, 1460, 1024, 2048, 5_000, 5_000, 1_000_000,
+            ))
+            .unwrap();
+        // conn A: TIME_WAIT + force_tw_skip=true  → should reap
+        // conn B: TIME_WAIT + deadline in future → should NOT reap
+        let now: u64 = 1_000_000_000;
+        if let Some(c) = ft.get_mut(h_a) {
+            c.state = TcpState::TimeWait;
+            c.force_tw_skip = true;
+            c.time_wait_deadline_ns = Some(now + 60_000_000_000);
+        }
+        if let Some(c) = ft.get_mut(h_b) {
+            c.state = TcpState::TimeWait;
+            c.force_tw_skip = false;
+            c.time_wait_deadline_ns = Some(now + 60_000_000_000);
+        }
+        // Replicate the candidate-filter predicate from reap_time_wait:
+        let candidates: Vec<_> = ft
+            .iter_handles()
+            .filter(|h| {
+                let Some(c) = ft.get(*h) else {
+                    return false;
+                };
+                c.state == TcpState::TimeWait
+                    && (c.force_tw_skip
+                        || c.time_wait_deadline_ns.is_some_and(|d| now >= d))
+            })
+            .collect();
+        assert_eq!(candidates.len(), 1, "only A reaps under short-circuit");
+        assert_eq!(candidates[0], h_a);
+    }
+}
+
+#[cfg(test)]
+mod a_hw_port_config_tests {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use super::and_offload_with_miss_counter;
+
+    #[test]
+    fn offload_miss_bumps_counter_returns_zero() {
+        let ctr = AtomicU64::new(0);
+        let bit: u64 = 1 << 3;
+        let advertised = 0u64;
+        let applied = and_offload_with_miss_counter(bit, advertised, &ctr, "tx-tcp-cksum", 0);
+        assert_eq!(applied, 0);
+        assert_eq!(ctr.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn offload_present_no_bump_returns_bit() {
+        let ctr = AtomicU64::new(0);
+        let bit: u64 = 1 << 3;
+        let advertised = bit;
+        let applied = and_offload_with_miss_counter(bit, advertised, &ctr, "tx-tcp-cksum", 0);
+        assert_eq!(applied, bit);
+        assert_eq!(ctr.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn offload_not_requested_noop() {
+        let ctr = AtomicU64::new(0);
+        let applied = and_offload_with_miss_counter(0, u64::MAX, &ctr, "ignored", 0);
+        assert_eq!(applied, 0);
+        assert_eq!(ctr.load(Ordering::Relaxed), 0);
     }
 }

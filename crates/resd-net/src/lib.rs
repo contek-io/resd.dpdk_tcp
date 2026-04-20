@@ -9,6 +9,39 @@ use resd_net_core::engine::{self, Engine, EngineConfig};
 use std::ffi::CStr;
 use std::ptr;
 
+/// A6 (spec §3.5): latency preset — all existing config fields honored
+/// as-written (post zero-sentinel substitution).
+pub const RESD_NET_PRESET_LATENCY: u8 = 0;
+/// A6 (spec §3.5): RFC-compliance preset — overrides five fields per
+/// parent spec §4: `tcp_nagle`, `tcp_delayed_ack`, `cc_mode`,
+/// `tcp_min_rto_us`, `tcp_initial_rto_us`.
+pub const RESD_NET_PRESET_RFC_COMPLIANCE: u8 = 1;
+
+/// A6 (spec §3.5): apply a preset to a core `EngineConfig` after the
+/// zero-sentinel substitution pass. The preset override is stronger
+/// than defaults — any explicit caller values for the five preset
+/// fields are overwritten when `preset == RESD_NET_PRESET_RFC_COMPLIANCE`.
+///
+/// Returns `Err(())` for unknown presets (>= 2); `resd_net_engine_create`
+/// surfaces that as a null-pointer return to the C caller.
+pub fn apply_preset(
+    preset: u8,
+    core_cfg: &mut resd_net_core::engine::EngineConfig,
+) -> Result<(), ()> {
+    match preset {
+        RESD_NET_PRESET_LATENCY => Ok(()),
+        RESD_NET_PRESET_RFC_COMPLIANCE => {
+            core_cfg.tcp_nagle = true;
+            core_cfg.tcp_delayed_ack = true;
+            core_cfg.cc_mode = 1; // Reno
+            core_cfg.tcp_min_rto_us = 200_000;
+            core_cfg.tcp_initial_rto_us = 1_000_000;
+            Ok(())
+        }
+        _ => Err(()),
+    }
+}
+
 /// Opaque handle — actually a Box<Engine> reinterpreted as *mut resd_net_engine.
 struct OpaqueEngine(Engine);
 
@@ -107,7 +140,7 @@ pub unsafe extern "C" fn resd_net_engine_create(
         cfg.tcp_msl_ms
     };
 
-    let core_cfg = EngineConfig {
+    let mut core_cfg = EngineConfig {
         lcore_id,
         port_id: cfg.port_id,
         rx_queue_id: cfg.rx_queue_id,
@@ -126,13 +159,32 @@ pub unsafe extern "C" fn resd_net_engine_create(
         tcp_mss: mss,
         tcp_msl_ms: msl,
         tcp_nagle: cfg.tcp_nagle,
+        // A6 Task 9 (spec §3.5): ABI-to-core pass-through. Pre-preset
+        // value honored when `preset == RESD_NET_PRESET_LATENCY`; `apply_preset`
+        // below overwrites to `true` when `preset == RESD_NET_PRESET_RFC_COMPLIANCE`.
+        tcp_delayed_ack: cfg.tcp_delayed_ack,
+        // A6 Task 9 (spec §3.5): ABI-to-core pass-through. Pre-preset
+        // value honored when `preset == RESD_NET_PRESET_LATENCY`; `apply_preset`
+        // overwrites to `1` (Reno) when `preset == RESD_NET_PRESET_RFC_COMPLIANCE`.
+        cc_mode: cfg.cc_mode,
         tcp_min_rto_us: min_rto_us,
         tcp_initial_rto_us: initial_rto_us,
         tcp_max_rto_us: max_rto_us,
         tcp_max_retrans_count: max_retrans,
         tcp_per_packet_events: cfg.tcp_per_packet_events,
         event_queue_soft_cap: cfg.event_queue_soft_cap,
+        // A6 Task 20: ABI-layer pass-through of the caller-supplied
+        // bucket edges. All-zero input triggers the spec §3.8.2 default
+        // substitution in `Engine::new`; non-monotonic input causes
+        // `Engine::new` to reject and is surfaced here as a null-return.
+        rtt_histogram_bucket_edges_us: cfg.rtt_histogram_bucket_edges_us,
     };
+    // A6 Task 9 (spec §3.5): apply preset override AFTER zero-sentinel
+    // substitution so the preset values are never clobbered by the
+    // substitution pass. Unknown presets (>= 2) null-return.
+    if apply_preset(cfg.preset, &mut core_cfg).is_err() {
+        return ptr::null_mut();
+    }
     match Engine::new(core_cfg) {
         Ok(e) => box_to_raw(e),
         Err(_) => ptr::null_mut(),
@@ -168,7 +220,9 @@ fn build_event_from_internal(
         | InternalEvent::StateChange { emitted_ts_ns, .. }
         | InternalEvent::Error { emitted_ts_ns, .. }
         | InternalEvent::TcpRetrans { emitted_ts_ns, .. }
-        | InternalEvent::TcpLossDetected { emitted_ts_ns, .. } => *emitted_ts_ns,
+        | InternalEvent::TcpLossDetected { emitted_ts_ns, .. }
+        | InternalEvent::ApiTimer { emitted_ts_ns, .. }
+        | InternalEvent::Writable { emitted_ts_ns, .. } => *emitted_ts_ns,
     };
     match ev {
         InternalEvent::Connected {
@@ -270,6 +324,36 @@ fn build_event_from_internal(
                 },
             }
         }
+        // A6 Task 17 (spec §5.3): public-timer fire translator. The
+        // wheel's `TimerId{slot, generation}` re-packs to the same u64
+        // the caller originally received from `resd_net_timer_add`; the
+        // opaque `user_data` round-trips through unchanged.
+        InternalEvent::ApiTimer { timer_id, user_data, .. } => {
+            resd_net_event_t {
+                kind: resd_net_event_kind_t::RESD_NET_EVT_TIMER,
+                conn: 0,
+                rx_hw_ts_ns: 0,
+                enqueued_ts_ns: emitted,
+                u: resd_net_event_payload_t {
+                    timer: resd_net_event_timer_t {
+                        timer_id: resd_net_core::engine::pack_timer_id(*timer_id),
+                        user_data: *user_data,
+                    },
+                },
+            }
+        }
+        // A6 Task 16 (spec §3.3): level-triggered WRITABLE hysteresis.
+        // Upstream emit lives in `Engine::tcp_input` after
+        // `apply_tcp_input_counters` when `outcome.writable_hysteresis_fired`
+        // latches (in-flight drained to ≤ send_buffer_bytes/2 after a
+        // prior send_bytes refusal). No payload — union zeroed.
+        InternalEvent::Writable { conn, .. } => resd_net_event_t {
+            kind: resd_net_event_kind_t::RESD_NET_EVT_WRITABLE,
+            conn: *conn as u64,
+            rx_hw_ts_ns: 0,
+            enqueued_ts_ns: emitted,
+            u: resd_net_event_payload_t { _pad: [0u8; 16] },
+        },
     }
 }
 
@@ -322,9 +406,15 @@ pub unsafe extern "C" fn resd_net_poll(
     filled as i32
 }
 
+/// A6 (spec §4.2): drains the pending data-segment TX batch via one
+/// `rte_eth_tx_burst`. No-op when ring empty. Idempotent.
+/// Control frames (ACK, SYN, FIN, RST) are emitted inline at their
+/// emit site and do not participate in the flush batch — flushing
+/// never blocks or reorders control-frame emission.
 #[no_mangle]
-pub unsafe extern "C" fn resd_net_flush(_p: *mut resd_net_engine) {
-    // Phase A1: no-op; TX burst handled inline in poll_once.
+pub unsafe extern "C" fn resd_net_flush(p: *mut resd_net_engine) {
+    let Some(e) = engine_from_raw(p) else { return };
+    e.flush_tx_pending_data();
 }
 
 #[no_mangle]
@@ -375,6 +465,46 @@ pub unsafe extern "C" fn resd_net_conn_stats(
             (*out).rttvar_us = s.rttvar_us;
             (*out).min_rtt_us = s.min_rtt_us;
             (*out).rto_us = s.rto_us;
+            0
+        }
+        None => -libc::ENOENT,
+    }
+}
+
+/// A6 (spec §3.8, §5.3): per-connection RTT histogram snapshot.
+///
+/// Each bucket counts RTT samples whose value is <= the corresponding
+/// edge in `rtt_histogram_bucket_edges_us[]` (bucket 15 is the catch-
+/// all for values greater than the last edge). Counters are u32 per-
+/// connection lifetime; applications take deltas across two snapshots
+/// using unsigned wraparound subtraction. See the core `rtt_histogram.rs`
+/// module doc-comment for the full wraparound contract.
+///
+/// Slow-path: safe per-order for forensics tagging, safe per-minute for
+/// session-health polling. Do not call in a per-segment loop.
+///
+/// Returns:
+///   0       on success; `out` is populated with 64 bytes.
+///   -EINVAL engine or out is NULL.
+///   -ENOENT conn is not a live handle in the engine's flow table.
+#[no_mangle]
+pub unsafe extern "C" fn resd_net_conn_rtt_histogram(
+    engine: *mut resd_net_engine,
+    conn: resd_net_conn_t,
+    out: *mut resd_net_tcp_rtt_histogram_t,
+) -> i32 {
+    if engine.is_null() || out.is_null() {
+        return -libc::EINVAL;
+    }
+    let Some(e) = engine_from_raw(engine) else {
+        return -libc::EINVAL;
+    };
+    let handle = conn as resd_net_core::flow_table::ConnHandle;
+    let ft = e.flow_table();
+    match ft.get(handle) {
+        Some(c) => {
+            let snap = c.rtt_histogram.snapshot();
+            (*out).bucket = snap;
             0
         }
         None => -libc::ENOENT,
@@ -520,23 +650,93 @@ pub unsafe extern "C" fn resd_net_send(
     }
 }
 
+/// A6 (spec §5.4, §3.4): close a connection, honoring the `flags` bitmask.
+///
+/// Defined flags:
+/// * `RESD_NET_CLOSE_FORCE_TW_SKIP` — request to skip 2×MSL TIME_WAIT.
+///   Honored only when the connection negotiated timestamps
+///   (`c.ts_enabled == true`) at close time — the combination of PAWS
+///   on the peer (RFC 7323 §5) + monotonic ISS on our side (RFC 6528,
+///   spec §6.5) is the client-side analog of RFC 6191's protections.
+///   When the prerequisite is not met, the flag is silently dropped
+///   and a `RESD_NET_EVT_ERROR{err=-EPERM}` is emitted for visibility;
+///   the normal FIN + 2×MSL TIME_WAIT sequence proceeds.
+///
+/// Undefined flag bits are reserved for future extension and silently
+/// ignored.
+///
+/// Returns 0 on successful close initiation (FIN emitted), or:
+///   -EINVAL  engine is NULL
+///   -ENOTCONN  conn is not a live handle
+///   -EIO  internal error (TX path or flow-table)
 #[no_mangle]
 pub unsafe extern "C" fn resd_net_close(
     p: *mut resd_net_engine,
     conn: resd_net_conn_t,
-    _flags: u32,
+    flags: u32,
 ) -> i32 {
-    // FORCE_TW_SKIP flag is A6; ignore in A3.
     if p.is_null() {
         return -libc::EINVAL;
     }
     let Some(e) = engine_from_raw(p) else {
         return -libc::EINVAL;
     };
-    match e.close_conn(conn as u32) {
+    match e.close_conn_with_flags(conn as u32, flags) {
         Ok(()) => 0,
         Err(resd_net_core::Error::InvalidConnHandle(_)) => -libc::ENOTCONN,
         Err(_) => -libc::EIO,
+    }
+}
+
+/// A6 (spec §5.3): schedule a one-shot timer. `deadline_ns` is in the
+/// engine's monotonic clock domain (see `resd_net_now_ns`). Rounded up
+/// to the next 10 µs wheel tick; past deadlines fire on the next poll.
+/// On fire, emits `RESD_NET_EVT_TIMER` with the returned `timer_id`
+/// and the caller-supplied `user_data` echoed back.
+///
+/// Returns 0 on success (populates `*timer_id_out`); -EINVAL on
+/// null engine/out. The populated `*timer_id_out` is a packed
+/// `TimerId{slot, generation}` opaque handle — callers treat as
+/// opaque but may observe the high 32 bits change on slot reuse.
+#[no_mangle]
+pub unsafe extern "C" fn resd_net_timer_add(
+    engine: *mut resd_net_engine,
+    deadline_ns: u64,
+    user_data: u64,
+    timer_id_out: *mut u64,
+) -> i32 {
+    if engine.is_null() || timer_id_out.is_null() {
+        return -libc::EINVAL;
+    }
+    let Some(e) = engine_from_raw(engine) else {
+        return -libc::EINVAL;
+    };
+    let id = e.public_timer_add(deadline_ns, user_data);
+    *timer_id_out = resd_net_core::engine::pack_timer_id(id);
+    0
+}
+
+/// A6 (spec §5.3): cancel a previously-added timer. Returns 0 if
+/// cancelled before fire, -ENOENT otherwise (collapses: never existed /
+/// already fired and drained / already fired but not yet drained).
+/// Callers must always drain any queued TIMER events regardless of
+/// this return — the event queue is authoritative.
+#[no_mangle]
+pub unsafe extern "C" fn resd_net_timer_cancel(
+    engine: *mut resd_net_engine,
+    timer_id: u64,
+) -> i32 {
+    if engine.is_null() {
+        return -libc::EINVAL;
+    }
+    let Some(e) = engine_from_raw(engine) else {
+        return -libc::EINVAL;
+    };
+    let id = resd_net_core::engine::unpack_timer_id(timer_id);
+    if e.public_timer_cancel(id) {
+        0
+    } else {
+        -libc::ENOENT
     }
 }
 
@@ -599,6 +799,7 @@ mod tests {
             gateway_mac: [0xde, 0xad, 0xbe, 0xef, 0x00, 0x01],
             garp_interval_sec: 5,
             event_queue_soft_cap: 4096,
+            rtt_histogram_bucket_edges_us: [0u32; 15],
         };
         assert_eq!(cfg.local_ip, 0x0a_00_00_02);
         assert_eq!(cfg.gateway_mac[2], 0xbe);
@@ -639,6 +840,7 @@ mod tests {
             gateway_mac: [0u8; 6],
             garp_interval_sec: 0,
             event_queue_soft_cap: 32,
+            rtt_histogram_bucket_edges_us: [0u32; 15],
         };
         let p = unsafe { resd_net_engine_create(0, &cfg) };
         assert!(p.is_null());
@@ -776,6 +978,109 @@ mod tests {
         // still return -EINVAL without segfaulting.
         let fake_engine = std::ptr::dangling_mut::<resd_net_engine>();
         let rc = unsafe { resd_net_conn_stats(fake_engine, 0, std::ptr::null_mut()) };
+        assert_eq!(rc, -libc::EINVAL);
+    }
+
+    // A6 Task 18: C ABI null-argument rejection for the RTT histogram
+    // snapshot extern. Happy-path + ENOENT-on-unknown-handle need a live
+    // Engine (DPDK/EAL + TAP); the bucket-update contract is covered by
+    // `resd-net-core::rtt_histogram` unit tests at the ladder layer. Here
+    // we pin the null-guard contracts so malformed C callers cannot
+    // dereference into the engine box.
+    #[test]
+    fn rtt_histogram_null_engine_returns_einval() {
+        let mut out = resd_net_tcp_rtt_histogram_t::default();
+        let rc = unsafe {
+            resd_net_conn_rtt_histogram(std::ptr::null_mut(), 0, &mut out)
+        };
+        assert_eq!(rc, -libc::EINVAL);
+    }
+
+    #[test]
+    fn rtt_histogram_null_out_returns_einval() {
+        let fake_engine = std::ptr::dangling_mut::<resd_net_engine>();
+        let rc = unsafe {
+            resd_net_conn_rtt_histogram(fake_engine, 0, std::ptr::null_mut())
+        };
+        assert_eq!(rc, -libc::EINVAL);
+    }
+
+    // A6 Task 9: `preset` (spec §3.5) must be honored in
+    // `resd_net_engine_create`. Pinning the constants + validator here
+    // lets us exercise the preset path without an EAL-backed Engine.
+    #[test]
+    fn preset_rfc_compliance_is_known_constant() {
+        assert_eq!(RESD_NET_PRESET_LATENCY, 0);
+        assert_eq!(RESD_NET_PRESET_RFC_COMPLIANCE, 1);
+    }
+
+    #[test]
+    fn apply_preset_rfc_compliance_overrides_five_fields() {
+        let mut core_cfg = resd_net_core::engine::EngineConfig {
+            tcp_nagle: false,
+            cc_mode: 0,
+            tcp_min_rto_us: 5_000,
+            tcp_initial_rto_us: 5_000,
+            ..resd_net_core::engine::EngineConfig::default()
+        };
+        apply_preset(1, &mut core_cfg).expect("preset=1 must apply");
+        assert!(core_cfg.tcp_nagle);
+        assert!(core_cfg.tcp_delayed_ack);
+        assert_eq!(core_cfg.cc_mode, 1);
+        assert_eq!(core_cfg.tcp_min_rto_us, 200_000);
+        assert_eq!(core_cfg.tcp_initial_rto_us, 1_000_000);
+    }
+
+    #[test]
+    fn apply_preset_latency_leaves_fields_intact() {
+        let mut core_cfg = resd_net_core::engine::EngineConfig {
+            tcp_nagle: false,
+            cc_mode: 0,
+            tcp_min_rto_us: 5_000,
+            tcp_initial_rto_us: 5_000,
+            ..resd_net_core::engine::EngineConfig::default()
+        };
+        apply_preset(0, &mut core_cfg).expect("preset=0 must be noop");
+        assert!(!core_cfg.tcp_nagle);
+        assert_eq!(core_cfg.cc_mode, 0);
+        assert_eq!(core_cfg.tcp_min_rto_us, 5_000);
+        assert_eq!(core_cfg.tcp_initial_rto_us, 5_000);
+    }
+
+    #[test]
+    fn apply_preset_unknown_rejected() {
+        let mut core_cfg = resd_net_core::engine::EngineConfig::default();
+        assert!(apply_preset(2, &mut core_cfg).is_err());
+        assert!(apply_preset(255, &mut core_cfg).is_err());
+    }
+
+    // A6 Task 17: null-argument rejection contracts for the public
+    // timer extern "C" wrappers. Happy-path + ENOENT-on-stale-id
+    // require a live Engine (DPDK/EAL) and are covered by
+    // resd-net-core's wheel tests at the engine layer; here we pin
+    // the null-guard contracts so malformed C callers can't
+    // dereference into the engine box.
+    #[test]
+    fn timer_add_null_engine_returns_einval() {
+        let mut out: u64 = 0;
+        let rc = unsafe {
+            resd_net_timer_add(std::ptr::null_mut(), 0, 0, &mut out)
+        };
+        assert_eq!(rc, -libc::EINVAL);
+    }
+
+    #[test]
+    fn timer_add_null_out_returns_einval() {
+        let fake_engine = std::ptr::dangling_mut::<resd_net_engine>();
+        let rc = unsafe {
+            resd_net_timer_add(fake_engine, 0, 0, std::ptr::null_mut())
+        };
+        assert_eq!(rc, -libc::EINVAL);
+    }
+
+    #[test]
+    fn timer_cancel_null_engine_returns_einval() {
+        let rc = unsafe { resd_net_timer_cancel(std::ptr::null_mut(), 0) };
         assert_eq!(rc, -libc::EINVAL);
     }
 }

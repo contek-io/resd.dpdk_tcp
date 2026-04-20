@@ -4,6 +4,7 @@
 pub mod arp;
 pub mod clock;
 pub mod counters;
+pub mod dpdk_consts;
 pub mod engine;
 pub mod error;
 pub mod flow_table;
@@ -11,7 +12,10 @@ pub mod icmp;
 pub mod iss;
 pub mod l2;
 pub mod l3_ip;
+#[cfg(feature = "hw-verify-llq")]
+pub mod llq_verify;
 pub mod mempool;
+pub mod rtt_histogram;
 pub mod siphash24;
 pub mod tcp_conn;
 pub mod tcp_events;

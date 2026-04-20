@@ -31,6 +31,10 @@ pub struct TimerNode {
     pub fire_at_ns: u64,
     pub owner_handle: u32,
     pub kind: TimerKind,
+    /// Opaque user payload; only meaningful for `TimerKind::ApiPublic`.
+    /// Zero for kernel timers (RTO / TLP / SynRetrans). Round-tripped
+    /// verbatim from `add` to `fire`.
+    pub user_data: u64,
     pub generation: u32,
     pub cancelled: bool,
 }
@@ -191,6 +195,7 @@ mod tests {
             fire_at_ns,
             owner_handle: 0,
             kind: TimerKind::Rto,
+            user_data: 0,
             generation: 0,
             cancelled: false,
         }
@@ -248,5 +253,23 @@ mod tests {
         let fired = w.advance(200_000);
         assert_eq!(fired.len(), 1);
         assert_eq!(fired[0].0, id_b);
+    }
+
+    #[test]
+    fn timer_node_carries_user_data_through_fire() {
+        let mut w = TimerWheel::new(8);
+        let id = w.add(0, TimerNode {
+            fire_at_ns: 100_000,
+            owner_handle: 0,
+            kind: TimerKind::ApiPublic,
+            user_data: 0xDEAD_BEEF_CAFE_BABE,
+            generation: 0,
+            cancelled: false,
+        });
+        let fired = w.advance(100_000);
+        assert_eq!(fired.len(), 1);
+        let (fired_id, node) = &fired[0];
+        assert_eq!(*fired_id, id);
+        assert_eq!(node.user_data, 0xDEAD_BEEF_CAFE_BABE);
     }
 }

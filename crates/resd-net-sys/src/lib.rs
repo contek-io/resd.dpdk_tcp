@@ -46,4 +46,21 @@ mod tests {
             resd_rte_pktmbuf_data;
         let _e: unsafe extern "C" fn(*const rte_mbuf) -> u16 = resd_rte_pktmbuf_data_len;
     }
+
+    #[test]
+    fn resd_mbuf_offload_shim_symbols_linkable() {
+        // A-HW Task 7: prove the ol_flags / tx-len shim symbols link.
+        // Actually calling them needs a live rte_mbuf (so EAL + mempool).
+        let _a: unsafe extern "C" fn(*mut rte_mbuf, u64) = resd_rte_mbuf_or_ol_flags;
+        let _b: unsafe extern "C" fn(*mut rte_mbuf, u16, u16, u16) = resd_rte_mbuf_set_tx_lens;
+        let _c: unsafe extern "C" fn(*const rte_mbuf) -> u64 = resd_rte_mbuf_get_ol_flags;
+        let _d: unsafe extern "C" fn(*const rte_mbuf) -> u16 = resd_rte_mbuf_get_l2_len;
+        let _e: unsafe extern "C" fn(*const rte_mbuf) -> u16 = resd_rte_mbuf_get_l3_len;
+        let _f: unsafe extern "C" fn(*const rte_mbuf) -> u16 = resd_rte_mbuf_get_l4_len;
+        // A-HW Task 9: RSS hash accessor shim symbol.
+        let _g: unsafe extern "C" fn(*const rte_mbuf) -> u32 = resd_rte_mbuf_get_rss_hash;
+        // A-HW Task 10: RX timestamp dynfield read shim symbol.
+        let _h: unsafe extern "C" fn(*const rte_mbuf, i32) -> u64 =
+            resd_rte_mbuf_read_dynfield_u64;
+    }
 }

@@ -32,6 +32,20 @@ pub enum Error {
     PeerUnreachable(u32),
     #[error("send buffer full for this connection")]
     SendBufferFull,
+    /// LLQ activation verification failed per spec §5.
+    /// Fires when hw-verify-llq is compile-enabled AND the driver is
+    /// net_ena AND the PMD log shows no activation marker (or a failure
+    /// marker) around rte_eth_dev_start.
+    #[error("LLQ activation failed on port {0}: no activation marker found in PMD log")]
+    LlqActivationFailed(u16),
+    /// Log capture init failed — fmemopen/rte_openlog_stream returned error.
+    /// Fires only when hw-verify-llq is compile-enabled.
+    #[error("log capture init failed: {0}")]
+    LogCaptureInit(String),
+    /// A6 (spec §3.8.3): `rtt_histogram_bucket_edges_us` was non-monotonic
+    /// or had an equal-adjacent pair. `engine_create` rejects with null-return.
+    #[error("invalid histogram edges (not strictly monotonic)")]
+    InvalidHistogramEdges,
 }
 
 #[cfg(test)]

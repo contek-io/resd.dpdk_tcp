@@ -103,6 +103,13 @@ typedef struct {
                                        delayed_ack=true, cc_mode=reno, min_rto=200,
                                        initial_rto=1000 — overrides above fields).
                                        Runtime-selectable per engine. */
+    uint32_t rtt_histogram_bucket_edges_us[15]; /* A6: 15 strictly monotonically
+                                       increasing edges define 16 buckets for the
+                                       per-connection RTT histogram. All-zero
+                                       substitutes the DEFAULT edge set (see §4
+                                       resd_net_tcp_rtt_histogram_t). Non-monotonic
+                                       rejected at engine_create with a NULL return
+                                       (-EINVAL to the caller). */
 } resd_net_engine_config_t;
 
 resd_net_engine_t* resd_net_engine_create(uint16_t lcore_id,
@@ -207,14 +214,16 @@ int resd_net_timer_add(resd_net_engine_t*,
 
 /* Cancel a previously-added timer. Fire is a no-op if the timer has already
  * been cancelled or has already fired. Returns 0 if cancelled before fire,
- * -ENOENT if not found, -EALREADY if the fire event has already been queued
- * (caller should still handle the RESD_NET_EVT_TIMER). */
+ * -ENOENT otherwise (unknown / stale / already-fired id). A6 note: the
+ * earlier `-EALREADY` case for "fire event already queued" collapses into
+ * `-ENOENT` — callers must always drain any queued RESD_NET_EVT_TIMER
+ * events regardless of this return. */
 int resd_net_timer_cancel(resd_net_engine_t*, uint64_t timer_id);
 
 /* ===== Observability primitives ===== */
 const resd_net_counters_t* resd_net_counters(resd_net_engine_t*);
 
-/* ===== Introspection (A5.5) ===== */
+/* ===== Introspection (A5.5 + A6) ===== */
 /* Per-connection snapshot: send-path state + RTT estimator state in one call.
  * Returns 0 on success, -ENOENT if conn is not a live handle, -EINVAL on null
  * args. Slow-path; safe to call per-order for forensics tagging but do not
@@ -223,9 +232,33 @@ const resd_net_counters_t* resd_net_counters(resd_net_engine_t*);
 int resd_net_conn_stats(resd_net_engine_t*,
                         resd_net_conn_t,
                         resd_net_conn_stats_t* out);
+
+/* A6: per-connection RTT histogram snapshot. 16 × u32 buckets, layout
+ * determined by `resd_net_engine_config_t.rtt_histogram_bucket_edges_us`
+ * (default edges below). `memcpy`s the current bucket array out to caller
+ * memory. Slow-path; one flow-table lookup + 64-byte copy per call.
+ * Returns 0 on success, -ENOENT if conn is not a live handle, -EINVAL on
+ * null `out`.
+ *
+ * Delta-math pattern: two successive snapshots with `wrapping_sub` per
+ * bucket yield the increment over the interval, even across
+ * wraparound, so long as no single bucket accumulated > 2^32 samples
+ * between polls. */
+typedef struct {
+    uint32_t buckets[16]; /* indexes 0..=15, bucket[i] = count(rtt ∈
+                             (edges[i-1], edges[i]]) with edges[-1]=0
+                             and bucket[15] = count(rtt > edges[14]). */
+} resd_net_tcp_rtt_histogram_t;
+
+int resd_net_conn_rtt_histogram(resd_net_engine_t*,
+                                resd_net_conn_t,
+                                resd_net_tcp_rtt_histogram_t* out);
 ```
 
-**Introspection API (A5.5).** `resd_net_conn_stats(engine, conn, out)` returns a 9-field `u32` POD (`snd_una`, `snd_nxt`, `snd_wnd`, `send_buf_bytes_pending`, `send_buf_bytes_free`, `srtt_us`, `rttvar_us`, `min_rtt_us`, `rto_us`) in one call. Designed for per-order forensics tagging: diffs between consecutive snapshots answer "was the order sitting in `snd.pending` under peer-rwnd backpressure?" and "was the path's `srtt_us` / `rttvar_us` steady or spiking at send time?". Slow-path; safe per order, not safe per packet. See A5.5 design spec §3.3 for the full field semantics and usage pattern.
+**A6 default RTT histogram edges** (when `rtt_histogram_bucket_edges_us` is all-zero):
+`[50, 100, 200, 300, 500, 750, 1000, 2000, 3000, 5000, 10000, 25000, 50000, 100000, 500000]` µs. Covers a typical trading WAN distribution in 16 buckets with tight resolution at the sub-millisecond end and a coarse tail out to half a second before the catch-all.
+
+**Introspection API (A5.5 + A6).** `resd_net_conn_stats(engine, conn, out)` returns a 9-field `u32` POD (`snd_una`, `snd_nxt`, `snd_wnd`, `send_buf_bytes_pending`, `send_buf_bytes_free`, `srtt_us`, `rttvar_us`, `min_rtt_us`, `rto_us`) in one call. Designed for per-order forensics tagging: diffs between consecutive snapshots answer "was the order sitting in `snd.pending` under peer-rwnd backpressure?" and "was the path's `srtt_us` / `rttvar_us` steady or spiking at send time?". Slow-path; safe per order, not safe per packet. See A5.5 design spec §3.3 for the full field semantics and usage pattern. `resd_net_conn_rtt_histogram(engine, conn, out)` (A6) returns the connection's 16-bucket RTT histogram; edges are set engine-wide via `resd_net_engine_config_t.rtt_histogram_bucket_edges_us` and default to the 15-edge ladder listed above. Per-conn RTT histogram lives on `TcpConn` (one cacheline per conn), not in `resd_net_counters_t`. Slow-path; one flow-table lookup + 64-byte `memcpy` per call.
 
 **Per-connect TLP tuning fields (A5.5).** `resd_net_connect_opts_t` carries five TLP knobs below the existing A5 `rack_aggressive` / `rto_no_backoff` entries; defaults preserve RFC 8985 exactly:
 
@@ -233,7 +266,7 @@ int resd_net_conn_stats(resd_net_engine_t*,
 - `tlp_pto_srtt_multiplier_x100: u16` — integer ×100 (100 = 1.0×, 200 = 2.0× default); valid range `[100, 200]`.
 - `tlp_skip_flight_size_gate: bool` — when `true`, skip the RFC 8985 §7.2 `+max(WCDelAckT, RTT/4)` PTO penalty at FlightSize=1.
 - `tlp_max_consecutive_probes: u8` — TLP probes fired consecutively before RTO takes over; default `1` (A5 behavior); valid `[1, 5]`.
-- `tlp_skip_rtt_sample_gate: bool` — when `true`, disable RFC 8985 §7.4 "no new RTT sample since last TLP" suppression. Required alongside `tlp_max_consecutive_probes > 1` for multi-probe cadence.
+- `tlp_skip_rtt_sample_gate: bool` — when `true`, disable RFC 8985 §7.3 step 2 "no new RTT sample since last TLP" suppression. Required alongside `tlp_max_consecutive_probes > 1` for multi-probe cadence.
 
 See A5.5 design spec §5.5 for valid-range table, rejection semantics at `resd_net_connect`, and the aggressive-preset composition example.
 
@@ -275,7 +308,8 @@ while (running) {
 - `RESD_NET_EVT_READABLE.u.readable.data` is a **borrowed view** into mbuf memory, valid from the moment `resd_net_poll` returns until the next `resd_net_poll` call on the same engine. The stack refcount-pins every mbuf referenced by any event in `events_out[0..n]` for that window; internal stack processing (including later bursts within the same poll) must not free those mbufs. Caller must `memcpy` out if they need bytes to outlive the poll.
 - Multiple `RESD_NET_EVT_READABLE` events may fire per poll iteration if received bytes span multiple mbufs; they deliver in-order, each with one contiguous mbuf-data region.
 - `RESD_NET_EVT_WRITABLE` fires when the per-connection send buffer has drained by at least half its capacity after a prior full/partial send refusal.
-- `resd_net_flush` drains the current TX batch via exactly one `rte_eth_tx_burst`; no-op when empty. Safe to call multiple times per poll iteration; idempotent — a follow-up call with nothing newly queued is a no-op.
+- `resd_net_flush` drains the pending data-segment TX batch via exactly one `rte_eth_tx_burst`; no-op when empty. Control frames (ACK, SYN, FIN, RST) are emitted inline at their emit site and do NOT participate in the flush batch — `resd_net_flush` only pushes out the data segments that `send_bytes` / internal retransmit queued onto `tx_pending_data`. Safe to call multiple times per poll iteration; idempotent — a follow-up call with nothing newly queued is a no-op.
+- `resd_net_close` accepts a `flags` bitmask. Currently defined: `RESD_NET_CLOSE_FORCE_TW_SKIP` (bit 0), which requests that the TIME_WAIT 2×MSL wait be skipped. The flag is honored only when `c.ts_enabled == true` at close time (the connection negotiated RFC 7323 timestamps). When the prerequisite is met, the close path sets the per-conn `force_tw_skip` bit; `reap_time_wait` then short-circuits the 2×MSL wait. When the prerequisite is NOT met, the flag is silently dropped, a `RESD_NET_EVT_ERROR{err=-EPERM}` event is emitted for visibility (the "EPERM_TW_REQUIRED" condition), and the normal FIN + 2×MSL TIME_WAIT sequence proceeds. Other bits in `flags` are reserved for future extension and currently ignored.
 - `rx_hw_ts_ns` is 0 when the NIC/PMD does not fill hardware timestamps; callers fall back to `enqueued_ts_ns`.
 - **`resd_net_poll` event-overflow policy**: if more events are ready than `max_events`, the stack fills `events_out[0..max_events]` with events in FIFO enqueue order, stops further RX-burst processing for this iteration, and leaves the overflow + any unprocessed RX packets queued inside the engine. The next `resd_net_poll` call drains the queue before processing new RX. Per-connection event ordering is preserved across poll boundaries; no event kind is preempted or prioritized. Callers size `max_events` at least to `(NIC_BURST × 2)` so steady-state traffic fits; smaller sizes are valid but cause additional poll round-trips.
 - **Event-queue soft-cap contract (A5.5).** The per-engine internal event queue has a configurable soft cap (`resd_net_engine_config_t.event_queue_soft_cap`, default `4096`, minimum `64` — smaller configs rejected at `engine_create` with `-EINVAL`). When `push` would exceed the cap, the **oldest** queued event is dropped (`pop_front`), `obs.events_dropped` increments, and the new event is pushed. `obs.events_queue_high_water` latches the maximum observed queue depth since engine start (does not decrement). The pair tells a clean story: high-water near cap with `events_dropped == 0` is a close call; `events_dropped > 0` is actual loss and the app's poll cadence is falling behind. Drop-oldest preserves the most recent events (most useful for immediate-past forensics), matching the Linux `dmesg` ring-buffer mental model. Both counters are slow-path (`AtomicU64`, fire only on event-push boundaries). See A5.5 design spec §3.2 for the full push-path pseudocode and rationale.
@@ -383,8 +417,8 @@ struct TcpConn {
 | 6582 | NewReno | with Reno mode | |
 | 6691 | MSS | yes | clamp to local MTU |
 | 3168 | ECN | off-by-default (flag) | |
-| 8985 | RACK-TLP | yes | A5 implements RACK-TLP as the primary loss-detection path; 3-dup-ACK fast retrans is disabled (counter visibility only via `rx_dup_ack`). **A5.5 additions:** §6.3 `RACK_mark_losses_on_RTO` pass now runs at the top of `on_rto_fire` (Task 14 — was AD-17 in A5 review, closed). §7.2 `arm_tlp_pto` now called from the `Engine::send_bytes` TX path on every new-data send (Task 15 — was AD-18 in A5 review, closed). Per-connect tuning knobs (`tlp_pto_min_floor_us`, `tlp_pto_srtt_multiplier_x100`, `tlp_skip_flight_size_gate`, `tlp_max_consecutive_probes`, `tlp_skip_rtt_sample_gate`) deviate from strict §7.2/§7.4 when set — default values match RFC 8985 exactly. |
-| 6298 §3.3 | SRTT from SYN handshake | yes (A5.5) | SRTT is seeded from the SYN handshake round-trip on the first SYN's ACK per RFC 6298 §3.3 MAY ("The RTT of the SYN segment MAY be used as the first SRTT"). Karn's rule honored via `syn_retransmit_count == 0` guard — retransmitted SYNs produce no sample. `min_rtt_us` and `rto_us` are trustworthy from the moment the connection enters ESTABLISHED. Added A5.5 Task 13. |
+| 8985 | RACK-TLP | yes | A5 implements RACK-TLP as the primary loss-detection path; 3-dup-ACK fast retrans is disabled (counter visibility only via `rx_dup_ack`). **A5.5 additions:** §6.3 `RACK_mark_losses_on_RTO` pass now runs at the top of `on_rto_fire` (Task 14 — was AD-17 in A5 review, closed). §7.2 `arm_tlp_pto` now called from the `Engine::send_bytes` TX path on every new-data send (Task 15 — was AD-18 in A5 review, closed). Per-connect tuning knobs (`tlp_pto_min_floor_us`, `tlp_pto_srtt_multiplier_x100`, `tlp_skip_flight_size_gate`, `tlp_max_consecutive_probes`, `tlp_skip_rtt_sample_gate`) deviate from strict §7.2 (PTO formula) and §7.3 step 2 (RTT-sample gate) when set — default values match RFC 8985 exactly. |
+| 6298 §2.2 + §3 | SRTT from SYN handshake + Karn's rule | yes (A5.5) | SRTT is seeded from the SYN handshake round-trip on the first SYN's ACK per RFC 6298 §2.2 (first-RTT seeding). Karn's rule (§3) honored via `syn_retransmit_count == 0` guard — retransmitted SYNs produce no sample. `min_rtt_us` and `rto_us` are trustworthy from the moment the connection enters ESTABLISHED. Added A5.5 Task 13. |
 | 6528 | ISS generation | yes | `ISS = (ticks_since_boot_at_4µs) + SipHash(4-tuple \|\| secret \|\| boot_nonce)` — clock outside the hash for monotonicity across reconnects |
 | 5961 | Blind-data-attack mitigations | yes | challenge-ACK on out-of-window seqs |
 | 7413 | TCP Fast Open | **NO** | not useful for long-lived connections |
@@ -406,14 +440,15 @@ struct TcpConn {
 
 | AD tag | RFC stance | Our behavior | Rationale |
 |---|---|---|---|
-| `AD-A5-5-srtt-from-syn` | RFC 6298 §3.3 MAY ("RTT of the SYN segment MAY be used as the first SRTT") | **applied** — first SRTT sample drawn from SYN handshake round-trip on the first SYN's ACK. Karn's rule honored via `syn_retransmit_count == 0` guard. | Trader-latency use case requires trustworthy RTT state from the moment ESTABLISHED fires (for `resd_net_conn_stats` forensics and so AD-18's arm-TLP-on-send has a valid PTO basis). Bounds-checked `[1, 60_000_000) µs`. Net-conservative under the cited MAY. Applies to every connection (not opt-in). See A5.5 design spec §3.5. |
+| `AD-A5-5-srtt-from-syn` | RFC 6298 §2.2 (first-RTT seeding) + §3 (Karn's rule) | **applied** — first SRTT sample drawn from SYN handshake round-trip on the first SYN's ACK. Karn's rule (§3) honored via `syn_retransmit_count == 0` guard. | Trader-latency use case requires trustworthy RTT state from the moment ESTABLISHED fires (for `resd_net_conn_stats` forensics and so AD-18's arm-TLP-on-send has a valid PTO basis). Bounds-checked `[1, 60_000_000) µs`. Net-conservative under the cited §2.2. Applies to every connection (not opt-in). See A5.5 design spec §3.5. |
 | `AD-A5-5-rack-mark-losses-on-rto` | RFC 8985 §6.3 SHOULD-equivalent (`RACK_mark_losses_on_RTO` pass) | **applied** — `on_rto_fire` Phase 3 walks `snd_retrans.entries` and marks lost any entry where `seq == snd.una` OR `(xmit_ts/1000) + rack.rtt_us + rack.reo_wnd_us <= now_us` before retransmitting the batch through the existing `rack_lost_indexes` loop. | Closes AD-17 (from A5 RFC review S-1 promotion). Single RTO fire now retransmits the entire §6.3-eligible tail in one burst (one `tcp.tx_rto` increment, `tcp.tx_retrans` one-per-segment). Fewer aggregate cycles than A5's one-segment-per-ACK amortization. Applies to every connection. See A5.5 design spec §3.6. |
 | `AD-A5-5-tlp-arm-on-send` | RFC 8985 §7.2 SHOULD ("the sender SHOULD start or restart a loss probe PTO timer after transmitting new data") | **applied** — new `arm_tlp_pto` helper invoked from `Engine::send_bytes` TX path after the new-data segment enters `snd_retrans`. Gated on SRTT-available + no-TLP-armed + probe-budget-not-exhausted. | Closes AD-18 (from A5 RFC review + mTCP E-2). Covers the pre-first-data-ACK tail-loss window that A5 left to RTO fallback. Combined with `AD-A5-5-srtt-from-syn`, SRTT is available at every arm site post-ESTABLISHED. Applies to every connection. See A5.5 design spec §3.7. |
 | `AD-A5-5-tlp-pto-floor-zero` | RFC 8985 §7.2 silent on PTO minimum; many implementations use 10 ms | **per-conn opt-in** via `tlp_pto_min_floor_us`. `0` inherits engine `tcp_min_rto_us` (default); `u32::MAX` = explicit no-floor; otherwise `[0, tcp_max_rto_us]`. | On a tight-jitter intra-region link the 10 ms floor is multiple RTTs of wasted budget. Risk: spurious probes if jitter exceeds `SRTT/4`; `tcp.tx_tlp_spurious` counter lets the app self-correct the floor upward. Defaults preserve A5 behavior exactly. See A5.5 design spec §5.5. |
 | `AD-A5-5-tlp-multiplier-below-2x` | RFC 8985 §7.2 hard-codes `2·SRTT` | **per-conn opt-in** via `tlp_pto_srtt_multiplier_x100`. Integer ×100; default `200` (2.0×); valid `[100, 200]`. | `2·SRTT` is conservative for the ≥40 ms delayed-ACK budgets the RFC assumes; trading peers do not use delayed ACKs in hot paths. Risk: probe-before-peer-ACK racing; same spurious counter mitigation. Defaults preserve A5 behavior exactly. |
 | `AD-A5-5-tlp-skip-flight-size-gate` | RFC 8985 §7.2 adds `+max(WCDelAckT, RTT/4)` to PTO when FlightSize == 1 | **per-conn opt-in** via `tlp_skip_flight_size_gate`. When `true`, skip the penalty regardless of FlightSize. | `WCDelAckT` default of 200 ms is four orders of magnitude larger than our target order-entry RTT; the penalty blows any latency budget. Risk: if peer has delayed-ACK on, probe fires before peer's ACK (detected as spurious via DSACK). Companion-segment mitigation tracked as §12 follow-on in A5.5 spec. |
-| `AD-A5-5-tlp-multi-probe` | RFC 8985 §7.4 allows at most one pending probe at a time; silent on consecutive schedules post-probe-ACK | **per-conn opt-in** via `tlp_max_consecutive_probes`. Default `1` (A5 behavior); valid `[1, 5]`. Budget resets on any new RTT sample or newly-ACKed data. | On clean probe-ACK arrival, a second probe at PTO cadence is often cheaper than a full RTO wait for a separate tail-loss. Risk: probe amplification bounded by the `[1, 5]` cap and budget reset. See A5.5 design spec §3.4. |
-| `AD-A5-5-tlp-skip-rtt-sample-gate` | RFC 8985 §7.4 suppresses TLP when no new RTT sample has been seen since the last probe | **per-conn opt-in** via `tlp_skip_rtt_sample_gate`. When `true`, disable the suppression. | Required alongside `tlp_max_consecutive_probes > 1` for multi-probe cadence. On a quiescent path with occasional lost segments, consecutive probes without intervening samples is the recovery we want. Risk: runaway probing if path is persistently broken; bounded by `tlp_max_consecutive_probes` and RTO takeover. |
+| `AD-A5-5-tlp-multi-probe` | RFC 8985 §7.3 step 2 allows at most one pending probe at a time; silent on consecutive schedules post-probe-ACK | **per-conn opt-in** via `tlp_max_consecutive_probes`. Default `1` (A5 behavior); valid `[1, 5]`. Budget resets on any new RTT sample or newly-ACKed data. | On clean probe-ACK arrival, a second probe at PTO cadence is often cheaper than a full RTO wait for a separate tail-loss. Risk: probe amplification bounded by the `[1, 5]` cap and budget reset. See A5.5 design spec §3.4. |
+| `AD-A5-5-tlp-skip-rtt-sample-gate` | RFC 8985 §7.3 step 2 suppresses TLP when no new RTT sample has been seen since the last probe | **per-conn opt-in** via `tlp_skip_rtt_sample_gate`. When `true`, disable the suppression. | Required alongside `tlp_max_consecutive_probes > 1` for multi-probe cadence. On a quiescent path with occasional lost segments, consecutive probes without intervening samples is the recovery we want. Risk: runaway probing if path is persistently broken; bounded by `tlp_max_consecutive_probes` and RTO takeover. |
+| `AD-A6-force-tw-skip` | RFC 9293 §3.5 MUST-13 requires an actively-closing side to linger in TIME_WAIT for 2×MSL; §3.5 MAY-2 permits reduction per RFC 6191, whose algorithm is stated server-side | **per-close opt-in** via `resd_net_close(conn, RESD_NET_CLOSE_FORCE_TW_SKIP)`, honored only when `c.ts_enabled == true` at close time. Under that prerequisite, `c.force_tw_skip` is set and `reap_time_wait` drains the TIME_WAIT conn as soon as the FIN handshake completes rather than waiting 2×MSL. When the prerequisite is NOT met, the flag is silently dropped, a `RESD_NET_EVT_ERROR{err=-EPERM}` event (the "EPERM_TW_REQUIRED" condition per §9.3) is emitted, and normal 2×MSL behavior proceeds. Default (no flag) is RFC 9293 MUST-13 exact. | Stage 1 is client-only (no LISTEN/accept) and exchanges reopen a 4-tuple faster than 2×MSL would permit. The combination of PAWS on the peer (RFC 7323 §5) + monotonic ISS on our side (RFC 6528 §3, via `(ticks_since_boot_at_4µs) + SipHash(…)`) is the client-side analog of RFC 6191 §4.2's protections: any in-flight segment from the prior incarnation is rejected either by the peer's TSval check (PAWS) or by our ISS-monotonicity gate. Opt-in + `ts_enabled` gate + EPERM-on-prereq-fail make the deviation caller-observable and RFC-default-preserving for unguarded callers. Full rationale in §6.5 "TIME_WAIT shortening". |
 
 **A5.5 retirements:** `AD-15` (TLP pre-fire state machine) superseded by the `tlp_recent_probes` ring + `tlp_consecutive_probes_fired` budget data structures — retirement note on `docs/superpowers/reviews/phase-a5-rfc-compliance.md`. `AD-17` and `AD-18` (A5 RFC review promotions) absorbed into the two `AD-A5-5-rack-mark-losses-on-rto` / `AD-A5-5-tlp-arm-on-send` closure rows above.
 
@@ -425,7 +460,7 @@ struct TcpConn {
 - **SYN retransmit**: schedule respects `connect_timeout_ms` from `resd_net_connect_opts_t`. Default: 3 attempts with initial backoff `max(initial_rto_ms, minRTO)` (config default: `initial_rto_ms=50`), exponential up to the total budget. Never exceed `connect_timeout_ms` in total; the connection fails fast for trading, not per RFC 6298's 1s recommendation.
 - **Data retransmit budget**: `tcp_max_retrans_count` (default 15). After this many RTO-driven retransmits of a single segment with no ACK progress, the connection fails with `RESD_NET_EVT_ERROR{err=ETIMEDOUT}`. With backoff + `tcp_max_rto_us=1s`, the total wall-clock budget is ≈8.3s (5 + 10 + 20 + 40 + ...). Opt-out of backoff per-connect (`rto_no_backoff=true`) makes the budget linear in `count × rto_us`.
 - **RTO timer re-arm**: lazy. On ACK, update `snd.una`; the existing wheel entry fires at its originally-scheduled deadline. When it fires, the handler re-checks `snd.una` vs `snd.nxt` — if fully ACKed, the timer cancels itself; otherwise it retransmits and re-arms. Avoids remove+insert on every ACK.
-- **TIME_WAIT shortening**: `resd_net_close(engine, conn, RESD_NET_CLOSE_FORCE_TW_SKIP)` is honored only when RFC 6191 / RFC 7323 §5 conditions are met — specifically, timestamps are enabled on both sides AND `SEG.TSval > TS.Recent` at reconnect. When conditions aren't met, the flag is ignored and the connection stays in TIME_WAIT; a `RESD_NET_EVT_ERROR` with `err=EPERM_TW_REQUIRED` is emitted so the caller knows.
+- **TIME_WAIT shortening**: `resd_net_close(engine, conn, RESD_NET_CLOSE_FORCE_TW_SKIP)` is honored only when `c.ts_enabled == true` at close time (the connection negotiated RFC 7323 timestamps). Under that prerequisite the close path sets `c.force_tw_skip`; `reap_time_wait` then drains the TIME_WAIT conn as soon as the FIN handshake completes rather than sitting for 2×MSL. When the prerequisite is NOT met, the flag is silently dropped, a `RESD_NET_EVT_ERROR{err=-EPERM}` event (the "EPERM_TW_REQUIRED" condition) is emitted for visibility, and the normal FIN + 2×MSL TIME_WAIT sequence proceeds. The combination of PAWS on the peer (RFC 7323 §5) plus monotonic ISS on our side (RFC 6528; see `ISS` implementation choice above) is the client-side analog of RFC 6191 §4.2's protections: any in-flight segment from the prior incarnation is rejected either by PAWS (peer-side TSval check) or by the ISS-monotonicity gate we maintain via the `(ticks_since_boot_at_4µs) + SipHash(…)` construction. Note this is a deliberate deviation from RFC 6191 §4.2's server-side wording — the RFC's conditions address the server incarnation reopening a passive listener, whereas our client-side construction relies on the peer's own PAWS + our ISS monotonicity to achieve the same protection without waiting 2×MSL on the client side.
 
 ## 7. Memory and Buffer Model
 
@@ -537,7 +572,7 @@ Design consequences:
 
 ### 8.4 Offload-enablement policy (tiered, driven by trading-latency goal)
 
-**Compile-time gates.** Every offload is behind a cargo feature flag — `hw-offload-llq`, `hw-offload-tx-cksum`, `hw-offload-rx-cksum`, `hw-offload-mbuf-fast-free`, `hw-offload-rss-hash`. All default to ON. A feature-off build compiles the offload code path away entirely; the software path is what the binary executes. This lets A10's benchmark harness produce an on-vs-off A/B comparison per offload via rebuilds, without the runtime cost of a toggle on the hot path. Gates live at the code site, not on struct fields, so the C ABI is stable across feature sets (same pattern as §9.1.1 observability flags).
+**Compile-time gates.** Every offload is behind a cargo feature flag — `hw-verify-llq`, `hw-offload-tx-cksum`, `hw-offload-rx-cksum`, `hw-offload-mbuf-fast-free`, `hw-offload-rss-hash`. All default to ON. A feature-off build compiles the offload code path away entirely; the software path is what the binary executes. This lets A10's benchmark harness produce an on-vs-off A/B comparison per offload via rebuilds, without the runtime cost of a toggle on the hot path. Gates live at the code site, not on struct fields, so the C ABI is stable across feature sets (same pattern as §9.1.1 observability flags). Note `hw-verify-llq` differs from the other flags: it does not enable an offload (LLQ activation is driven by the ENA PMD's `enable_llq=X` devarg, which is **application-owned** via EAL init — the ENA PMD default is `enable_llq=1`). Instead it gates the engine's verification discipline — PMD log-scrape at EAL init + fail-hard if ENA advertised LLQ capability but LLQ did not activate. See A-HW spec §5 for the capture mechanism.
 
 **Runtime capability gate.** Separately from the compile-time gate, every offload that is compile-time-enabled is also AND-ed against `rte_eth_dev_info_get`'s `*_offload_capa` at `engine_create`. A requested-but-unadvertised capability degrades to the software path for that engine instance, logs WARN, and bumps a one-shot counter (`eth.offload_missing_<name>`). This preserves portability to non-ENA hardware (including `net_vdev` / `net_tap` in tests) without a separate build.
 
@@ -606,6 +641,15 @@ Counter groups (Stage 1): `eth`, `ip`, `tcp`, `poll`, `obs` (A5.5). Examples in 
 - `obs.events_dropped` — event dropped from the per-engine internal event queue on soft-cap overflow. Nonzero = app poll cadence cannot keep up; `events_queue_high_water` tells you how close the pressure got and `events_dropped` tells you whether any were lost.
 - `obs.events_queue_high_water` — latched max observed queue depth since engine start. Does not decrement. Combined with `events_dropped`: high-water near cap with `events_dropped == 0` is a close call; nonzero `events_dropped` is actual loss.
 
+**A6 additions** (all slow-path counters per §9.1.1 — timer fire, lazy-expiration, flush-drain):
+
+- `tcp.tx_api_timers_fired` — incremented once per `RESD_NET_EVT_TIMER` emission (i.e. per public-timer fire from `resd_net_timer_add`). Paired with `resd_net_timer_add` return counts (observed externally by the caller) to answer "did my timer actually fire, or was it cancelled / stale?". Slow-path; fires at timer-fire rate, not per-segment.
+- `tcp.ts_recent_expired` — incremented when the RFC 7323 §5.5 24-day `TS.Recent` lazy expiration fires on a received TS-carrying segment. Nonzero values indicate a connection that has been idle for > 24 days and is re-adopting a fresh TSval rather than PAWS-rejecting the segment. Rare on short-lived exchange connections; informational for long-held keepalive paths.
+- `tcp.tx_flush_bursts` — incremented once per `rte_eth_tx_burst` call made by `drain_tx_pending_data` (via `resd_net_flush` or the end-of-poll drain). Paired with `tcp.tx_flush_batched_pkts` to compute the average batch size (`batched_pkts / bursts`); higher ratios indicate better amortization of the per-burst doorbell cost.
+- `tcp.tx_flush_batched_pkts` — incremented by the number of mbufs actually handed to the single `rte_eth_tx_burst` inside each drain. Sum over an interval vs. `tx_pkts` tells you what fraction of TX went through the batched data-segment path vs. the inline control-frame path.
+
+Per-connection RTT histogram is intentionally NOT in `resd_net_counters_t` — see `resd_net_conn_rtt_histogram` under the §4 Introspection API. The histogram lives on each `TcpConn` (one cacheline per conn) rather than in the engine counter struct; snapshot-delta semantics give the caller control over the aggregation interval without engine-wide contention.
+
 Counter writes are `fetch_add(1, Ordering::Relaxed)` (`lock xadd` on x86_64; ~8-12 cycles uncontended). Cross-lcore snapshot readers use `load(Ordering::Relaxed)` — no torn reads. `Relaxed` is sufficient because counters are non-ordering observability data, not synchronization primitives. The alternative — `load(Relaxed)` + `store(val+1, Relaxed)` — is cheaper by a few cycles under the single-owner-lcore invariant but drops increments if that invariant ever slips (e.g., a future refactor moves a counter to a shared path); `fetch_add` is robust under any producer layout. The additional alternative — "plain `u64` + `memcpy`" — is a data race by the Rust / C++ abstract machine and is rejected. Slow-path counters pay the `fetch_add` cost unconditionally (see §9.1.1); hot-path counters follow the §9.1.1 policy (feature-gated + per-burst batched into a stack-local accumulator + single aggregate `fetch_add`).
 
 ### 9.1.1 Counter-addition policy
@@ -651,6 +695,12 @@ Delivered through the normal `resd_net_poll` interface:
 - `RESD_NET_EVT_ERROR` with `err=ENOMEM` — mempool exhaustion on TX or internal allocation; with `err=EPERM_TW_REQUIRED` — `FORCE_TW_SKIP` flag ignored because RFC 6191 conditions not met; with `err=ETIMEDOUT` — SYN retransmit budget exhausted (4th SYN attempt) or data retransmit budget exhausted (`tcp_max_retrans_count`+1).
 
 State changes and ERROR events are always emitted. Per-packet TCP trace events (`TCP_RETRANS`, `TCP_LOSS_DETECTED`) are gated by the `tcp_per_packet_events` config flag so they don't clutter `resd_net_poll` results when not wanted.
+
+**A6 `RESD_NET_EVT_ERROR{err=-ENOMEM}` emission sites.** ENOMEM (tx / rx mempool exhaustion) is surfaced through three distinct sites with different cadences so the caller always has actionable visibility without event-storm risk:
+
+1. **`send_bytes` synchronous return.** When `resd_net_send` cannot allocate a header mbuf from `tx_hdr_mempool`, the call returns `-ENOMEM` synchronously AND emits one `RESD_NET_EVT_ERROR{conn, err=-ENOMEM}` event per call site. The redundant event makes the condition visible to callers whose error-handling wrapper only looks at poll events (and for symmetry with the internal-retransmit path below where no sync return exists).
+2. **Internal retransmit per-occurrence.** When `retransmit` (called from RTO / RACK / TLP fire handlers) cannot allocate a fresh header mbuf or the subsequent `rte_pktmbuf_chain` fails, one `RESD_NET_EVT_ERROR{conn, err=-ENOMEM}` is emitted per occurrence. No rate limiting — retransmit failures are already rare (mempool exhaustion under persistent pressure) and each occurrence is actionable.
+3. **RX mempool edge-triggered per poll iteration.** The RX path's mempool-drop counter (`eth.rx_drop_nomem`) increments per dropped packet, but the RX ENOMEM event is edge-triggered: `poll_once` snapshots `eth.rx_drop_nomem` at the top and compares against the post-RX-burst value; if `post > pre`, exactly ONE `RESD_NET_EVT_ERROR{conn=0, err=-ENOMEM}` event is emitted for that poll iteration, regardless of how many packets were dropped. This caps the event rate at one per poll under a runaway RX-mempool-exhaustion condition, leaving `eth.rx_drop_nomem` as the ground-truth per-packet counter.
 
 **`enqueued_ts_ns` semantic (A5.5 correction).** The `resd_net_event_t.enqueued_ts_ns` field is sampled at **event emission** inside the stack, **not** at `resd_net_poll` drain. For packet-triggered events, emission time is when the stack processed the triggering packet (not when the NIC received it — use `rx_hw_ts_ns` for NIC-arrival). For timer-triggered events (RTO fire, loss-detected), emission time is the fire instant. This eliminates the ±poll-interval skew (tens of µs at 10–100 kHz poll rates) that the pre-A5.5 drain-time sampling introduced. Field name and layout on the public ABI are unchanged; only the sampling site moves. See A5.5 design spec §3.1 for the rationale; `rx_hw_ts_ns` semantics are unchanged.
 

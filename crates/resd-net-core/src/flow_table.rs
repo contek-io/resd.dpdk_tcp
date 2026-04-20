@@ -8,6 +8,7 @@
 //! "0 = invalid" convention in spec §4.
 
 use std::collections::HashMap;
+use std::hash::{BuildHasher, Hasher};
 
 use crate::tcp_conn::{ConnStats, TcpConn};
 
@@ -27,6 +28,76 @@ pub struct FourTuple {
 pub type ConnHandle = u32;
 
 pub const INVALID_HANDLE: ConnHandle = 0;
+
+/// Fold the 4-tuple through the same hasher `HashMap<FourTuple, _>` uses
+/// internally (`std::hash::RandomState` → SipHash-1-3 with a per-process
+/// random seed) and truncate to `u32` for bucket-index use. This is the
+/// software fallback path for `hash_bucket_for_lookup` when either the
+/// `hw-offload-rss-hash` feature is off, the engine's RSS latch is off,
+/// or the mbuf did not stamp `RTE_MBUF_F_RX_RSS_HASH` in `ol_flags`.
+///
+/// Determinism within a process: the std hasher uses a random seed, so
+/// the numeric value is stable within one process run but varies across
+/// runs. The tests in this module therefore compare pairs of calls within
+/// one run, not against a pre-baked constant.
+pub fn siphash_4tuple(tup: &FourTuple) -> u32 {
+    // Use a lazily-initialised shared seed so every `siphash_4tuple` in
+    // one process folds into the same bucket index. `HashMap` does the
+    // same via its embedded `RandomState`; we rebuild one here because
+    // the table's hasher is an implementation detail (not exposed
+    // through `HashMap::hasher()` on older std versions we stay
+    // compatible with).
+    use std::sync::OnceLock;
+    static SEED: OnceLock<std::collections::hash_map::RandomState> = OnceLock::new();
+    let rs = SEED.get_or_init(std::collections::hash_map::RandomState::new);
+    let mut h = rs.build_hasher();
+    // Fold the canonical host-byte-order 4-tuple. Ordering matters for
+    // stability across lookups — matches `FourTuple`'s `Hash` derive.
+    h.write_u32(tup.local_ip);
+    h.write_u16(tup.local_port);
+    h.write_u32(tup.peer_ip);
+    h.write_u16(tup.peer_port);
+    h.finish() as u32
+}
+
+/// Pick the initial flow-table bucket hash for a received segment. When
+/// the `hw-offload-rss-hash` feature is compile-on AND the engine's
+/// `rss_hash_offload_active` latch is true AND the mbuf's `ol_flags`
+/// set `RTE_MBUF_F_RX_RSS_HASH`, return the NIC-provided Toeplitz hash
+/// directly — saving a software SipHash fold on the RX hot path.
+///
+/// Falls back to `siphash_4tuple(tup)` for:
+/// - feature-off builds,
+/// - runtime latch off (PMD did not advertise RSS hash offload),
+/// - mbuf `ol_flags` without the `RX_RSS_HASH` bit (e.g. non-IPv4-TCP
+///   frames that RSS does not hash — ICMP, ARP-shaped frames).
+///
+/// Spec §8.2.
+#[cfg(feature = "hw-offload-rss-hash")]
+pub fn hash_bucket_for_lookup(
+    tup: &FourTuple,
+    ol_flags: u64,
+    nic_rss_hash: u32,
+    rss_active: bool,
+) -> u32 {
+    use crate::dpdk_consts::RTE_MBUF_F_RX_RSS_HASH;
+    if rss_active && (ol_flags & RTE_MBUF_F_RX_RSS_HASH) != 0 {
+        return nic_rss_hash;
+    }
+    siphash_4tuple(tup)
+}
+
+/// Feature-off variant. Signature identical so callers don't need to
+/// `#[cfg]`-wrap the call site. Always computes `siphash_4tuple`.
+#[cfg(not(feature = "hw-offload-rss-hash"))]
+pub fn hash_bucket_for_lookup(
+    tup: &FourTuple,
+    _ol_flags: u64,
+    _nic_rss_hash: u32,
+    _rss_active: bool,
+) -> u32 {
+    siphash_4tuple(tup)
+}
 
 pub struct FlowTable {
     slots: Vec<Option<TcpConn>>,
@@ -81,6 +152,27 @@ impl FlowTable {
 
     pub fn lookup_by_tuple(&self, tuple: &FourTuple) -> Option<ConnHandle> {
         self.by_tuple.get(tuple).copied().map(|i| i + 1)
+    }
+
+    /// RX hot-path lookup that accepts a pre-computed bucket hash from
+    /// `hash_bucket_for_lookup`. Today the backing store is still a
+    /// `HashMap<FourTuple, _>` so `bucket_hash` is informational only —
+    /// the HashMap probes by its own internal hasher, and we still
+    /// resolve by the full `FourTuple` key. The hash is plumbed through
+    /// now for forward-compat with a Stage-2 flat-bucket table where the
+    /// NIC Toeplitz hash will pick the initial probe slot directly.
+    ///
+    /// Callers that don't have an mbuf (e.g. API-initiated flow work
+    /// or tests) should stay on `lookup_by_tuple`.
+    pub fn lookup_by_hash(
+        &self,
+        tuple: &FourTuple,
+        #[allow(unused_variables)] bucket_hash: u32,
+    ) -> Option<ConnHandle> {
+        // TODO (Stage 2): when we swap `by_tuple` for a flat bucket
+        // array, use `bucket_hash` as the initial probe index.
+        let _ = bucket_hash;
+        self.lookup_by_tuple(tuple)
     }
 
     /// Slow-path stats snapshot; see `TcpConn::stats`.
@@ -240,5 +332,62 @@ mod tests {
         ft.remove(h2);
         let got: Vec<_> = ft.iter_handles().collect();
         assert_eq!(got, vec![h1, h3]);
+    }
+
+    #[cfg(feature = "hw-offload-rss-hash")]
+    #[test]
+    fn rss_hash_used_when_flag_set_and_latch_on() {
+        use crate::dpdk_consts::RTE_MBUF_F_RX_RSS_HASH;
+        let tup = FourTuple {
+            local_ip: 0x0a000001,
+            local_port: 1,
+            peer_ip: 0x0a000002,
+            peer_port: 2,
+        };
+        let nic_hash: u32 = 0xdeadbeef;
+        let ol_flags = RTE_MBUF_F_RX_RSS_HASH;
+        let picked = hash_bucket_for_lookup(&tup, ol_flags, nic_hash, /*rss_active=*/ true);
+        assert_eq!(picked, nic_hash);
+    }
+
+    #[cfg(feature = "hw-offload-rss-hash")]
+    #[test]
+    fn rss_hash_unused_when_flag_clear() {
+        let tup = FourTuple {
+            local_ip: 0x0a000001,
+            local_port: 1,
+            peer_ip: 0x0a000002,
+            peer_port: 2,
+        };
+        // No RSS_HASH flag in ol_flags → fall back to SipHash. Two calls
+        // with the SAME tuple but different nic_rss_hash values must
+        // return the SAME result, because the nic_rss_hash is ignored
+        // when the flag is clear.
+        let picked = hash_bucket_for_lookup(&tup, 0, 0xdeadbeef, true);
+        let again = hash_bucket_for_lookup(&tup, 0, 0xbeefdead, true);
+        assert_eq!(
+            picked, again,
+            "when ol_flags missing RSS_HASH, nic_rss_hash must be ignored and SipHash used"
+        );
+        // And it should equal the direct SipHash path.
+        assert_eq!(picked, siphash_4tuple(&tup));
+    }
+
+    #[cfg(feature = "hw-offload-rss-hash")]
+    #[test]
+    fn rss_hash_unused_when_latch_off() {
+        use crate::dpdk_consts::RTE_MBUF_F_RX_RSS_HASH;
+        let tup = FourTuple {
+            local_ip: 0x0a000001,
+            local_port: 1,
+            peer_ip: 0x0a000002,
+            peer_port: 2,
+        };
+        // Even with the flag set, if the latch is off (runtime fallback
+        // when PMD didn't advertise), we fall back to SipHash.
+        let picked_latch_off =
+            hash_bucket_for_lookup(&tup, RTE_MBUF_F_RX_RSS_HASH, 0xdeadbeef, false);
+        let sw_fallback = hash_bucket_for_lookup(&tup, 0, 0, true); // SipHash path
+        assert_eq!(picked_latch_off, sw_fallback);
     }
 }

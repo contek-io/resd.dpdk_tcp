@@ -111,6 +111,105 @@ pub fn ip_decode(pkt: &[u8], our_ip: u32, nic_csum_ok: bool) -> Result<L3Decoded
     })
 }
 
+/// RX checksum classification from `mbuf.ol_flags`, per DPDK's 2-bit
+/// encoding on the RTE_MBUF_F_RX_IP_CKSUM_MASK / L4_CKSUM_MASK bits.
+/// Feature-gated on `hw-offload-rx-cksum`; absent from feature-off builds.
+/// See spec §7.
+#[cfg(feature = "hw-offload-rx-cksum")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IpCksumOutcome {
+    /// NIC did not verify — software verify required.
+    Unknown,
+    /// NIC verified and rejected — drop.
+    Bad,
+    /// NIC verified and accepted — skip software verify.
+    Good,
+    /// NIC explicitly signaled no verification — software verify required.
+    None,
+}
+
+/// Map the IP-cksum bits in `ol_flags` (masked by
+/// RTE_MBUF_F_RX_IP_CKSUM_MASK) to an `IpCksumOutcome`. See spec §7.
+#[cfg(feature = "hw-offload-rx-cksum")]
+pub fn classify_ip_rx_cksum(ol_flags: u64) -> IpCksumOutcome {
+    use crate::dpdk_consts::{
+        RTE_MBUF_F_RX_IP_CKSUM_BAD, RTE_MBUF_F_RX_IP_CKSUM_GOOD, RTE_MBUF_F_RX_IP_CKSUM_MASK,
+        RTE_MBUF_F_RX_IP_CKSUM_NONE,
+    };
+    let m = ol_flags & RTE_MBUF_F_RX_IP_CKSUM_MASK;
+    if m == RTE_MBUF_F_RX_IP_CKSUM_GOOD {
+        IpCksumOutcome::Good
+    } else if m == RTE_MBUF_F_RX_IP_CKSUM_BAD {
+        IpCksumOutcome::Bad
+    } else if m == RTE_MBUF_F_RX_IP_CKSUM_NONE {
+        IpCksumOutcome::None
+    } else {
+        IpCksumOutcome::Unknown
+    }
+}
+
+/// Map the L4-cksum bits in `ol_flags` (masked by
+/// RTE_MBUF_F_RX_L4_CKSUM_MASK) to an `IpCksumOutcome`. See spec §7.
+#[cfg(feature = "hw-offload-rx-cksum")]
+pub fn classify_l4_rx_cksum(ol_flags: u64) -> IpCksumOutcome {
+    use crate::dpdk_consts::{
+        RTE_MBUF_F_RX_L4_CKSUM_BAD, RTE_MBUF_F_RX_L4_CKSUM_GOOD, RTE_MBUF_F_RX_L4_CKSUM_MASK,
+        RTE_MBUF_F_RX_L4_CKSUM_NONE,
+    };
+    let m = ol_flags & RTE_MBUF_F_RX_L4_CKSUM_MASK;
+    if m == RTE_MBUF_F_RX_L4_CKSUM_GOOD {
+        IpCksumOutcome::Good
+    } else if m == RTE_MBUF_F_RX_L4_CKSUM_BAD {
+        IpCksumOutcome::Bad
+    } else if m == RTE_MBUF_F_RX_L4_CKSUM_NONE {
+        IpCksumOutcome::None
+    } else {
+        IpCksumOutcome::Unknown
+    }
+}
+
+/// Offload-aware IP decode entry point for the RX path. Consumes
+/// `mbuf.ol_flags` to decide whether software IP-cksum verify is
+/// needed, and drops+counter-bumps on NIC-reported BAD. When
+/// `hw-offload-rx-cksum` is compile-off OR the engine's runtime latch
+/// `rx_cksum_offload_active` is false, forwards directly to
+/// `ip_decode(.., nic_csum_ok=false)` — always software verify. See
+/// spec §7.2 (runtime fallback on non-advertising PMDs).
+pub fn ip_decode_offload_aware(
+    pkt: &[u8],
+    our_ip: u32,
+    #[allow(unused_variables)] ol_flags: u64,
+    #[allow(unused_variables)] rx_cksum_offload_active: bool,
+    #[allow(unused_variables)] counters: &crate::counters::Counters,
+) -> Result<L3Decoded, L3Drop> {
+    #[cfg(feature = "hw-offload-rx-cksum")]
+    {
+        if !rx_cksum_offload_active {
+            return ip_decode(pkt, our_ip, false);
+        }
+        use std::sync::atomic::Ordering;
+        match classify_ip_rx_cksum(ol_flags) {
+            IpCksumOutcome::Good => ip_decode(pkt, our_ip, true),
+            IpCksumOutcome::Bad => {
+                counters
+                    .eth
+                    .rx_drop_cksum_bad
+                    .fetch_add(1, Ordering::Relaxed);
+                counters.ip.rx_csum_bad.fetch_add(1, Ordering::Relaxed);
+                Err(L3Drop::CsumBad)
+            }
+            _ => ip_decode(pkt, our_ip, false),
+        }
+    }
+    #[cfg(not(feature = "hw-offload-rx-cksum"))]
+    {
+        let _ = ol_flags;
+        let _ = rx_cksum_offload_active;
+        let _ = counters;
+        ip_decode(pkt, our_ip, false)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -249,5 +348,55 @@ mod tests {
         let h = build_ip_hdr(IPPROTO_ICMP, 1, 2, 4, false);
         let d = ip_decode(&h, 0, true).expect("accepted");
         assert_eq!(d.protocol, IPPROTO_ICMP);
+    }
+
+    #[cfg(feature = "hw-offload-rx-cksum")]
+    #[test]
+    fn classify_ip_cksum_from_ol_flags() {
+        use crate::dpdk_consts::{
+            RTE_MBUF_F_RX_IP_CKSUM_BAD, RTE_MBUF_F_RX_IP_CKSUM_GOOD,
+            RTE_MBUF_F_RX_IP_CKSUM_NONE, RTE_MBUF_F_RX_IP_CKSUM_UNKNOWN,
+        };
+        assert_eq!(
+            classify_ip_rx_cksum(RTE_MBUF_F_RX_IP_CKSUM_GOOD),
+            IpCksumOutcome::Good
+        );
+        assert_eq!(
+            classify_ip_rx_cksum(RTE_MBUF_F_RX_IP_CKSUM_BAD),
+            IpCksumOutcome::Bad
+        );
+        assert_eq!(
+            classify_ip_rx_cksum(RTE_MBUF_F_RX_IP_CKSUM_UNKNOWN),
+            IpCksumOutcome::Unknown
+        );
+        assert_eq!(
+            classify_ip_rx_cksum(RTE_MBUF_F_RX_IP_CKSUM_NONE),
+            IpCksumOutcome::None
+        );
+    }
+
+    #[cfg(feature = "hw-offload-rx-cksum")]
+    #[test]
+    fn classify_l4_cksum_from_ol_flags() {
+        use crate::dpdk_consts::{
+            RTE_MBUF_F_RX_L4_CKSUM_BAD, RTE_MBUF_F_RX_L4_CKSUM_GOOD,
+            RTE_MBUF_F_RX_L4_CKSUM_NONE, RTE_MBUF_F_RX_L4_CKSUM_UNKNOWN,
+        };
+        assert_eq!(
+            classify_l4_rx_cksum(RTE_MBUF_F_RX_L4_CKSUM_GOOD),
+            IpCksumOutcome::Good
+        );
+        assert_eq!(
+            classify_l4_rx_cksum(RTE_MBUF_F_RX_L4_CKSUM_BAD),
+            IpCksumOutcome::Bad
+        );
+        assert_eq!(
+            classify_l4_rx_cksum(RTE_MBUF_F_RX_L4_CKSUM_UNKNOWN),
+            IpCksumOutcome::Unknown
+        );
+        assert_eq!(
+            classify_l4_rx_cksum(RTE_MBUF_F_RX_L4_CKSUM_NONE),
+            IpCksumOutcome::None
+        );
     }
 }

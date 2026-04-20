@@ -97,6 +97,9 @@ fn ffi_eal_init_and_engine_lifecycle() {
         _pad4: [u8; 2],
         garp_interval_sec: u32,
         event_queue_soft_cap: u32,
+        // A6 Task 20: caller-supplied RTT histogram bucket edges. All-zero
+        // triggers the stack's trading-tuned default (spec §3.8.2).
+        rtt_histogram_bucket_edges_us: [u32; 15],
     }
     let cfg = Cfg {
         port_id: 0,
@@ -129,6 +132,7 @@ fn ffi_eal_init_and_engine_lifecycle() {
         _pad4: [0; 2],
         garp_interval_sec: 0,
         event_queue_soft_cap: 4096,
+        rtt_histogram_bucket_edges_us: [0u32; 15],
     };
 
     let eng = unsafe { resd_net_engine_create(0, &cfg as *const Cfg as *const core::ffi::c_void) };
