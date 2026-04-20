@@ -24,7 +24,7 @@
 | 14 | `tcp_conn.rs` receiver-side byte buffer | `last_read_buf: Vec<u8>` (reallocated per READABLE event) | `last_read_mbufs: SmallVec<[Mbuf; 4]>` holding mbuf refs; event carries `(mbuf_idx, offset, len)` | Task 8 |
 | 15 | `engine.rs::poll_once` per-poll handle list | `let handles: Vec<_> = ft.iter_handles().collect();` for per-conn `last_read_mbufs.clear()` | Engine-owned `conn_handles_scratch: RefCell<SmallVec<[ConnHandle; 8]>>`; borrow + clear + extend + drain | Task 10 |
 | 16 | `engine.rs::reap_time_wait` candidate list | `let candidates: Vec<_> = { … iter_handles().filter(…).collect() };` per poll | reuse of `conn_handles_scratch`; filter-loop pushes, pop-drain with re-released borrow across `transition_conn` | Task 10 |
-| 17 | `tcp_timer_wheel.rs` per-bucket storage | `const EMPTY_BUCKET: Vec<u32> = Vec::new();` → first-push reallocates on every fresh bucket | `Vec::with_capacity(BUCKET_INIT_CAP = 512)` per bucket (4 levels × 2048 buckets), plus `drain_scratch: Vec<u32>` for cascade | Task 10 |
+| 17 | `tcp_timer_wheel.rs` per-bucket storage | `const EMPTY_BUCKET: Vec<u32> = Vec::new();` → first-push reallocates on every fresh bucket | `Vec::with_capacity(BUCKET_INIT_CAP = 512)` per bucket (8 levels × 256 buckets = 2048 Vec<u32>), plus `drain_scratch: Vec<u32>` for cascade | Task 10 |
 | 18 | `tcp_timer_wheel.rs::advance` bucket drain | `let bucket = std::mem::take(&mut self.buckets[0][cursor]);` (left bucket at zero-cap) | index-loop + `clear()` preserves heap capacity for next sweep | Task 10 |
 | 19 | `tcp_timer_wheel.rs::cascade` bucket drain | `let bucket = std::mem::take(&mut self.buckets[level][cursor]);` | `std::mem::swap` with `drain_scratch`, index-loop, then `clear` + `swap` back; preserves both bucket and scratch cap across cascades | Task 10 |
 
@@ -134,10 +134,23 @@ strict.
 - Call-sites excluded from A6.5's scope (per-connection one-shot,
   engine-creation, slow-path error/logging) documented in the design spec
   §1 "Out of scope."
-- `BUCKET_INIT_CAP = 512` trades 16 MiB of wheel-level heap (512 × 4 B ×
-  2048 × 4) against zero-alloc in steady state. If memory becomes a
-  concern, per-level caps (level-0 high, level-3 low) could reclaim most
-  of the budget.
+- `BUCKET_INIT_CAP = 512` trades 4 MiB of wheel-level heap
+  (512 u32 × 4 B = 2 KiB per bucket; BUCKETS=256 × LEVELS=8 × 2 KiB
+  = 4 MiB) against zero-alloc in steady state. If memory becomes a
+  concern, per-level caps (level-0 high, level-7 low) could reclaim
+  most of the budget.
+- The audit test relaxes the `frees_delta == 0` assertion when a
+  peer-initiated RST is observed during the measurement window
+  (`rx_rst > 0`, `tx_rst > 0`, or the connection's flow-table entry
+  is gone). Per-connection teardown is explicitly out-of-scope per
+  spec §1 ("Out of scope: per-connection one-shot allocations,
+  engine-creation, slow-path error/logging"). The `allocs_delta == 0`
+  assertion stays strict under all conditions — teardown should drop
+  existing mbufs and free the connection entry, not allocate new
+  heap. If `tx_retrans > 0` we also expect frees from the
+  pruned-mbufs drain path; that's accounted for by the same
+  relaxation (an RST-driven teardown is effectively a bulk
+  prune-all).
 
 ## Gate status
 

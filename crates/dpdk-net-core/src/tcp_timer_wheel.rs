@@ -81,11 +81,12 @@ impl TimerWheel {
         // `TimerWheel::add`. Bumped to 512 to cover cascade's P99
         // without saturating asymptotically across hours.
         //
-        // One-time footprint: 512 u32 × 2048 buckets × 4 levels =
-        // 16 MiB of wheel-level heap. Acceptable for Stage 1 (single
-        // engine per process, single lcore). If this becomes a
-        // concern, we can tune per-level caps (level-0 needs the
-        // high cap, level-3 can stay at 128).
+        // One-time footprint: 512 u32 × 4 B = 2 KiB per bucket;
+        // BUCKETS=256, LEVELS=8 → 256 × 8 × 2 KiB = 4 MiB of
+        // wheel-level heap at Engine::new. Acceptable for Stage 1
+        // (single engine per process, single lcore). If this
+        // becomes a concern, we can tune per-level caps (level-0
+        // needs the high cap, level-7 can stay at 128).
         const BUCKET_INIT_CAP: usize = 512;
         // Build level arrays at runtime since `Vec::with_capacity`
         // isn't const. `MaybeUninit`-backed init avoids the

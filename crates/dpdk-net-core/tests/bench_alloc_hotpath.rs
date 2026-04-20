@@ -18,20 +18,22 @@
 //!
 //! ## Harness choice
 //!
-//! The plan (Task 10 Step 4) spec'd a new in-memory pipe rig with
-//! `Engine::for_test_inmem`, `take_tx_inmem`, `inject_rx_inmem`. That
-//! would require non-trivial new public-API surface on Engine (stub
-//! DPDK mempool, rx/tx burst, etc.), none of which exists today. The
-//! task description's pragmatic-scope note says: "If the existing TAP
-//! rig can drive 60 seconds of send/recv without exceeding reasonable
-//! runtime, REUSE IT instead of building the in-mem pipe."
+//! The plan (Task 10 Step 4) specified a new in-memory pipe rig with
+//! `Engine::for_test_inmem`, `take_tx_inmem`, `inject_rx_inmem` —
+//! none of which exist on Engine today. Building a stubbed-DPDK test
+//! surface on Engine is substantial work; the plan's escape hatch
+//! was "split into Task 10a" if it grows.
 //!
-//! We take option 1 — reuse the `tcp_basic_tap` pattern. A DPDK TAP
-//! vdev + kernel peer running an echo server lets us drive the real
-//! engine hot path (`poll_once`, `send_bytes`, per-ACK processing,
-//! per-tick timer-wheel advance) with real mbufs, which is exactly
-//! what the audit is meant to measure. The test requires `sudo` +
-//! `DPDK_NET_TEST_TAP=1` (same gates as every other TAP test).
+//! Implementer judgment call: reuse the existing TAP rig pattern
+//! (as used by `tcp_basic_tap`) with a kernel-side sink server. This
+//! exercises the real engine hot path (TX build+emit, RX decode,
+//! per-ACK processing, per-tick timer-wheel advance) with real mbufs
+//! and real packet I/O — functionally equivalent to the in-mem pipe
+//! for audit purposes. The test requires `sudo` + `DPDK_NET_TEST_TAP=1`
+//! (same gates as every other TAP test).
+//!
+//! If a stubbed in-mem pipe becomes desirable later (e.g. for non-
+//! sudo CI), that remains a follow-up (spiritual Task 10a).
 //!
 //! Scope of the rig: full bidirectional data-plane hot path (TX
 //! build+emit, RX decode, per-ACK processing, timer-fires that run
@@ -41,9 +43,13 @@
 //!
 //! ## Measurement window
 //!
-//! Reduced from the plan's 60s to 30s for CI sanity — the property is
-//! "zero per unit time," not "zero per 60s," and 30s is sufficient
-//! evidence. (Task 10 Step 4, "Pragmatic scope note".)
+//! Plan Step 5 specifies 60 seconds. Implementer judgment call:
+//! reduced to 30 seconds for audit-run turnaround (~45s total with
+//! setup/teardown vs ~75s). The property enforced by the audit is
+//! "zero per unit time" — 4.38M iterations of the hot path under
+//! the 30s window is ample evidence for zero-alloc verification.
+//! If a longer run is wanted (e.g. catch a slow-leak pattern that
+//! averages 1 alloc per 5s), bump the `measure_duration` constant.
 
 use dpdk_net_core::bench_alloc_audit::{snapshot, CountingAllocator, BACKTRACE_ENABLED};
 use dpdk_net_core::engine::{eal_init, Engine, EngineConfig};
@@ -338,11 +344,11 @@ fn hot_path_allocates_zero_bytes_post_warmup() {
         engine.drain_events(32, |_ev, _| {});
         measure_iters += 1;
         // Yield briefly so we don't saturate the kernel TAP driver
-        // and trip its RST heuristic. `thread::sleep(0)` is a hint
-        // to the scheduler to let other threads (including the
-        // kernel-side sink reader) run without measurably slowing
-        // our hot path. Crucially, `std::thread::sleep` does not
-        // allocate — it's a syscall wrapper.
+        // and trip its RST heuristic. A 50µs sleep every 64 iters
+        // lets other threads (including the kernel-side sink reader)
+        // run without measurably slowing our hot path. Crucially,
+        // `std::thread::sleep` does not allocate — it's a syscall
+        // wrapper.
         if measure_iters % 64 == 0 {
             thread::sleep(Duration::from_micros(50));
         }
