@@ -38,11 +38,15 @@ pub struct ParsedSegment<'a> {
 /// A6.5 Task 4b: mbuf context for zero-copy OOO reassembly. When the
 /// engine dispatches an RX-origin segment that may end up in the
 /// out-of-order reorder queue, it passes this struct so the insert
-/// path can store `OooSegment::MbufRef` entries referencing the live
-/// mbuf instead of copying payload into a `Vec<u8>`.
+/// path can store `OooSegment` entries referencing the live mbuf.
+/// A6.5 Task 4d retired the legacy copy-based `Vec<u8>` path —
+/// reassembly is fully mbuf-ref now; `None` here means OOO payload
+/// simply will not be queued for this segment (in-order and drop
+/// paths are unaffected).
 ///
-/// Pure-slice test callers pass `None` to `dispatch` and thus exercise
-/// the legacy `insert` (Bytes-variant) path — behavior-preserving.
+/// Pure-slice test callers that need to exercise OOO-insert must pass
+/// a fake mbuf context with Box-backed storage (see
+/// `established_ooo_segment_queues_into_reassembly` for the pattern).
 ///
 /// Refcount contract: the caller is responsible for bumping the mbuf's
 /// refcount before `dispatch` (so the reorder queue can store a live
@@ -242,14 +246,13 @@ pub struct Outcome {
     /// `conn.send_refused_pending` when setting this, so subsequent ACKs
     /// won't re-fire until a fresh `send_bytes` refusal restarts the cycle.
     pub writable_hysteresis_fired: bool,
-    /// A6.5 Task 4b: mirrors `InsertOutcome.mbuf_ref_retained` when the
-    /// OOO-insert took the MbufRef path. `true` iff the reorder queue
-    /// retained an MbufRef from the caller's mbuf; the engine's RX path
-    /// uses this to roll back (`rte_mbuf_refcnt_update(mbuf, -1)`) the
-    /// pre-dispatch up-bump when no segment was retained. `false` on
-    /// every other path (no MbufCtx passed / Bytes-variant insert / no
-    /// OOO insert at all) — the legacy engine paths do not touch
-    /// refcount here.
+    /// A6.5 Task 4b/4d: mirrors `InsertOutcome.mbuf_ref_retained` when
+    /// the OOO-insert took place. `true` iff the reorder queue retained
+    /// an `OooSegment` referencing the caller's mbuf; the engine's RX
+    /// path uses this to roll back
+    /// (`rte_mbuf_refcnt_update(mbuf, -1)`) the pre-dispatch up-bump
+    /// when no segment was retained. `false` on every other path (no
+    /// MbufCtx passed / no OOO insert at all).
     pub mbuf_ref_retained: bool,
     /// A6.5 Task 4c: bytes of this segment's payload that were delivered
     /// in-order directly from the RX mbuf (not via the reorder queue).
@@ -888,13 +891,13 @@ fn handle_established(
     let mut buf_full_drop = 0u32;
     let mut reassembly_queued_bytes = 0u32;
     let mut reassembly_hole_filled = 0u32;
-    // A6.5 Task 4b: when the engine handed us a mbuf context, the
-    // OOO-insert path records MbufRef entries instead of copying
-    // payload into a Vec<u8>. The caller already bumped the mbuf
-    // refcount pre-dispatch; we surface `mbuf_ref_retained` so the
-    // engine can roll back when no ref was retained. On every other
-    // path (in-order delivery, pure-ACK, no OOO insert), this flag
-    // stays false and the caller's rollback branch is skipped.
+    // A6.5 Task 4b/4d: when the engine handed us a mbuf context, the
+    // OOO-insert path records zero-copy `OooSegment` entries
+    // referencing the mbuf. The caller already bumped the mbuf refcount
+    // pre-dispatch; we surface `mbuf_ref_retained` so the engine can
+    // roll back when no ref was retained. On every other path
+    // (in-order delivery, pure-ACK, no OOO insert), this flag stays
+    // false and the caller's rollback branch is skipped.
     let mut mbuf_ref_retained = false;
     // A6.5 Task 4c: track the in-order bytes delivered directly from
     // this segment's mbuf (vs. from the reorder queue drain). The
@@ -926,7 +929,7 @@ fn handle_established(
                 // SAFETY: `d.mbuf` is live (queue held a refcount
                 // until this drain transferred it to the caller). The
                 // data range `[d.offset, d.offset + d.len)` is bounded
-                // by the mbuf's data_len at `insert_mbuf` time.
+                // by the mbuf's data_len at `insert` time.
                 let payload_area = unsafe {
                     let mbuf_ptr = d.mbuf.as_ptr();
                     let base_ptr = sys::shim_rte_pktmbuf_data(mbuf_ptr) as *const u8;
@@ -947,38 +950,34 @@ fn handle_established(
             let total_cap = conn.recv.free_space_total();
             if total_cap > 0 {
                 let take = (seg.payload.len() as u32).min(total_cap);
-                let outcome = if let Some(ctx) = mbuf_ctx {
-                    // A6.5 Task 4b: mbuf-ref path. The engine has already
-                    // bumped the mbuf refcount by one; if no ref is
-                    // retained, the engine rolls back on seeing
-                    // `outcome.mbuf_ref_retained == false`.
-                    conn.recv.reorder.insert_mbuf(
+                if let Some(ctx) = mbuf_ctx {
+                    // A6.5 Task 4b/4d: mbuf-ref path. The engine has
+                    // already bumped the mbuf refcount by one; if no
+                    // ref is retained, the engine rolls back on seeing
+                    // `outcome.mbuf_ref_retained == false`. After
+                    // Task 4d this is the ONLY OOO-insert path —
+                    // non-mbuf callers don't enqueue OOO.
+                    let outcome = conn.recv.reorder.insert(
                         seg.seq,
                         &seg.payload[..take as usize],
                         ctx.mbuf,
                         ctx.payload_offset,
-                    )
-                } else {
-                    // Legacy Bytes-variant path — test callers + any
-                    // future non-mbuf insert source. `mbuf_ref_retained`
-                    // is false here, so the engine's rollback branch
-                    // never fires on this path.
-                    conn.recv
-                        .reorder
-                        .insert(seg.seq, &seg.payload[..take as usize])
-                };
-                reassembly_queued_bytes = outcome.newly_buffered;
-                buf_full_drop = outcome.cap_dropped;
-                mbuf_ref_retained = outcome.mbuf_ref_retained;
+                    );
+                    reassembly_queued_bytes = outcome.newly_buffered;
+                    buf_full_drop = outcome.cap_dropped;
+                    mbuf_ref_retained = outcome.mbuf_ref_retained;
+                    // F-8 RFC 2018 §4 MUST-26: record the seq range
+                    // that triggered this OOO-insert so
+                    // `build_ack_outcome` emits it as the first SACK
+                    // block. `emit_ack` clears the trigger after
+                    // consuming it.
+                    if outcome.newly_buffered > 0 {
+                        conn.last_sack_trigger =
+                            Some((seg.seq, seg.seq.wrapping_add(take)));
+                    }
+                }
                 if (take as usize) < seg.payload.len() {
                     buf_full_drop += seg.payload.len() as u32 - take;
-                }
-                // F-8 RFC 2018 §4 MUST-26: record the seq range that
-                // triggered this OOO-insert so `build_ack_outcome` emits
-                // it as the first SACK block. `emit_ack` clears the
-                // trigger after consuming it.
-                if outcome.newly_buffered > 0 {
-                    conn.last_sack_trigger = Some((seg.seq, seg.seq.wrapping_add(take)));
                 }
             } else {
                 buf_full_drop = seg.payload.len() as u32;
@@ -1584,6 +1583,19 @@ mod tests {
 
     #[test]
     fn established_ooo_segment_queues_into_reassembly() {
+        // A6.5 Task 4d: OOO-enqueue is mbuf-ref only. This test sources
+        // a fake mbuf backed by boxed storage so the refcnt accounting
+        // (`insert` bumps, `ReorderQueue::Drop` decrements) lands in
+        // live memory. 256 aligned bytes covers rte_mbuf's refcnt
+        // field which lives in the first cacheline.
+        let mut fake_mbuf_storage: Box<[u8; 256]> = Box::new([0u8; 256]);
+        let fake_mbuf: std::ptr::NonNull<dpdk_net_sys::rte_mbuf> = unsafe {
+            std::ptr::NonNull::new_unchecked(
+                fake_mbuf_storage.as_mut_ptr() as *mut dpdk_net_sys::rte_mbuf,
+            )
+        };
+        let mbuf_ctx = MbufInsertCtx { mbuf: fake_mbuf, payload_offset: 54 };
+
         let mut c = est_conn(1000, 5000, 1024);
         let seg = ParsedSegment {
             src_port: 5000,
@@ -1596,32 +1608,47 @@ mod tests {
             payload: b"xyz",
             options: &[],
         };
-        let out = dispatch(&mut c, &seg, &TEST_EDGES, TEST_SEND_BUF_BYTES, None);
+        let out = dispatch(
+            &mut c,
+            &seg,
+            &TEST_EDGES,
+            TEST_SEND_BUF_BYTES,
+            Some(mbuf_ctx),
+        );
         assert_eq!(out.tx, TxAction::Ack);
         assert_eq!(out.delivered, 0);
         assert_eq!(out.reassembly_queued_bytes, 3);
         assert_eq!(c.rcv_nxt, 5001);
         assert_eq!(c.recv.reorder.len(), 1);
-        assert_eq!(
-            &crate::tcp_reassembly::expect_bytes(&c.recv.reorder.segments()[0]).payload,
-            b"xyz"
-        );
+        // Structural assertion only: payload bytes live in the fake
+        // mbuf; we validate (seq, offset, len) shape without derefing
+        // the mbuf pointer to confirm bytes — end-to-end byte
+        // verification is covered by the TAP tests + A6.6/A10 work.
+        let seg0 = &c.recv.reorder.segments()[0];
+        assert_eq!(seg0.seq, 5100);
+        assert_eq!(seg0.offset, 54);
+        assert_eq!(seg0.len, 3);
         // F-8 RFC 2018 §4 MUST-26: triggering OOO range recorded for
         // the upcoming ACK's first SACK block.
         assert_eq!(c.last_sack_trigger, Some((5100, 5103)));
+        // `c` drops before `fake_mbuf_storage`, so the ReorderQueue
+        // Drop impl's refcnt decrement lands in live storage.
+        drop(c);
+        let _ = &mut fake_mbuf_storage;
     }
 
-    // A6.5 Task 8 (4c): this test exercised the Bytes-variant drain path
-    // via ReorderQueue::insert + drain_contiguous_from — both APIs retired
-    // in Task 8. The dispatch-level OOO-insert → gap-close → MbufRef drain
-    // pipeline does not currently have a single-binary end-to-end test
-    // (a synthetic TAP peer that injects OOO would be required).
-    // Coverage today:
-    //   - drain_mbuf_* unit tests in tcp_reassembly: structural drain shape
-    //     + refcount-accounting with dangling-pointer-safe assertions.
+    // A6.5 Task 8 (4c) / Task 9 (4d): the dispatch-level OOO-insert →
+    // gap-close → mbuf-ref drain pipeline does not currently have a
+    // single-binary end-to-end test (a synthetic TAP peer that injects
+    // OOO would be required). Task 4d collapsed the reorder queue to
+    // a single `OooSegment` struct (no more Bytes-variant copy path),
+    // so unit-test coverage is now:
+    //   - drain_mbuf_* + insert_* unit tests in tcp_reassembly:
+    //     structural drain/insert shape + refcount-accounting with
+    //     fake-mbuf-backed assertions.
     //   - tcp_basic_tap::handshake_echo_close_over_tap: in-order RX
-    //     end-to-end with real mbufs + refcount balance confirmed by the
-    //     test running clean under repeated invocations.
+    //     end-to-end with real mbufs + refcount balance confirmed by
+    //     the test running clean under repeated invocations.
     // A6.6 / A10 may add the dedicated OOO end-to-end scenario.
 
     #[test]

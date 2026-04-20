@@ -1689,10 +1689,10 @@ impl Engine {
             // RX-origin event emission sites (Connected + Readable).
             let hw_rx_ts = unsafe { self.hw_rx_ts_ns(m) };
             add(&self.counters.eth.rx_bytes, bytes.len() as u64);
-            // A6.5 Task 4b: hand the mbuf pointer to the RX decode chain
-            // so the OOO reorder queue can store zero-copy MbufRef
-            // entries instead of copied Vec<u8>. `m` is non-null by
-            // rx_burst contract.
+            // A6.5 Task 4b/4d: hand the mbuf pointer to the RX decode
+            // chain so the OOO reorder queue can store zero-copy
+            // `OooSegment` entries referencing the mbuf instead of
+            // copying payload. `m` is non-null by rx_burst contract.
             let rx_mbuf = std::ptr::NonNull::new(m);
             let _accepted = self.rx_frame(bytes, ol_flags, nic_rss_hash, hw_rx_ts, rx_mbuf);
             #[cfg(feature = "obs-byte-counters")]
@@ -2496,12 +2496,13 @@ impl Engine {
     /// one (expected on ENA — spec §10.5).
     ///
     /// `rx_mbuf` — the mbuf the frame was decoded from, OR `None` for
-    /// non-mbuf test callers. A6.5 Task 4b threads this through to the
-    /// OOO reorder-queue insert site so out-of-order payload can be
-    /// stored as `OooSegment::MbufRef` (zero-copy) instead of a copied
-    /// `Vec<u8>`. `eth_payload_offset` is the offset (in bytes) of the
-    /// L2 payload (= start of the IP header) within the mbuf data
-    /// region; used to compute the TCP payload offset for the MbufRef.
+    /// non-mbuf test callers. A6.5 Task 4b/4d threads this through to
+    /// the OOO reorder-queue insert site so out-of-order payload can
+    /// be stored as an `OooSegment` (zero-copy mbuf reference).
+    /// `eth_payload_offset` is the offset (in bytes) of the L2
+    /// payload (= start of the IP header) within the mbuf data
+    /// region; used to compute the TCP payload offset for the
+    /// `OooSegment`.
     fn rx_frame(
         &self,
         bytes: &[u8],
@@ -2638,7 +2639,8 @@ impl Engine {
                         // offset from the mbuf data pointer to the TCP
                         // header (= eth_payload_offset + ip.header_len).
                         // `tcp_input` adds `parsed.header_len` to derive
-                        // the TCP payload offset for MbufRef storage.
+                        // the TCP payload offset for `OooSegment`
+                        // storage.
                         let tcp_bytes_offset =
                             eth_payload_offset.saturating_add(ip.header_len as u16);
                         self.tcp_input(
@@ -2799,10 +2801,11 @@ impl Engine {
         // A6.5 Task 4b: build the MbufInsertCtx iff we have a live mbuf
         // AND the segment has payload (no-payload segments never take
         // the OOO-insert path). Bump the mbuf refcount before dispatch:
-        // the reorder queue owns one refcount per stored MbufRef; the
-        // caller's subsequent `rte_pktmbuf_free` drops the original RX-
-        // burst reference. If no MbufRef is retained, we roll back the
-        // up-bump after dispatch (via `outcome.mbuf_ref_retained == false`).
+        // the reorder queue owns one refcount per stored `OooSegment`;
+        // the caller's subsequent `rte_pktmbuf_free` drops the
+        // original RX-burst reference. If no ref is retained, we roll
+        // back the up-bump after dispatch (via
+        // `outcome.mbuf_ref_retained == false`).
         //
         // Skip when the OOO path is unreachable: empty payload, or no
         // mbuf handle (shouldn't happen on the real RX path but keeps
@@ -2853,11 +2856,12 @@ impl Engine {
             // Outcome flag; the engine translator below pushes
             // `InternalEvent::Writable` when set.
             //
-            // A6.5 Task 4b: `mbuf_ctx` wires the mbuf pointer + payload
-            // offset so the OOO reorder-queue insert path can store
-            // MbufRef entries instead of copied Vec<u8>. `None` on the
-            // pure-slice path (empty payload or no mbuf) falls back to
-            // the legacy Bytes-variant insert.
+            // A6.5 Task 4b/4d: `mbuf_ctx` wires the mbuf pointer +
+            // payload offset so the OOO reorder-queue insert path can
+            // store zero-copy `OooSegment` entries referencing the
+            // mbuf. `None` on the pure-slice path (empty payload or
+            // no mbuf) skips OOO-enqueue entirely — Task 4d retired
+            // the legacy copy-based path.
             dispatch(
                 conn,
                 &parsed,
@@ -2872,7 +2876,7 @@ impl Engine {
         // The three cases where we bumped but need to roll back:
         //   1. Payload delivered in-order (no OOO insert reached).
         //   2. OOO-insert path ran but the cap was already exceeded, so
-        //      `insert_mbuf` returned `mbuf_ref_retained = false`.
+        //      `insert` returned `mbuf_ref_retained = false`.
         //   3. Segment dropped before the OOO-insert site (e.g. PAWS,
         //      bad-seq, out-of-window). All such paths leave
         //      `mbuf_ref_retained = false`.
@@ -3323,7 +3327,7 @@ impl Engine {
             .reorder
             .segments()
             .iter()
-            .map(|s| (s.seq(), s.end_seq()))
+            .map(|s| (s.seq, s.end_seq()))
             .collect();
         drop(ft);
 
