@@ -221,6 +221,10 @@ fn tcp_checksum_split(
 /// header-bytes and payload-bytes on the wire. For a 20-byte TCP header
 /// with N bytes payload, tcp_seg_len = 20 + N.
 pub fn tcp_pseudo_header_checksum(src_ip: u32, dst_ip: u32, tcp_seg_len: u32) -> u16 {
+    debug_assert!(
+        tcp_seg_len <= u16::MAX as u32,
+        "tcp_seg_len {tcp_seg_len} exceeds u16::MAX — pseudo-header tcp_length field is 16 bits (IPv4 total-length bound)"
+    );
     let mut buf = [0u8; 12];
     buf[0..4].copy_from_slice(&src_ip.to_be_bytes());
     buf[4..8].copy_from_slice(&dst_ip.to_be_bytes());

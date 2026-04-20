@@ -485,22 +485,21 @@ fn and_offload_with_miss_counter(
 #[derive(Debug, Clone, Copy)]
 struct PortConfigOutcome {
     /// Bits written to `eth_conf.rxmode.offloads` after AND with
-    /// `dev_info.rx_offload_capa`. Zero in Task 2 (no RX offloads requested yet).
+    /// `dev_info.rx_offload_capa`.
     #[allow(dead_code)]
     applied_rx_offloads: u64,
     /// Bits written to `eth_conf.txmode.offloads` after AND with
-    /// `dev_info.tx_offload_capa`. At Task 2 this contains only MULTI_SEGS
-    /// if the PMD advertises it.
+    /// `dev_info.tx_offload_capa`.
     #[allow(dead_code)]
     applied_tx_offloads: u64,
     /// True iff TX IPv4 + TCP checksum offload bits both applied. Latches
-    /// the TX hot-path offload-vs-software branch. Task 2: always false.
+    /// the TX hot-path offload-vs-software branch.
     tx_cksum_offload_active: bool,
     /// True iff RX IPv4 + TCP checksum offload bits both applied. Latches
-    /// the RX hot-path offload-vs-software branch. Task 2: always false.
+    /// the RX hot-path offload-vs-software branch.
     rx_cksum_offload_active: bool,
-    /// True iff RSS_HASH bit applied. Latches mbuf.hash.rss consumption
-    /// in flow_table.rs. Task 2: always false.
+    /// True iff RSS_HASH bit applied. Latches `mbuf.hash.rss` consumption
+    /// in flow_table.rs.
     rss_hash_offload_active: bool,
     /// Driver name captured at bring-up — consumed by the LLQ verification
     /// path (Task 12) to short-circuit non-ENA drivers.
@@ -549,7 +548,7 @@ impl Engine {
         )?;
 
         // Counters exist before port config so the helper can bump any
-        // offload-miss counters it needs in later tasks (Task 2: unused).
+        // offload-miss counters on unsupported requested bits.
         let counters = Box::new(Counters::new());
 
         // Port-config: dev_info query, offload AND, runtime-fallback
@@ -699,14 +698,14 @@ impl Engine {
         })
     }
 
-    /// A-HW Task 2: build `rte_eth_conf` with requested offload bits,
-    /// query `dev_info` to AND the request against what the PMD advertises,
-    /// then call `rte_eth_dev_configure`. Returns the actually-applied
-    /// masks + per-engine runtime latches (all `false` in Task 2, populated
-    /// as each offload is wired in later tasks). See spec §4.
+    /// Build `rte_eth_conf` with requested offload bits, query `dev_info`
+    /// to AND the request against what the PMD advertises, then call
+    /// `rte_eth_dev_configure`. Returns the actually-applied masks +
+    /// per-engine runtime latches that gate the hot-path
+    /// offload-vs-software branches. See spec §4.
     ///
-    /// `counters` is kept in the signature ahead of Task 3, which starts
-    /// bumping `eth.offload_missing_*` when a requested bit isn't advertised.
+    /// `counters.eth.offload_missing_*` is bumped one-shot when a
+    /// compile-enabled offload bit is not advertised by the PMD.
     fn configure_port_offloads(
         cfg: &EngineConfig,
         counters: &Counters,
@@ -735,6 +734,15 @@ impl Engine {
         // the unsupported request.
         let mut dev_info: sys::rte_eth_dev_info = unsafe { std::mem::zeroed() };
         let info_rc = unsafe { sys::rte_eth_dev_info_get(cfg.port_id, &mut dev_info) };
+        if info_rc != 0 {
+            // Spec §4 step 1: hard-fail at bring-up. Continuing with a
+            // zeroed `dev_info` would silently ignore every requested
+            // offload (every capability AND returns zero), ship a
+            // misleading all-zero banner, and then surface the failure
+            // at rte_eth_dev_configure anyway — just later and less
+            // clearly.
+            return Err(Error::PortInfo(cfg.port_id, info_rc));
+        }
 
         // Capture driver name for Task 12's LLQ verification — copy up to
         // 31 bytes + NUL terminator. `rte_eth_dev_info.driver_name` is
@@ -792,9 +800,7 @@ impl Engine {
             allow(unused_mut)
         )]
         let mut applied_rx_offloads: u64 = 0;
-        if info_rc == 0
-            && (dev_info.tx_offload_capa & RTE_ETH_TX_OFFLOAD_MULTI_SEGS) == 0
-        {
+        if (dev_info.tx_offload_capa & RTE_ETH_TX_OFFLOAD_MULTI_SEGS) == 0 {
             eprintln!(
                 "resd_net: PMD on port {} does not advertise RTE_ETH_TX_OFFLOAD_MULTI_SEGS; \
                  A5 retransmit chain may fail — check NIC/PMD support",
@@ -1162,6 +1168,8 @@ impl Engine {
             inc(&self.counters.eth.tx_drop_nomem);
             return false;
         }
+        // Safety: append writes into the mbuf's data room. Returns NULL if
+        // the mbuf's tailroom is < len.
         let dst = unsafe { sys::resd_rte_pktmbuf_append(m, bytes.len() as u16) };
         if dst.is_null() {
             unsafe { sys::resd_rte_pktmbuf_free(m) };
@@ -1397,9 +1405,14 @@ impl Engine {
             // Task 8: read ol_flags once per mbuf at the RX boundary;
             // threaded through rx_frame -> handle_ipv4 -> tcp_input so
             // the IP + L4 offload classifications can gate on the bits
-            // the NIC stamped on this frame. Feature-off / latch-false
-            // callees ignore it.
+            // the NIC stamped on this frame. Spec §7.2: feature-off
+            // builds do NOT read ol_flags (software verify always), so
+            // the shim call is compile-gated away and the parameter is
+            // fed as 0. Mirrors Task 9's pattern for nic_rss_hash.
+            #[cfg(feature = "hw-offload-rx-cksum")]
             let ol_flags = unsafe { sys::resd_rte_mbuf_get_ol_flags(m) };
+            #[cfg(not(feature = "hw-offload-rx-cksum"))]
+            let ol_flags: u64 = 0;
             // Task 9: read the NIC-provided RSS Toeplitz hash alongside
             // ol_flags. Threaded through to flow_table::hash_bucket_for_lookup
             // in tcp_input. When the feature is off, we compile the read
@@ -2231,13 +2244,13 @@ impl Engine {
         #[cfg(feature = "hw-offload-rx-cksum")]
         {
             if self.rx_cksum_offload_active {
-                use crate::l3_ip::{classify_l4_rx_cksum, IpCksumOutcome};
+                use crate::l3_ip::{classify_l4_rx_cksum, CksumOutcome};
                 use std::sync::atomic::Ordering;
                 match classify_l4_rx_cksum(ol_flags) {
-                    IpCksumOutcome::Good => {
+                    CksumOutcome::Good => {
                         nic_csum_ok = true;
                     }
-                    IpCksumOutcome::Bad => {
+                    CksumOutcome::Bad => {
                         self.counters
                             .eth
                             .rx_drop_cksum_bad
