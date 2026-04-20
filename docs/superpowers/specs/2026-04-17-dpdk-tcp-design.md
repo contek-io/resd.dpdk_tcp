@@ -502,7 +502,7 @@ TX:  user buf  → memcpy into tx mbuf.data at headroom offset
 
 Copies on Stage 1:
 - **TX**: one `memcpy` from user `buf` into tx mbuf. Unavoidable because user memory isn't DMA-pinned and we can't rely on the application keeping `buf` valid for the lifetime of TCP retransmission.
-- **RX reassembly**: zero copies for in-order data (mbuf chain in `recv_queue`). Out-of-order segments are held as a linked list of mbufs; no copy unless we ever coalesce for contiguous delivery (which we don't — we fire one event per mbuf).
+- **RX reassembly**: zero copies for both in-order data (mbuf chain in `recv_queue`) and out-of-order segments (mbuf refs with `(offset, len)` per segment in `ReorderQueue`). The READABLE event pins referenced mbufs until the poll iteration completes per §5.3's mbuf-lifetime contract. Drain to in-order delivery produces an mbuf list (one event per mbuf), not a concatenated byte buffer. A6.5 retired the pre-existing `Vec<u8>` OOO-segment storage.
 
 ### 7.4 Timer wheel
 
@@ -517,6 +517,23 @@ Copies on Stage 1:
 - **Single calibration shared across all engines on the host**: the first `dpdk_net_engine_create` call performs `(tsc0, t0) = calibrate_against(CLOCK_MONOTONIC_RAW)`; subsequent engines reuse the same epoch via a process-global atomic-init. All engines therefore share one `ns_per_tsc` conversion; cross-lcore event correlation has bounded skew (only the per-core invariant-TSC startup offset, <100ns typical on bare metal; measured and reported in WAN A/B harness).
 - `dpdk_net_now_ns` uses `rdtsc` (not `rdtscp`) — serialization is unnecessary for ms/µs-scale latency attribution. An inline variant `dpdk_net_now_ns_inline()` is exposed as a `static inline` in `dpdk_net.h` (reads TSC via compiler intrinsic, applies `(tsc-tsc0)*ns_per_tsc + t0` with engine-calibrated constants) so users can avoid the FFI call on tight hot-paths.
 - NIC hardware timestamp: dyn-field offset and flag are resolved **once** at `engine_create` via `rte_mbuf_dynfield_lookup("rte_dynfield_timestamp")` and `rte_mbuf_dynflag_lookup("rte_dynflag_rx_timestamp")`. Hot-path reads are a direct `*(uint64_t*)((char*)mbuf + ts_offset)` behind an always-inline accessor. When the NIC/PMD doesn't register the dynfield, the accessor returns 0 and `rx_hw_ts_ns` in every event is 0; callers fall back to `enqueued_ts_ns`.
+
+### 7.6 Hot-path scratch reuse policy
+
+Hot-path code — any function reachable from `engine::poll_once`, the RX / TX burst loops, the per-segment TCP state machine, per-ACK processing, or per-tick timer fire — MUST NOT call `Vec::new`, `Vec::with_capacity`, `Box::new`, `String::from`, `format!`, or any other heap allocator on a per-segment basis. The canonical patterns are:
+
+1. **Engine-owned scratch.** `RefCell<Vec<T>>` (or `RefCell<SmallVec<[T; N]>>`) fields on `Engine` sized at `engine_create`. Hot-path borrows with `borrow_mut()`, clears, resizes only if capacity is insufficient, then fills. Mirrors the A6 `tx_pending_data` ring precedent. Typical examples: TX frame scratch, timer-id iteration scratch, pruned-mbufs scratch.
+
+2. **Caller-provided `&mut` buffer.** Function takes `&mut Vec<T>` or `&mut SmallVec<[T; N]>` from the caller; clears + populates. Typical example: `rack_mark_losses_on_rto_into(&mut Vec<u16>)`.
+
+3. **`SmallVec<[T; N]>` inline-stored.** For small working sets whose P99 size fits in N. Spill to heap is correctness-neutral but costs an allocation; N sized to cover observed P99. Typical examples: RACK lost-indexes (N=16), prune-below drop list (N=8), timer-fire burst (N=8), RACK loss-event tuples (N=4).
+
+**Gate.** The `bench-alloc-audit` regression test (§10 — Testing) enforces zero allocations on the steady-state hot path. Any new hot-path site either satisfies one of the three patterns above, or the increment is a documented exception recorded in `docs/superpowers/reports/alloc-hotpath.md` with measured cost and reviewer sign-off — same structure as §9.1.1 rule 3 for hot-path counters.
+
+**Not governed by this rule.**
+- Per-connection one-shot allocations at `connect()` / `accept()` (send/recv VecDeques, `timer_ids` list). Per-connection, not per-segment.
+- Engine-creation allocations (mempools, timer-wheel slots, scratch sizing). Startup cost.
+- Error-path / slow-path `String::` / `format!` in logging, `Error` variants. Per §9.1.1 parallel: slow-path cost is fine.
 
 ## 8. Hardware Assumptions
 
