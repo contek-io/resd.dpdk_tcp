@@ -100,6 +100,9 @@ fn ffi_eal_init_and_engine_lifecycle() {
         // A6 Task 20: caller-supplied RTT histogram bucket edges. All-zero
         // triggers the stack's trading-tuned default (spec §3.8.2).
         rtt_histogram_bucket_edges_us: [u32; 15],
+        // A-HW+ T7: ENA devarg intent knobs. 0 = use PMD default.
+        ena_large_llq_hdr: u8,
+        ena_miss_txc_to_sec: u8,
     }
     let cfg = Cfg {
         port_id: 0,
@@ -133,6 +136,8 @@ fn ffi_eal_init_and_engine_lifecycle() {
         garp_interval_sec: 0,
         event_queue_soft_cap: 4096,
         rtt_histogram_bucket_edges_us: [0u32; 15],
+        ena_large_llq_hdr: 0,
+        ena_miss_txc_to_sec: 0,
     };
 
     let eng = unsafe { dpdk_net_engine_create(0, &cfg as *const Cfg as *const core::ffi::c_void) };

@@ -178,6 +178,11 @@ pub unsafe extern "C" fn dpdk_net_engine_create(
         // substitution in `Engine::new`; non-monotonic input causes
         // `Engine::new` to reject and is surfaced here as a null-return.
         rtt_histogram_bucket_edges_us: cfg.rtt_histogram_bucket_edges_us,
+        // A-HW+ T7 (ENA README §5.1): informational knobs consumed by
+        // `dpdk_net_recommended_ena_devargs` (T8) and the bring-up
+        // overflow-risk assertion (T9). 0 = use PMD default on both.
+        ena_large_llq_hdr: cfg.ena_large_llq_hdr,
+        ena_miss_txc_to_sec: cfg.ena_miss_txc_to_sec,
     };
     // A6 Task 9 (spec §3.5): apply preset override AFTER zero-sentinel
     // substitution so the preset values are never clobbered by the
@@ -824,6 +829,8 @@ mod tests {
             garp_interval_sec: 5,
             event_queue_soft_cap: 4096,
             rtt_histogram_bucket_edges_us: [0u32; 15],
+            ena_large_llq_hdr: 0,
+            ena_miss_txc_to_sec: 0,
         };
         assert_eq!(cfg.local_ip, 0x0a_00_00_02);
         assert_eq!(cfg.gateway_mac[2], 0xbe);
@@ -865,6 +872,8 @@ mod tests {
             garp_interval_sec: 0,
             event_queue_soft_cap: 32,
             rtt_histogram_bucket_edges_us: [0u32; 15],
+            ena_large_llq_hdr: 0,
+            ena_miss_txc_to_sec: 0,
         };
         let p = unsafe { dpdk_net_engine_create(0, &cfg) };
         assert!(p.is_null());

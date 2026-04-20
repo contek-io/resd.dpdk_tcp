@@ -294,6 +294,24 @@ pub struct EngineConfig {
     /// substitutes `DEFAULT_RTT_HISTOGRAM_EDGES_US`. Non-monotonic
     /// rejected at `Engine::new` with `Err(Error::InvalidHistogramEdges)`.
     pub rtt_histogram_bucket_edges_us: [u32; 15],
+
+    /// M1 — request the ENA `large_llq_hdr=1` devarg. When 1, the
+    /// application MUST also splice the corresponding devarg string
+    /// into its EAL args; use `dpdk_net_recommended_ena_devargs` to
+    /// build it. Engine bumps `eth.llq_header_overflow_risk` at
+    /// bring-up if the worst-case header (14 + 20 + 20 + 40 = 94 B) is
+    /// within margin of the 96 B LLQ limit and this is 0.
+    /// Default 0 (PMD default 96 B header limit). Set to 1 to request
+    /// the 224 B large-header variant — cost is a Tx queue halved per
+    /// ENA README §5.1.
+    pub ena_large_llq_hdr: u8,
+    /// M2 — value to pass as the ENA `miss_txc_to=N` devarg (seconds).
+    /// 0 = use PMD default (5 s); 1..=60 = explicit value. Application
+    /// splices via `dpdk_net_recommended_ena_devargs`. Recommended for
+    /// trading: 2 or 3 (faster Tx-stall detection than 5 s). Do NOT
+    /// set 0 to disable — see ENA README §5.1 caution about performance
+    /// degradation when the watchdog is disabled.
+    pub ena_miss_txc_to_sec: u8,
 }
 
 impl Default for EngineConfig {
@@ -329,6 +347,8 @@ impl Default for EngineConfig {
             tcp_per_packet_events: false,
             event_queue_soft_cap: 4096,
             rtt_histogram_bucket_edges_us: [0; 15],
+            ena_large_llq_hdr: 0,
+            ena_miss_txc_to_sec: 0,
         }
     }
 }

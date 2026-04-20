@@ -56,6 +56,11 @@ pub struct dpdk_net_engine_config_t {
     /// means "use the stack's trading-tuned defaults" (see spec §3.8.2).
     /// Non-monotonic rejected at `dpdk_net_engine_create` with null-return.
     pub rtt_histogram_bucket_edges_us: [u32; 15],
+    /// M1 — see core `EngineConfig.ena_large_llq_hdr`. Default 0.
+    pub ena_large_llq_hdr: u8,
+    /// M2 — see core `EngineConfig.ena_miss_txc_to_sec`. Default 0
+    /// (PMD default 5 s). Recommended 2 or 3 for trading.
+    pub ena_miss_txc_to_sec: u8,
 }
 
 #[repr(C)]

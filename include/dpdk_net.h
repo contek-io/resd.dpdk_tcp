@@ -96,6 +96,15 @@ struct dpdk_net_engine_config_t {
    * Non-monotonic rejected at `dpdk_net_engine_create` with null-return.
    */
   uint32_t rtt_histogram_bucket_edges_us[15];
+  /**
+   * M1 — see core `EngineConfig.ena_large_llq_hdr`. Default 0.
+   */
+  uint8_t ena_large_llq_hdr;
+  /**
+   * M2 — see core `EngineConfig.ena_miss_txc_to_sec`. Default 0
+   * (PMD default 5 s). Recommended 2 or 3 for trading.
+   */
+  uint8_t ena_miss_txc_to_sec;
 };
 
 typedef uint64_t dpdk_net_conn_t;
