@@ -6,9 +6,15 @@ use crate::Error;
 
 /// RAII wrapper around an `rte_mempool*`.
 /// Dropped pool calls `rte_mempool_free` on the inner pointer.
+///
+/// `data_room_size` is stashed at construction time so callers can query
+/// the per-mbuf payload capacity without dereferencing the opaque
+/// `rte_mempool` struct (`struct rte_mempool` is `_address: u8` in bindgen
+/// because its nested anonymous unions defeat bindgen's layout engine).
 pub struct Mempool {
     ptr: NonNull<sys::rte_mempool>,
     name: CString,
+    data_room_size: u16,
 }
 
 impl Mempool {
@@ -37,7 +43,38 @@ impl Mempool {
         let ptr = NonNull::new(p).ok_or(Error::MempoolCreate(
             "rte_pktmbuf_pool_create returned NULL",
         ))?;
-        Ok(Self { ptr, name: cname })
+        Ok(Self { ptr, name: cname, data_room_size })
+    }
+
+    /// Create an RX-shaped mbuf pool sized for the given mbuf count.
+    ///
+    /// Thin wrapper around `new_pktmbuf` that hardcodes the same
+    /// per-mbuf shape used by `Engine::new` for the primary RX mempool
+    /// (default 2048 data-room + RTE_PKTMBUF_HEADROOM, cache_size=256,
+    /// priv_size=0). Used by the A9 `test-inject` hook to conjure a
+    /// dedicated mempool for synthetic frames so inject traffic never
+    /// contends with the production RX mempool.
+    ///
+    /// Elements carry a `data_room_size` of `2048 + RTE_PKTMBUF_HEADROOM`
+    /// — matches the `EngineConfig` default so single-seg inject frames
+    /// up to 2048 bytes (MTU 1500 + options) always fit. If a future test
+    /// needs jumbo inject frames, extend the signature with a
+    /// `data_room_size` knob; for A9's property + fuzz coverage the
+    /// default covers every Scapy-generated pattern.
+    pub fn new_rx_mempool(
+        name: &str,
+        elt_count: u32,
+        socket_id: i32,
+    ) -> Result<Self, Error> {
+        const DEFAULT_DATA_ROOM: u16 = 2048;
+        Self::new_pktmbuf(
+            name,
+            elt_count,
+            256,
+            0,
+            DEFAULT_DATA_ROOM + sys::RTE_PKTMBUF_HEADROOM as u16,
+            socket_id,
+        )
     }
 
     #[inline]
@@ -47,6 +84,18 @@ impl Mempool {
 
     pub fn name(&self) -> &std::ffi::CStr {
         &self.name
+    }
+
+    /// Per-mbuf data-room capacity (bytes) this pool was configured with.
+    ///
+    /// Matches the `data_room_size` argument passed to
+    /// `rte_pktmbuf_pool_create` — i.e., the maximum single-segment
+    /// payload + headroom an mbuf from this pool can hold. Returned as
+    /// `u32` for arithmetic convenience (matches the DPDK C field
+    /// width); callers compare against frame length before copying.
+    #[inline]
+    pub fn elt_size(&self) -> u32 {
+        self.data_room_size as u32
     }
 }
 

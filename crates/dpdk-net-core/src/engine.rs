@@ -537,6 +537,15 @@ pub struct Engine {
     /// PMDs every slot is `None` and `scrape_xstats` is a cheap no-op.
     /// Slow-path only; not on any hot path.
     xstat_map: crate::ena_xstats::XstatMap,
+
+    /// A9 Task 2: lazily-created mempool for synthetic RX frames injected
+    /// via `inject_rx_frame` / `inject_rx_chain`. Feature-gated so
+    /// release builds carry zero of it. `OnceCell` (not `OnceLock`)
+    /// because `Engine` is single-lcore / `!Sync` — no cross-thread
+    /// access to the cell. Size defaults to 4096 mbufs; override via
+    /// the `DPDK_NET_TEST_INJECT_POOL_SIZE` environment variable.
+    #[cfg(feature = "test-inject")]
+    test_inject_mempool: std::cell::OnceCell<crate::mempool::Mempool>,
 }
 
 /// A4: map an `Outcome` to per-segment `TcpCounters` bumps. Pure slow-path
@@ -1079,6 +1088,8 @@ impl Engine {
             driver_name: outcome.driver_name,
             xstat_map,
             rtt_histogram_edges,
+            #[cfg(feature = "test-inject")]
+            test_inject_mempool: std::cell::OnceCell::new(),
             cfg,
         })
     }
@@ -1912,46 +1923,20 @@ impl Engine {
         let mut rx_bytes_acc: u64 = 0;
 
         for &m in &mbufs[..n] {
-            let bytes = unsafe { crate::mbuf_data_slice(m) };
-            // Task 8: read ol_flags once per mbuf at the RX boundary;
-            // threaded through rx_frame -> handle_ipv4 -> tcp_input so
-            // the IP + L4 offload classifications can gate on the bits
-            // the NIC stamped on this frame. Spec §7.2: feature-off
-            // builds do NOT read ol_flags (software verify always), so
-            // the shim call is compile-gated away and the parameter is
-            // fed as 0. Mirrors Task 9's pattern for nic_rss_hash.
-            #[cfg(feature = "hw-offload-rx-cksum")]
-            let ol_flags = unsafe { sys::shim_rte_mbuf_get_ol_flags(m) };
-            #[cfg(not(feature = "hw-offload-rx-cksum"))]
-            let ol_flags: u64 = 0;
-            // Task 9: read the NIC-provided RSS Toeplitz hash alongside
-            // ol_flags. Threaded through to flow_table::hash_bucket_for_lookup
-            // in tcp_input. When the feature is off, we compile the read
-            // away entirely (no bindgen call) and pass 0.
-            #[cfg(feature = "hw-offload-rss-hash")]
-            let nic_rss_hash = unsafe { sys::shim_rte_mbuf_get_rss_hash(m) };
-            #[cfg(not(feature = "hw-offload-rss-hash"))]
-            let nic_rss_hash: u32 = 0;
-            // Task 11: read the NIC-provided RX timestamp alongside ol_flags
-            // + nic_rss_hash. `hw_rx_ts_ns` yields 0 when the feature is off,
-            // when either dynfield/dynflag lookup returned negative at
-            // engine_create (expected on ENA — spec §10.5), or when the
-            // mbuf's ol_flags do not indicate a valid timestamp. Threaded
-            // through rx_frame -> handle_ipv4 -> tcp_input to both
-            // RX-origin event emission sites (Connected + Readable).
-            let hw_rx_ts = unsafe { self.hw_rx_ts_ns(m) };
-            add(&self.counters.eth.rx_bytes, bytes.len() as u64);
-            // A6.5 Task 4b/4d: hand the mbuf pointer to the RX decode
-            // chain so the OOO reorder queue can store zero-copy
-            // `OooSegment` entries referencing the mbuf instead of
-            // copying payload. `m` is non-null by rx_burst contract.
-            let rx_mbuf = std::ptr::NonNull::new(m);
-            let _accepted = self.rx_frame(bytes, ol_flags, nic_rss_hash, hw_rx_ts, rx_mbuf);
+            // A9 Task 2: per-mbuf RX dispatch extracted into
+            // `dispatch_one_rx_mbuf` so the `test-inject` hook can share
+            // the identical decode / offload-read / rx_frame / mbuf-free
+            // path. `rx_burst` never returns null mbuf pointers —
+            // `expect` documents the contract; failure here would be a
+            // PMD bug worth surfacing loudly rather than silently
+            // skipping the slot.
+            let mbuf = std::ptr::NonNull::new(m)
+                .expect("rte_eth_rx_burst contract: returned mbuf slots are non-null");
+            let _accepted = self.dispatch_one_rx_mbuf(mbuf);
             #[cfg(feature = "obs-byte-counters")]
             {
                 rx_bytes_acc += _accepted as u64;
             }
-            unsafe { sys::shim_rte_pktmbuf_free(m) };
         }
 
         #[cfg(feature = "obs-byte-counters")]
@@ -2783,6 +2768,66 @@ impl Engine {
             n += 1;
         }
         n
+    }
+
+    /// A9 Task 2: dispatch a single RX mbuf through the per-mbuf decode
+    /// chain. Reads feature-gated ol_flags / RSS hash / hw RX timestamp
+    /// off the mbuf, bumps `eth.rx_bytes`, runs `rx_frame`, and frees
+    /// the mbuf back to its mempool. Returns the bytes accepted by the
+    /// inner `tcp_input` (feeds `poll_once`'s `obs-byte-counters`
+    /// accumulator — unused on feature-off builds).
+    ///
+    /// Extracted from `poll_once`'s per-mbuf loop so the `test-inject`
+    /// hook (`inject_rx_frame` / `inject_rx_chain`) can share the
+    /// identical path. Behaviour-preserving — the pre-extraction
+    /// inline sequence is reproduced verbatim here.
+    ///
+    /// Future A9 Task 6: the FaultInjector intercept lands at the
+    /// TOP of this function — see phase-a9 plan §6.
+    #[inline]
+    fn dispatch_one_rx_mbuf(
+        &self,
+        mbuf: std::ptr::NonNull<sys::rte_mbuf>,
+    ) -> u32 {
+        use crate::counters::add;
+        let m = mbuf.as_ptr();
+        let bytes = unsafe { crate::mbuf_data_slice(m) };
+        // Task 8: read ol_flags once per mbuf at the RX boundary;
+        // threaded through rx_frame -> handle_ipv4 -> tcp_input so
+        // the IP + L4 offload classifications can gate on the bits
+        // the NIC stamped on this frame. Spec §7.2: feature-off
+        // builds do NOT read ol_flags (software verify always), so
+        // the shim call is compile-gated away and the parameter is
+        // fed as 0. Mirrors Task 9's pattern for nic_rss_hash.
+        #[cfg(feature = "hw-offload-rx-cksum")]
+        let ol_flags = unsafe { sys::shim_rte_mbuf_get_ol_flags(m) };
+        #[cfg(not(feature = "hw-offload-rx-cksum"))]
+        let ol_flags: u64 = 0;
+        // Task 9: read the NIC-provided RSS Toeplitz hash alongside
+        // ol_flags. Threaded through to flow_table::hash_bucket_for_lookup
+        // in tcp_input. When the feature is off, we compile the read
+        // away entirely (no bindgen call) and pass 0.
+        #[cfg(feature = "hw-offload-rss-hash")]
+        let nic_rss_hash = unsafe { sys::shim_rte_mbuf_get_rss_hash(m) };
+        #[cfg(not(feature = "hw-offload-rss-hash"))]
+        let nic_rss_hash: u32 = 0;
+        // Task 11: read the NIC-provided RX timestamp alongside ol_flags
+        // + nic_rss_hash. `hw_rx_ts_ns` yields 0 when the feature is off,
+        // when either dynfield/dynflag lookup returned negative at
+        // engine_create (expected on ENA — spec §10.5), or when the
+        // mbuf's ol_flags do not indicate a valid timestamp. Threaded
+        // through rx_frame -> handle_ipv4 -> tcp_input to both
+        // RX-origin event emission sites (Connected + Readable).
+        let hw_rx_ts = unsafe { self.hw_rx_ts_ns(m) };
+        add(&self.counters.eth.rx_bytes, bytes.len() as u64);
+        // A6.5 Task 4b/4d: hand the mbuf pointer to the RX decode
+        // chain so the OOO reorder queue can store zero-copy
+        // `OooSegment` entries referencing the mbuf instead of
+        // copying payload.
+        let rx_mbuf = Some(mbuf);
+        let accepted = self.rx_frame(bytes, ol_flags, nic_rss_hash, hw_rx_ts, rx_mbuf);
+        unsafe { sys::shim_rte_pktmbuf_free(m) };
+        accepted
     }
 
     /// Returns the count of TCP payload bytes accepted from this frame
@@ -5110,6 +5155,32 @@ impl Engine {
         *last = now;
     }
 
+    /// A9 Task 2: lazy-construct the dedicated test-inject mempool.
+    ///
+    /// Sized by the `DPDK_NET_TEST_INJECT_POOL_SIZE` env var (mbufs);
+    /// default 4096 when unset or unparseable. NUMA socket matches the
+    /// engine's port socket so synthetic mbufs live on the same NUMA
+    /// node as the production RX path. Panics on creation failure —
+    /// EAL-not-initialized or hugepage exhaustion are environmental
+    /// issues the test harness needs to surface loudly, not recover
+    /// from.
+    #[cfg(feature = "test-inject")]
+    fn test_inject_pool(&self) -> &crate::mempool::Mempool {
+        self.test_inject_mempool.get_or_init(|| {
+            let size: u32 = std::env::var("DPDK_NET_TEST_INJECT_POOL_SIZE")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(4096);
+            let socket_id = unsafe { sys::rte_eth_dev_socket_id(self.cfg.port_id) };
+            crate::mempool::Mempool::new_rx_mempool(
+                &format!("test_inject_mp_{}", self.cfg.lcore_id),
+                size,
+                socket_id,
+            )
+            .expect("test-inject mempool create failed (check hugepages + EAL init)")
+        })
+    }
+
     /// Inject a synthetic Ethernet frame as if it came from PMD RX.
     /// The frame is copied into an mbuf from a lazily-created test-inject
     /// mempool; the same internal RX dispatch the poll loop uses runs end
@@ -5117,8 +5188,60 @@ impl Engine {
     /// downstream by reassembly / READABLE delivery — caller does not own
     /// the mbuf after this returns).
     #[cfg(feature = "test-inject")]
-    pub fn inject_rx_frame(&self, _frame: &[u8]) -> Result<(), InjectErr> {
-        unimplemented!("Task 2: single-seg inject_rx_frame implementation")
+    pub fn inject_rx_frame(&self, frame: &[u8]) -> Result<(), InjectErr> {
+        // Reject pathologically large frames before the alloc so the
+        // caller gets a typed error instead of a cryptic append-NULL
+        // from DPDK. `elt_size()` returns the pool's `data_room_size`
+        // (including headroom — slightly over-permissive, but errs on
+        // the side of letting the append decide the final boundary).
+        let pool = self.test_inject_pool();
+        let seg_size = pool.elt_size() as usize;
+        if frame.len() > seg_size {
+            return Err(InjectErr::FrameTooLarge {
+                frame_len: frame.len(),
+                seg_size,
+            });
+        }
+
+        // SAFETY: `pool.as_ptr()` is a live, non-null `rte_mempool*` (RAII
+        // wrapper holds `NonNull`). `shim_rte_pktmbuf_alloc` is the
+        // re-exported static-inline `rte_pktmbuf_alloc`; returns NULL
+        // iff the pool is exhausted.
+        let m_raw = unsafe { sys::shim_rte_pktmbuf_alloc(pool.as_ptr()) };
+        let mbuf = std::ptr::NonNull::new(m_raw).ok_or(InjectErr::MempoolExhausted)?;
+
+        // `rte_pktmbuf_alloc` returns a fresh mbuf with
+        // `data_len=0`, `pkt_len=0`, `nb_segs=1`, `next=NULL`,
+        // `data_off=RTE_PKTMBUF_HEADROOM`. `shim_rte_pktmbuf_append`
+        // advances `data_len` + `pkt_len` by `frame.len()` and returns
+        // a writable pointer into the mbuf's data room — this is the
+        // same production pattern `tx_frame` / `tx_tcp_frame` use.
+        // SAFETY: frame length was bounded against `elt_size()` above,
+        // so `append` cannot fail on a non-corrupt mbuf; the NULL
+        // branch below is pure belt-and-suspenders for the
+        // headroom-ate-the-payload edge case.
+        let dst = unsafe {
+            sys::shim_rte_pktmbuf_append(mbuf.as_ptr(), frame.len() as u16)
+        };
+        if dst.is_null() {
+            // SAFETY: we own the mbuf; free returns it to its pool.
+            unsafe { sys::shim_rte_pktmbuf_free(mbuf.as_ptr()) };
+            return Err(InjectErr::FrameTooLarge {
+                frame_len: frame.len(),
+                seg_size,
+            });
+        }
+        // SAFETY: `dst` points to `frame.len()` writable bytes inside
+        // the mbuf's data room (append just reserved them). `frame` is
+        // a caller-owned slice; the regions cannot overlap.
+        unsafe {
+            std::ptr::copy_nonoverlapping(frame.as_ptr(), dst as *mut u8, frame.len());
+        }
+
+        // Dispatch through the same per-mbuf RX path `poll_once` uses;
+        // `dispatch_one_rx_mbuf` frees the mbuf before returning.
+        let _accepted = self.dispatch_one_rx_mbuf(mbuf);
+        Ok(())
     }
 
     /// Inject a multi-segment Ethernet frame chain (LRO-shape).

@@ -80,3 +80,83 @@ mod tests {
         assert!(m.blackhole);
     }
 }
+
+// ─────────────────────────────────────────────────────────────────────────
+// A9 Task 2: shared test-engine constructor for `test-inject` smoke tests.
+//
+// Stands up a minimal `Engine` backed by a DPDK TAP vdev. Requires
+// `DPDK_NET_TEST_TAP=1` + sudo + hugepages (same gate as every other TAP
+// test in this crate). Returns `None` when the gate is unmet so the
+// caller can skip cleanly without taking down the test run.
+//
+// The returned `Engine` is the caller's to keep alive — mempool + port
+// handles drop when it goes out of scope.
+// ─────────────────────────────────────────────────────────────────────────
+
+/// Per-process latch so multiple inject tests can share one EAL init
+/// (rte_eal_init is idempotent-rejected once called; the `engine::eal_init`
+/// wrapper handles that, but we also avoid racing tests that call it
+/// concurrently). `Mutex<bool>` mirrors the existing EAL_INIT in engine.rs.
+#[cfg(feature = "test-inject")]
+static TEST_INJECT_EAL_INIT: std::sync::Mutex<bool> = std::sync::Mutex::new(false);
+
+/// Build a minimal `Engine` suitable for `test-inject` hook smoke tests.
+///
+/// Returns `None` when `DPDK_NET_TEST_TAP` is not `1` so the caller
+/// (test) can early-return and skip. Panics on environment failures
+/// that the test harness should surface loudly (EAL init fail,
+/// port setup fail, hugepage exhaustion) rather than silently
+/// skip — matches the behaviour of the other TAP-gated tests.
+///
+/// Follows the same EAL args + vdev pattern as `tcp_basic_tap.rs`
+/// (`net_tap0` + a unique iface name so concurrent inject tests
+/// don't collide with the production-path TAP tests).
+#[cfg(feature = "test-inject")]
+pub fn make_test_engine() -> Option<dpdk_net_core::engine::Engine> {
+    use dpdk_net_core::engine::{eal_init, Engine, EngineConfig};
+
+    if std::env::var("DPDK_NET_TEST_TAP").ok().as_deref() != Some("1") {
+        eprintln!(
+            "make_test_engine: DPDK_NET_TEST_TAP unset; skipping. \
+             Set DPDK_NET_TEST_TAP=1 (and run with sudo + hugepages) \
+             to exercise the test-inject hook end-to-end."
+        );
+        return None;
+    }
+
+    {
+        let mut guard = TEST_INJECT_EAL_INIT.lock().unwrap();
+        if !*guard {
+            let args = [
+                "dpdk-net-a9-inject-test",
+                "--in-memory",
+                "--no-pci",
+                // Unique iface so the inject tests can coexist with
+                // the L2/L3/TCP TAP suites. dpdktap9x range is reserved
+                // for A9 test-inject.
+                "--vdev=net_tap0,iface=dpdktap90",
+                "-l",
+                "0-1",
+                "--log-level=3",
+            ];
+            eal_init(&args).expect("EAL init (test-inject smoke)");
+            *guard = true;
+        }
+    }
+
+    // Use 10.99.90.2 so the inject tests don't collide with any of the
+    // existing /24s (the TAP suite carves 10.99.[0..30].0/24).
+    let cfg = EngineConfig {
+        port_id: 0,
+        local_ip: 0x0a_63_5a_02, // 10.99.90.2
+        gateway_ip: 0x0a_63_5a_01, // 10.99.90.1
+        // Static gateway MAC; the inject smoke test does not emit
+        // TX traffic, so this value is inert.
+        gateway_mac: [0x02, 0x00, 0x00, 0x00, 0x00, 0x01],
+        garp_interval_sec: 0,
+        tcp_msl_ms: 100,
+        max_connections: 8,
+        ..Default::default()
+    };
+    Some(Engine::new(cfg).expect("engine new (test-inject smoke)"))
+}
