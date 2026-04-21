@@ -2085,13 +2085,18 @@ impl Engine {
             let Some(c) = ft.get(handle) else { return };
             let rtt_us = c.rtt_est.srtt_us().unwrap_or(c.rack.min_rtt_us);
             let reo_wnd = c.rack.reo_wnd_us;
-            let now_us = (crate::clock::now_ns() / 1_000) as u32;
+            // bug_008 fix: pass u64 ns directly. Truncating to u32 µs
+            // here wrapped every ~71 min and (combined with saturating
+            // arithmetic in the helper) silently skipped loss marking
+            // across the wrap — breaking RACK RTO tail-loss recovery
+            // on long-lived flows. u64 ns wraps only every ~584 years.
+            let now_ns = crate::clock::now_ns();
             crate::tcp_rack::rack_mark_losses_on_rto_into(
                 &c.snd_retrans.entries,
                 c.snd_una,
                 rtt_us,
                 reo_wnd,
-                now_us,
+                now_ns,
                 &mut scratch,
             );
         }
