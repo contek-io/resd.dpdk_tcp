@@ -27,7 +27,6 @@ bench-common = { path = "../bench-common" }
 bench-e2e = { path = "../bench-e2e" }
 dpdk-net-core = { path = "../../crates/dpdk-net-core" }
 dpdk-net-sys = { path = "../../crates/dpdk-net-sys" }
-dpdk-net = { path = "../../crates/dpdk-net" }
 clap = { version = "4", features = ["derive"] }
 anyhow = "1"
 csv = "1.3"

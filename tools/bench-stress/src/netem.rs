@@ -28,6 +28,53 @@
 
 use std::process::Command;
 
+/// Allowlist validator for the peer-iface CLI input. Linux iface names
+/// are a bounded alphabet (alphanumeric + `_` + `.` + `-`); anything
+/// outside that window is rejected so `iface` can't smuggle shell
+/// metachars (`;`, `&&`, backtick, `$(...)`, newline, etc.) through the
+/// `ssh ... "sudo tc qdisc add dev {iface} root ..."` interpolation.
+///
+/// Zero-length inputs are also rejected — an empty iface would produce
+/// a malformed tc command that could match the peer's default device in
+/// unpredictable ways.
+fn validate_iface(iface: &str) -> anyhow::Result<()> {
+    if iface.is_empty() {
+        anyhow::bail!("netem: unsafe iface value: {iface:?} (empty)");
+    }
+    for b in iface.bytes() {
+        let ok = b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'-');
+        if !ok {
+            anyhow::bail!("netem: unsafe iface value: {iface:?}");
+        }
+    }
+    Ok(())
+}
+
+/// Allowlist validator for the scenario's netem spec string. The current
+/// matrix uses values like `loss 0.1% delay 10ms`, `reorder 50% gap 3`,
+/// `duplicate 100%`, `loss 1% 25%` — letters, digits, `.`, `%`, `:`,
+/// space, `-`, `_`. Anything else (`;`, `&&`, `|`, backtick, `$(...)`,
+/// newline) is rejected to keep the SSH shell interpolation safe.
+///
+/// The spec strings live in `scenarios.rs` as `'static` literals, so the
+/// validator is mostly a defence-in-depth guard; the operator CLI
+/// doesn't accept a netem spec today, but the check stays here so any
+/// future path that routes external input into `spec` inherits the
+/// allowlist automatically.
+fn validate_spec(spec: &str) -> anyhow::Result<()> {
+    if spec.is_empty() {
+        anyhow::bail!("netem: unsafe spec value: {spec:?} (empty)");
+    }
+    for b in spec.bytes() {
+        let ok = b.is_ascii_alphanumeric()
+            || matches!(b, b'_' | b'.' | b'%' | b':' | b' ' | b'-');
+        if !ok {
+            anyhow::bail!("netem: unsafe spec value: {spec:?}");
+        }
+    }
+    Ok(())
+}
+
 /// RAII guard for a `tc qdisc add dev <iface> root netem <spec>` that
 /// reverts to the clean qdisc state on drop. See module-level docs for
 /// the rationale behind the SSH shell-out transport.
@@ -48,9 +95,9 @@ use std::process::Command;
 #[derive(Debug)]
 pub struct NetemGuard {
     /// SSH target (e.g. `user@host`).
-    peer_ssh: String,
+    pub(crate) peer_ssh: String,
     /// Peer-local iface name (e.g. `ens6`).
-    iface: String,
+    pub(crate) iface: String,
 }
 
 impl NetemGuard {
@@ -62,6 +109,8 @@ impl NetemGuard {
     /// identity is already constrained by the VPC + SG, which is the
     /// trust boundary for the bench run.
     pub fn apply(peer_ssh: &str, iface: &str, spec: &str) -> anyhow::Result<Self> {
+        validate_iface(iface)?;
+        validate_spec(spec)?;
         let cmd = format!("sudo tc qdisc add dev {iface} root netem {spec}");
         let out = Command::new("ssh")
             .args(["-o", "StrictHostKeyChecking=no", peer_ssh, &cmd])
@@ -139,8 +188,78 @@ mod tests {
         };
         assert_eq!(g.peer_ssh(), "user@10.0.0.43");
         assert_eq!(g.iface(), "ens6");
-        // Drop will shell out to ssh and emit a stderr warning. The test
-        // keeps running; we just assert construction + accessors work.
-        drop(g);
+        // mem::forget to skip Drop (would shell out to SSH which hangs
+        // ~4s on dev hosts without the peer). This test only validates
+        // accessors; the Drop path has its own stderr-warning coverage
+        // via operator inspection on live peer runs (documented, not
+        // shell-tested in the cargo sandbox).
+        std::mem::forget(g);
+    }
+
+    #[test]
+    fn validate_iface_accepts_normal_names() {
+        assert!(validate_iface("ens6").is_ok());
+        assert!(validate_iface("eth0").is_ok());
+        assert!(validate_iface("enp1s0").is_ok());
+        assert!(validate_iface("br-0ab12c3d").is_ok());
+        assert!(validate_iface("veth_foo.bar").is_ok());
+    }
+
+    #[test]
+    fn validate_iface_rejects_shell_metachars() {
+        // Covers `;`, `&&`, `|`, backtick, `$(...)`, newline — the
+        // classic shell-injection vectors through SSH command
+        // interpolation.
+        assert!(validate_iface("ens6; reboot").is_err());
+        assert!(validate_iface("ens6&&rm").is_err());
+        assert!(validate_iface("ens6|cat").is_err());
+        assert!(validate_iface("ens6`id`").is_err());
+        assert!(validate_iface("ens6$(id)").is_err());
+        assert!(validate_iface("ens6\nreboot").is_err());
+        assert!(validate_iface("").is_err());
+    }
+
+    #[test]
+    fn validate_spec_accepts_current_scenario_values() {
+        // Every netem spec that appears in `scenarios::MATRIX` today.
+        assert!(validate_spec("loss 0.1% delay 10ms").is_ok());
+        assert!(validate_spec("loss 1% 25%").is_ok());
+        assert!(validate_spec("reorder 50% gap 3").is_ok());
+        assert!(validate_spec("duplicate 100%").is_ok());
+    }
+
+    #[test]
+    fn validate_spec_rejects_shell_metachars() {
+        // Same vector set as the iface validator. Kept as a separate test
+        // so a regression on either validator points at the correct site.
+        assert!(validate_spec("loss 1%; reboot").is_err());
+        assert!(validate_spec("loss 1%&&rm").is_err());
+        assert!(validate_spec("loss 1%|cat").is_err());
+        assert!(validate_spec("loss 1%`id`").is_err());
+        assert!(validate_spec("loss 1%$(id)").is_err());
+        assert!(validate_spec("loss 1%\nreboot").is_err());
+        assert!(validate_spec("").is_err());
+    }
+
+    #[test]
+    fn apply_rejects_unsafe_iface_without_shelling_out() {
+        // Apply must fail *before* the ssh fork; the validator surfaces
+        // the error rather than handing the crafted string to the shell.
+        let err = NetemGuard::apply("user@host", "ens6; reboot", "loss 0.1%")
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("unsafe iface"),
+            "expected unsafe-iface error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn apply_rejects_unsafe_spec_without_shelling_out() {
+        let err = NetemGuard::apply("user@host", "ens6", "loss 0.1%; reboot")
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("unsafe spec"),
+            "expected unsafe-spec error, got: {err}"
+        );
     }
 }

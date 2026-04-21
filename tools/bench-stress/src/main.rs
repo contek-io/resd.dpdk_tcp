@@ -49,7 +49,6 @@ use bench_common::run_metadata::RunMetadata;
 
 use bench_e2e::workload::{open_connection, run_rtt_workload};
 
-use dpdk_net_core::counters::Counters;
 use dpdk_net_core::engine::Engine;
 
 use bench_stress::counters_snapshot::{
@@ -291,19 +290,41 @@ fn run_one_scenario<W: std::io::Write>(
 
     // 6. Summarise + p999 ratio check.
     let summary = summarize(&samples);
-    if let (Some(ratio), Some(baseline)) = (scenario.p999_ceiling_ratio, idle_baseline) {
-        let observed = summary.p999 / baseline;
-        if observed > ratio {
-            anyhow::bail!(
-                "scenario {} p999 ratio {:.3} exceeded ceiling {:.3} \
-                 (scenario p999 = {:.1} ns, idle p999 = {:.1} ns)",
-                scenario.name,
-                observed,
-                ratio,
-                summary.p999,
-                baseline
+    match (scenario.p999_ceiling_ratio, idle_baseline) {
+        (Some(ratio), Some(baseline)) => {
+            if baseline <= 0.0 {
+                anyhow::bail!(
+                    "idle baseline p999 is non-positive: {baseline} ns \
+                     (scenario {})",
+                    scenario.name
+                );
+            }
+            let observed = summary.p999 / baseline;
+            if observed > ratio {
+                anyhow::bail!(
+                    "scenario {} p999 ratio {:.3} exceeded ceiling {:.3} \
+                     (scenario p999 = {:.1} ns, idle p999 = {:.1} ns)",
+                    scenario.name,
+                    observed,
+                    ratio,
+                    summary.p999,
+                    baseline
+                );
+            }
+        }
+        (Some(ratio), None) => {
+            // Per-scenario WARN surfaces the skip inline in the driver log
+            // so operators don't miss it in long sweeps. Rationale for the
+            // skip itself (EAL-once-per-process, FI config read once at
+            // bring-up) is documented at idle_baseline's construction
+            // site; this line just makes the consequence visible.
+            eprintln!(
+                "bench-stress: WARN scenario {} p999 ratio {:.2} NOT checked \
+                 (idle baseline skipped; re-run netem-only to capture baseline)",
+                scenario.name, ratio
             );
         }
+        (None, _) => {}
     }
 
     // 7. Emit CSV rows.
@@ -682,10 +703,6 @@ fn run_capture(argv: &[&str]) -> Option<String> {
     }
     Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
-
-// -- Silence unused-code warnings on tests path --
-#[allow(dead_code)]
-fn _unused_counters_ref(_: &Counters) {}
 
 #[cfg(test)]
 mod tests {
