@@ -66,27 +66,33 @@ declare -A RESULTS
 # Best-effort ENA-style interface lookup — first device whose name
 # starts with "en" or is literally eth1. Returns empty string when
 # none is present (dev-host path; callers must treat as "skipped").
+# Anchoring the regex to the interface-name field prevents false
+# matches on e.g. veth1 / vxlan-eth1 on dev hosts (I2).
 detect_ena_iface() {
-  ip -o link 2>/dev/null | awk -F': ' '/ en|eth1/ {print $2; exit}'
+  ip -o link 2>/dev/null | awk -F': ' '$2 ~ /^(en|eth1)/ {print $2; exit}' || true
 }
 
+# I1: some kernels without the GRUB boot args set surface these sysfs
+# entries as the literal string "(null)" (sometimes with trailing
+# whitespace). Trim whitespace and reject that literal so a misbaked
+# AMI doesn't silently pass strict mode.
 check_isolcpus() {
   local v
-  v=$(cat /sys/devices/system/cpu/isolated 2>/dev/null || true)
-  if [[ -n "$v" ]]; then
+  v=$(tr -d '[:space:]' </sys/devices/system/cpu/isolated 2>/dev/null || true)
+  if [[ -n "$v" && "$v" != "(null)" ]]; then
     RESULTS[isolcpus]="pass|$v"
   else
-    RESULTS[isolcpus]="fail|empty"
+    RESULTS[isolcpus]="fail|${v:-empty}"
   fi
 }
 
 check_nohz_full() {
   local v
-  v=$(cat /sys/devices/system/cpu/nohz_full 2>/dev/null || true)
-  if [[ -n "$v" ]]; then
+  v=$(tr -d '[:space:]' </sys/devices/system/cpu/nohz_full 2>/dev/null || true)
+  if [[ -n "$v" && "$v" != "(null)" ]]; then
     RESULTS[nohz_full]="pass|$v"
   else
-    RESULTS[nohz_full]="fail|empty"
+    RESULTS[nohz_full]="fail|${v:-empty}"
   fi
 }
 
@@ -207,14 +213,17 @@ check_thermal_throttle() {
   RESULTS[thermal_throttle]="pass|${throttles:-0}"
 }
 
+# I3: spec §16.2 bakes hugepages=2048 on the AMI; the old 1024 threshold
+# would silently pass a half-populated reservation. Parametrize via env
+# var (default matches the AMI bake) so CI / dev hosts can lower it.
 check_hugepages_reserved() {
   local pages
   pages=$(awk '/^HugePages_Total:/ {print $2}' /proc/meminfo 2>/dev/null || true)
-  pages="${pages:-0}"
-  if [[ "$pages" =~ ^[0-9]+$ && "$pages" -ge 1024 ]]; then
+  local expected="${EXPECTED_HUGEPAGES:-2048}"
+  if [[ "$pages" =~ ^[0-9]+$ && "$pages" -ge "$expected" ]]; then
     RESULTS[hugepages_reserved]="pass|$pages"
   else
-    RESULTS[hugepages_reserved]="fail|$pages"
+    RESULTS[hugepages_reserved]="fail|${pages:-missing}"
   fi
 }
 
