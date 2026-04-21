@@ -1,0 +1,28 @@
+[package]
+name = "dpdk-net"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "dpdk_net"
+# staticlib for static linking into C++; cdylib for dynamic.
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[features]
+# A6.7 (T19): gates the test-only `dpdk_net_panic_for_test()` FFI entry
+# in src/test_only.rs. Used exclusively by tests/panic_firewall.rs to
+# verify panic = "abort" at the C ABI boundary; never enabled in
+# production builds and never emitted into dpdk_net.h via cbindgen.
+test-panic-entry = []
+
+[dependencies]
+dpdk-net-core = { path = "../dpdk-net-core" }
+dpdk-net-sys = { path = "../dpdk-net-sys" }
+libc.workspace = true
+
+[dev-dependencies]
+libc.workspace = true
+
+[build-dependencies]
+cbindgen = "0.26"

@@ -1,0 +1,12 @@
+[package]
+name = "ffi-test"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[dependencies]
+dpdk-net = { path = "../../crates/dpdk-net" }
+libc.workspace = true
+
+[build-dependencies]
+pkg-config = "0.3"

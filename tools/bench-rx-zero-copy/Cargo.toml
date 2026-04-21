@@ -1,0 +1,24 @@
+[package]
+name = "bench-rx-zero-copy"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[dependencies]
+dpdk-net-core = { path = "../../crates/dpdk-net-core", features = ["bench-alloc-audit"] }
+dpdk-net-sys = { path = "../../crates/dpdk-net-sys" }
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[features]
+# Mirror the dpdk-net-core bench-alloc-audit feature so the tests
+# directory can gate `#[cfg(feature = "bench-alloc-audit")]` modules.
+# Enabling this flag has no effect on the benches themselves — the
+# dpdk-net-core feature is always on in [dependencies] so the
+# CountingAllocator type is always in scope.
+bench-alloc-audit = []
+
+[[bench]]
+name = "delivery_cycle"
+harness = false

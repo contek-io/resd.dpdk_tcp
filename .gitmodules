@@ -1,0 +1,3 @@
+[submodule "third_party/mtcp"]
+	path = third_party/mtcp
+	url = https://github.com/mtcp-stack/mtcp

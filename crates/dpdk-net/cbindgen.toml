@@ -1,0 +1,52 @@
+language = "C"
+include_guard = "DPDK_NET_H"
+pragma_once = true
+autogen_warning = "/* DO NOT EDIT: generated from Rust via cbindgen */"
+no_includes = false
+sys_includes = ["stdint.h", "stdbool.h", "stddef.h", "arpa/inet.h"]
+# Macro used to express `#[repr(C, align(N))]` in C. Defined in after_includes.
+after_includes = "\n#define DPDK_NET_ALIGNED(N) __attribute__((aligned(N)))\n"
+style = "tag"
+# Emit the header so it can also be `#include`d from C++. Wraps the
+# sized-enum typedef in `#ifndef __cplusplus` and uses `enum X : uintN_t`
+# in C++ mode so the enum tag name doesn't clash with the typedef.
+cpp_compat = true
+
+[layout]
+aligned_n = "DPDK_NET_ALIGNED"
+
+[export]
+# Types are already prefixed with `dpdk_net_` at their Rust source names, so
+# cbindgen doesn't need to prepend anything. (An additional `prefix` here
+# would double-prefix to `dpdk_net_dpdk_net_*`.)
+# `dpdk_net_panic_for_test` is a test-only FFI export gated behind the
+# `test-panic-entry` cargo feature (T19). cbindgen ignores feature gates
+# when scanning module trees, so we exclude the symbol explicitly to
+# keep it out of the public header — tests declare it themselves.
+exclude = ["EngineConfigRustOnly", "dpdk_net_panic_for_test"]
+# Force-include types that aren't yet referenced by any extern "C" function
+# (T9 adds those; until then cbindgen's reachability analysis would trim them).
+include = [
+    "dpdk_net_engine",
+    "dpdk_net_engine_config_t",
+    "dpdk_net_connect_opts_t",
+    "dpdk_net_event_kind_t",
+    "dpdk_net_iovec_t",
+    "dpdk_net_event_readable_t",
+    "dpdk_net_event_error_t",
+    "dpdk_net_event_timer_t",
+    "dpdk_net_event_tcp_retrans_t",
+    "dpdk_net_event_tcp_loss_t",
+    "dpdk_net_event_tcp_state_t",
+    "dpdk_net_event_payload_t",
+    "dpdk_net_event_t",
+    "dpdk_net_eth_counters_t",
+    "dpdk_net_ip_counters_t",
+    "dpdk_net_tcp_counters_t",
+    "dpdk_net_poll_counters_t",
+    "dpdk_net_counters_t",
+    "dpdk_net_conn_stats_t",
+]
+
+[parse]
+parse_deps = false

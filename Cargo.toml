@@ -1,0 +1,26 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/dpdk-net-sys",
+    "crates/dpdk-net-core",
+    "crates/dpdk-net",
+    "tests/ffi-test",
+    "tools/bench-rx-zero-copy",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+
+[workspace.dependencies]
+# pinned once, used by all crates
+libc = "0.2"
+smallvec = "1"
+thiserror = "1"
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+debug = 1  # line tables for perf/flame graphs

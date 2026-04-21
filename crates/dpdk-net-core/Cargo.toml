@@ -1,0 +1,83 @@
+[package]
+name = "dpdk-net-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+dpdk-net-sys = { path = "../dpdk-net-sys" }
+libc.workspace = true
+smallvec = { workspace = true }
+thiserror.workspace = true
+
+[features]
+default = [
+    "obs-poll-saturation",
+    "hw-verify-llq",
+    "hw-offload-tx-cksum",
+    "hw-offload-rx-cksum",
+    "hw-offload-mbuf-fast-free",
+    "hw-offload-rss-hash",
+    "hw-offload-rx-timestamp",
+]
+# Hot-path TCP payload byte counters. Default OFF — see spec §9.1.1.
+# Per-burst-batched increment in engine.rs (Tasks 25-26).
+obs-byte-counters = []
+# Hot-path poll-saturation counter (poll.iters_with_rx_burst_max).
+# Default ON — single conditional fetch_add per poll, no cheap alternative.
+obs-poll-saturation = []
+# A-HW hardware-offload compile-time gates. All default ON. Each gate
+# lives at the code site; struct fields stay present across all feature
+# sets (C ABI stability). A feature-off build compiles the offload code
+# path away entirely — see spec §8.4.
+#
+# `hw-verify-llq`: verify ENA Low-Latency Queue activation at bring-up
+# and bump `offload_missing_llq` if advertised-but-not-activated.
+hw-verify-llq = []
+# `hw-offload-tx-cksum`: request IPv4/TCP/UDP TX cksum offload; when
+# off, the TX path computes checksums on the CPU.
+hw-offload-tx-cksum = []
+# `hw-offload-rx-cksum`: request IPv4/TCP/UDP RX cksum validation;
+# when off, the RX path validates checksums on the CPU.
+hw-offload-rx-cksum = []
+# `hw-offload-mbuf-fast-free`: request the MBUF_FAST_FREE TX optimization
+# for single-segment packets from a single mempool.
+hw-offload-mbuf-fast-free = []
+# `hw-offload-rss-hash`: request RSS hash delivery in the mbuf and
+# consume it when present (used in future RSS-aware paths).
+hw-offload-rss-hash = []
+# `hw-offload-rx-timestamp`: request NIC-level RX timestamp dynfield;
+# expected to be absent on ENA (steady-state `offload_missing_rx_timestamp=1`).
+hw-offload-rx-timestamp = []
+# A10 offload-A/B convenience meta: every hw-* flag at once.
+hw-offloads-all = [
+    "hw-verify-llq",
+    "hw-offload-tx-cksum",
+    "hw-offload-rx-cksum",
+    "hw-offload-mbuf-fast-free",
+    "hw-offload-rss-hash",
+    "hw-offload-rx-timestamp",
+]
+# Meta for the A8 counter-coverage audit.
+obs-all = ["obs-byte-counters", "obs-poll-saturation"]
+# A6.5 Group 5: counting GlobalAlloc wrapper + steady-state
+# alloc-audit regression test. Feature-gated so the probe never
+# ships in release/default builds. The library code does NOT
+# install the allocator globally — the integration test binary
+# does, in `tests/bench_alloc_hotpath.rs`.
+bench-alloc-audit = []
+# Backtrace-capture sub-feature for diagnosing a surfaced allocation.
+# Backtrace capture is itself allocating, so enable only for repro
+# runs of a failing audit.
+bench-alloc-audit-backtrace = ["bench-alloc-audit"]
+# A6.7 hardening: marker feature for the miri job. Tests that touch
+# DPDK sys::* (mbuf alloc, mempool create, port init) are skipped via
+# `#[cfg_attr(miri, ignore = "touches DPDK sys::*")]`. Pure-compute
+# modules (siphash24, iss, tcp_seq/state/sack/rack/rtt/tlp,
+# tcp_options, tcp_events ConnHandle/queue logic, rtt_histogram,
+# error, counters, clock) run fully under miri to detect UB,
+# aliasing, and integer-overflow hazards.
+miri-safe = []
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "warn"
