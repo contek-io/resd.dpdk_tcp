@@ -2,9 +2,12 @@
 //! multi-homed setups. Validates end-to-end wiring:
 //!
 //!   1. `ConnectOpts.local_addr == 0` → SYN source IP == engine's primary (A)
-//!   2. `ConnectOpts.local_addr == B`  → SYN source IP == B (registered secondary)
+//!   2. `ConnectOpts.local_addr == B`  → SYN source IP == B (registered via
+//!      `EngineConfig.secondary_local_ips` at engine create time)
 //!   3. `ConnectOpts.local_addr == C`  → connect rejects with
 //!      `Error::InvalidLocalAddr(C)` (maps to `-EINVAL` at the FFI boundary)
+//!   4. `Engine::add_local_ip(D)` post-create → subsequent connect with
+//!      `ConnectOpts.local_addr == D` succeeds with SYN source IP == D
 //!
 //! Requires `DPDK_NET_TEST_TAP=1` + root (DPDK TAP vdev + AF_PACKET socket
 //! to observe the outbound SYN on the kernel side). Runs against a fresh

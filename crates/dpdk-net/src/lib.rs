@@ -229,13 +229,15 @@ pub unsafe extern "C" fn dpdk_net_engine_destroy(p: *mut dpdk_net_engine) {
 /// in a connect request always selects the primary — the value 0 is
 /// reserved and rejected here as well.
 ///
-/// Idempotent: re-registering an already-known IP is not an error.
+/// Idempotent for secondaries: re-registering an already-known
+/// secondary IP is not an error. The engine's primary `local_ip` is
+/// rejected with `-EINVAL` as a caller-mistake flag (it is already
+/// accepted by `dpdk_net_connect` without registration).
 ///
 /// Returns:
-///   0        success (IP is registered; may or may not have been new)
+///   0        success (secondary IP is registered; may or may not have been new)
 ///   -EINVAL  `p` is null, or `local_addr_nbo == 0`, or the value
-///            equals the engine's primary `local_ip` (already accepted;
-///            no registration needed).
+///            equals the engine's primary `local_ip`.
 ///
 /// Scope note: this only extends the source-IP selection whitelist.
 /// It does NOT configure the address on the host interface, does NOT
