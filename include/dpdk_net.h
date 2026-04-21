@@ -371,6 +371,24 @@ struct DPDK_NET_ALIGNED(64) dpdk_net_poll_counters_t {
   uint64_t _pad[11];
 };
 
+/**
+ * A9 fault-injector counter group (slow-path). Mirror of
+ * `dpdk_net_core::counters::FaultInjectorCounters`; field docs live on
+ * the core struct (see counters.rs). Struct is ALWAYS emitted into the
+ * C ABI (same pattern as A5 deferred tx_retrans / tx_rto / tx_tlp —
+ * cbindgen doesn't honour `#[cfg(feature=...)]`, so feature-gating
+ * here would leak the type into the default-build header). The
+ * `fault-injector` cargo feature only gates whether the FaultInjector
+ * middleware runs and populates these counters; release builds with
+ * the feature off carry zero-valued counters.
+ */
+struct DPDK_NET_ALIGNED(64) dpdk_net_fault_injector_counters_t {
+  uint64_t drops;
+  uint64_t dups;
+  uint64_t reorders;
+  uint64_t corrupts;
+};
+
 struct dpdk_net_counters_t {
   struct dpdk_net_eth_counters_t eth;
   struct dpdk_net_ip_counters_t ip;
@@ -378,6 +396,7 @@ struct dpdk_net_counters_t {
   struct dpdk_net_poll_counters_t poll;
   uint64_t obs_events_dropped;
   uint64_t obs_events_queue_high_water;
+  struct dpdk_net_fault_injector_counters_t fault_injector;
 };
 
 /**

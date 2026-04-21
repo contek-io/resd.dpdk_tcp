@@ -257,4 +257,14 @@ mod tests {
         let err = FaultConfig::parse("foo=0.1").unwrap_err();
         assert_eq!(err, FaultConfigParseError::UnknownKey("foo".to_string()));
     }
+
+    /// Locks in the parser's whitespace + empty-entry tolerance (the
+    /// trim + `if entry.is_empty() { continue; }` behaviour). Rejecting
+    /// these later would be a behaviour change.
+    #[test]
+    fn parse_tolerates_whitespace_and_empty_entries() {
+        let cfg = FaultConfig::parse(" drop = 0.1 , , dup=0.05 ,  ").unwrap();
+        assert_eq!(cfg.drop_rate, 0.1_f32);
+        assert_eq!(cfg.dup_rate, 0.05_f32);
+    }
 }
