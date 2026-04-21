@@ -116,6 +116,15 @@ fn read_process_secret() -> [u8; 16] {
         if f.read_exact(&mut out).is_ok() {
             return out;
         }
+        eprintln!(
+            "dpdk_net: /dev/urandom read_exact failed; \
+             ISS secret falls back to TSC-mixed (degraded mode)"
+        );
+    } else {
+        eprintln!(
+            "dpdk_net: /dev/urandom unreadable; \
+             ISS secret falls back to TSC-mixed (degraded mode)"
+        );
     }
     // Degraded fallback — mix multiple TSC reads at different offsets.
     let t1 = clock::now_ns();
