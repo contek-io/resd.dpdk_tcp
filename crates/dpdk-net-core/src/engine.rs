@@ -1926,12 +1926,16 @@ impl Engine {
             // A9 Task 2: per-mbuf RX dispatch extracted into
             // `dispatch_one_rx_mbuf` so the `test-inject` hook can share
             // the identical decode / offload-read / rx_frame / mbuf-free
-            // path. `rx_burst` never returns null mbuf pointers —
-            // `expect` documents the contract; failure here would be a
-            // PMD bug worth surfacing loudly rather than silently
-            // skipping the slot.
-            let mbuf = std::ptr::NonNull::new(m)
-                .expect("rte_eth_rx_burst contract: returned mbuf slots are non-null");
+            // path. DPDK's `rx_burst` contract guarantees non-null mbuf
+            // pointers in populated slots, but `poll_once` is reachable
+            // via the `dpdk_net_poll` extern "C" FFI entry — panicking
+            // across that boundary under `panic = "unwind"` (dev/test
+            // profile) is UB. Per A6.7's panic-firewall audit, silently
+            // skip null slots instead so the invariant holds regardless
+            // of PMD behaviour.
+            let Some(mbuf) = std::ptr::NonNull::new(m) else {
+                continue;
+            };
             let _accepted = self.dispatch_one_rx_mbuf(mbuf);
             #[cfg(feature = "obs-byte-counters")]
             {

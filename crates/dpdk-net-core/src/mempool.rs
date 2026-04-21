@@ -91,11 +91,13 @@ impl Mempool {
     /// Matches the `data_room_size` argument passed to
     /// `rte_pktmbuf_pool_create` — i.e., the maximum single-segment
     /// payload + headroom an mbuf from this pool can hold. Returned as
-    /// `u32` for arithmetic convenience (matches the DPDK C field
-    /// width); callers compare against frame length before copying.
+    /// `u16` to match the underlying DPDK `rte_pktmbuf_pool_private`
+    /// field width (and the `uint16_t` accepted by
+    /// `rte_pktmbuf_append`), which prevents silent truncation at any
+    /// append-style call site that casts the value back to `u16`.
     #[inline]
-    pub fn elt_size(&self) -> u32 {
-        self.data_room_size as u32
+    pub fn elt_size(&self) -> u16 {
+        self.data_room_size
     }
 }
 
