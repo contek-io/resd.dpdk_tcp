@@ -515,8 +515,8 @@ index 0000000..fdaa7eb
 +    if (!g_active || !g_engine) return -1;
 +    if (count > 65535) return -1;
 +    uint8_t l2_buf[14 + 65535];
-+    memcpy(l2_buf, "\x02\x00\x00\x00\x00\x02"   /* dst: engine local MAC */
-+                   "\x02\x00\x00\x00\x00\x01"   /* src: gateway MAC */
++    memcpy(l2_buf, "\x02\x00\x00\x00\x00\x01"   /* dst: engine local MAC (our_mac) */
++                   "\x02\x00\x00\x00\x00\x02"   /* src: gateway MAC (peer) */
 +                   "\x08\x00",                  /* EtherType IPv4 */
 +           14);
 +    memcpy(l2_buf + 14, ip_bytes, count);
