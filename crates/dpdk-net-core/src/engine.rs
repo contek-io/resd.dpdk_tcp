@@ -5253,9 +5253,129 @@ impl Engine {
     /// payload chunk; each subsequent segment is chained via `rte_mbuf.next`.
     /// `pkt_len` is set to `Σ segments[i].len()`; `nb_segs = segments.len()`.
     /// Used by I-8 closure + chain-walk fuzz coverage.
+    ///
+    /// Errors:
+    ///   - `InjectErr::EmptyChain` — caller passed `&[]`.
+    ///   - `InjectErr::FrameTooLarge` — any single segment exceeds the
+    ///     test-inject mempool's `data_room_size` (or the per-mbuf
+    ///     `rte_pktmbuf_append` declines, which would imply the
+    ///     headroom + segment combo overflowed).
+    ///   - `InjectErr::MempoolExhausted` — `rte_pktmbuf_alloc` returned
+    ///     NULL mid-chain (test-inject pool is sized at construction
+    ///     time via `DPDK_NET_TEST_INJECT_POOL_SIZE`).
+    ///
+    /// On any mid-chain error the partial chain is freed back to the
+    /// pool before returning so a failing inject does not leak mbufs.
     #[cfg(feature = "test-inject")]
-    pub fn inject_rx_chain(&self, _segments: &[&[u8]]) -> Result<(), InjectErr> {
-        unimplemented!("Task 3: multi-seg inject_rx_chain implementation")
+    pub fn inject_rx_chain(&self, segments: &[&[u8]]) -> Result<(), InjectErr> {
+        if segments.is_empty() {
+            return Err(InjectErr::EmptyChain);
+        }
+
+        let pool = self.test_inject_pool();
+        let seg_size = pool.elt_size() as usize;
+
+        // Allocate + copy each segment first, holding handles in a SmallVec.
+        // Stack-inline up to 4 segments (typical LRO-shape coalesces a
+        // small handful of SDUs); spills to heap beyond that. On any
+        // mid-chain failure, free everything we've already allocated.
+        // SAFETY (chain-wide): every pointer pushed onto `mbufs` came
+        // from `shim_rte_pktmbuf_alloc` and is freed exactly once — either
+        // via the per-error cleanup loop, or transferred to the engine
+        // via `dispatch_one_rx_mbuf` which (chain-aware via DPDK's
+        // `rte_pktmbuf_free` walking `next`) returns every link to its
+        // pool exactly once.
+        let mut mbufs: smallvec::SmallVec<[std::ptr::NonNull<sys::rte_mbuf>; 4]>
+            = smallvec::SmallVec::new();
+
+        for seg in segments {
+            if seg.len() > seg_size {
+                for held in &mbufs {
+                    unsafe { sys::shim_rte_pktmbuf_free(held.as_ptr()) };
+                }
+                return Err(InjectErr::FrameTooLarge {
+                    frame_len: seg.len(),
+                    seg_size,
+                });
+            }
+            // SAFETY: pool.as_ptr() is a live mempool*; alloc returns NULL
+            // iff exhausted. NonNull narrows the success branch.
+            let m_raw = unsafe { sys::shim_rte_pktmbuf_alloc(pool.as_ptr()) };
+            let m = match std::ptr::NonNull::new(m_raw) {
+                Some(p) => p,
+                None => {
+                    for held in &mbufs {
+                        unsafe { sys::shim_rte_pktmbuf_free(held.as_ptr()) };
+                    }
+                    return Err(InjectErr::MempoolExhausted);
+                }
+            };
+            // SAFETY: append reserves `seg.len()` bytes after data_off.
+            // Bounded against `seg_size` above, so non-corrupt mbufs
+            // accept the request; the NULL branch is belt-and-suspenders
+            // for the headroom-ate-the-payload edge case (small seg_size
+            // + large RTE_PKTMBUF_HEADROOM). copy_nonoverlapping is safe
+            // because `seg` is a caller-owned slice and `dst` points
+            // into mbuf-private memory.
+            unsafe {
+                let dst = sys::shim_rte_pktmbuf_append(m.as_ptr(), seg.len() as u16);
+                if dst.is_null() {
+                    sys::shim_rte_pktmbuf_free(m.as_ptr());
+                    for held in &mbufs {
+                        sys::shim_rte_pktmbuf_free(held.as_ptr());
+                    }
+                    return Err(InjectErr::FrameTooLarge {
+                        frame_len: seg.len(),
+                        seg_size,
+                    });
+                }
+                std::ptr::copy_nonoverlapping(seg.as_ptr(), dst as *mut u8, seg.len());
+            }
+            mbufs.push(m);
+        }
+
+        // Link the chain. `rte_mbuf` is opaque to bindgen (packed
+        // anonymous unions defeat its layout engine), so we cannot
+        // write `(*head).next = ...` directly from Rust. The C-side
+        // `shim_rte_pktmbuf_chain` re-exports `rte_pktmbuf_chain`,
+        // which: (a) walks to the head's current chain tail, (b)
+        // sets `tail.next = new_tail`, (c) updates `head.nb_segs +=
+        // new_tail.nb_segs`, (d) updates `head.pkt_len += new_tail.pkt_len`.
+        // After we chain each subsequent mbuf onto the head, the head
+        // carries the correct `pkt_len` (= Σ seg.len()) + `nb_segs`
+        // (= segments.len()).
+        //
+        // SAFETY: every entry in `mbufs` is a live mbuf we own; chain
+        // takes ownership only of `tail`'s next-link slot. The return
+        // value is 0 on success, -EOVERFLOW iff the combined chain
+        // would exceed `RTE_MBUF_MAX_NB_SEGS` (default 65535; we cap
+        // at `segments.len()` <= u16 implicitly via the smallvec push
+        // pattern, but a pathological 64K-segment caller would get
+        // EOVERFLOW). Treat that as MempoolExhausted-class — free
+        // everything and return; this avoids a third error variant
+        // for a path no realistic test exercises.
+        for i in 1..mbufs.len() {
+            let rc = unsafe {
+                sys::shim_rte_pktmbuf_chain(mbufs[0].as_ptr(), mbufs[i].as_ptr())
+            };
+            if rc != 0 {
+                // -EOVERFLOW path: free the head (which transitively
+                // frees every link already chained) + every link not
+                // yet chained.
+                unsafe { sys::shim_rte_pktmbuf_free(mbufs[0].as_ptr()) };
+                for held in &mbufs[i..] {
+                    unsafe { sys::shim_rte_pktmbuf_free(held.as_ptr()) };
+                }
+                return Err(InjectErr::MempoolExhausted);
+            }
+        }
+
+        // Dispatch through the same per-mbuf RX path `poll_once` uses;
+        // `dispatch_one_rx_mbuf` reads the head segment, runs decode,
+        // and frees the head — `rte_pktmbuf_free` on a chain head walks
+        // `next` and frees every link.
+        let _accepted = self.dispatch_one_rx_mbuf(mbufs[0]);
+        Ok(())
     }
 }
 
