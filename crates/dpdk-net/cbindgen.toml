@@ -23,7 +23,30 @@ aligned_n = "DPDK_NET_ALIGNED"
 # `test-panic-entry` cargo feature (T19). cbindgen ignores feature gates
 # when scanning module trees, so we exclude the symbol explicitly to
 # keep it out of the public header — tests declare it themselves.
-exclude = ["EngineConfigRustOnly", "dpdk_net_panic_for_test"]
+#
+# A7 Task 8: the test-only FFI surface (`dpdk_net_test_*`) lives in its
+# own header, `include/dpdk_net_test.h`, emitted by a second cbindgen
+# pass under `--features test-server`. cbindgen's reachability scan
+# treats the feature-gated module as reachable at build time (the
+# `#[cfg(...)]` cull happens later, in rustc), so without an explicit
+# exclusion these symbols would leak into `dpdk_net.h` whenever the
+# feature is on. Exclude every `dpdk_net_test_*` symbol plus the two
+# supporting typedefs. Verified by `tests/test_header_excluded.rs`.
+exclude = [
+    "EngineConfigRustOnly",
+    "dpdk_net_panic_for_test",
+    "dpdk_net_test_set_time_ns",
+    "dpdk_net_test_inject_frame",
+    "dpdk_net_test_drain_tx_frames",
+    "dpdk_net_test_listen",
+    "dpdk_net_test_accept_next",
+    "dpdk_net_test_connect",
+    "dpdk_net_test_send",
+    "dpdk_net_test_recv",
+    "dpdk_net_test_close",
+    "dpdk_net_listen_handle_t",
+    "dpdk_net_test_frame_t",
+]
 # Force-include types that aren't yet referenced by any extern "C" function
 # (T9 adds those; until then cbindgen's reachability analysis would trim them).
 include = [

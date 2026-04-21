@@ -5588,6 +5588,52 @@ impl Engine {
             }
         }
     }
+
+    /// A7 Task 8: run the per-conn TX flush path once. Returns `true`
+    /// iff the TX-intercept queue transitioned from empty to non-empty
+    /// during this call. Used by the test-FFI `pump_until_quiescent`
+    /// loop to decide whether forward progress happened.
+    pub fn pump_tx_drain(&self) -> bool {
+        let before_empty = crate::test_tx_intercept::is_empty();
+        self.drain_tx_pending_data();
+        let after_empty = crate::test_tx_intercept::is_empty();
+        before_empty && !after_empty
+    }
+
+    /// A7 Task 8: advance the timer wheel to `now_ns` and dispatch every
+    /// fired timer through the same per-kind handlers `advance_timer_wheel`
+    /// uses. Returns the number of timers that fired on this tick.
+    pub fn pump_timers(&self, now_ns: u64) -> usize {
+        use crate::counters::inc;
+        let fired = self.timer_wheel.borrow_mut().advance(now_ns);
+        let count = fired.len();
+        for (id, node) in fired {
+            match node.kind {
+                crate::tcp_timer_wheel::TimerKind::Rto => {
+                    self.on_rto_fire(node.owner_handle, id);
+                }
+                crate::tcp_timer_wheel::TimerKind::Tlp => {
+                    self.on_tlp_fire(node.owner_handle, id);
+                }
+                crate::tcp_timer_wheel::TimerKind::SynRetrans => {
+                    self.on_syn_retrans_fire(node.owner_handle, id);
+                }
+                crate::tcp_timer_wheel::TimerKind::ApiPublic => {
+                    let mut ev = self.events.borrow_mut();
+                    ev.push(
+                        InternalEvent::ApiTimer {
+                            timer_id: id,
+                            user_data: node.user_data,
+                            emitted_ts_ns: crate::clock::now_ns(),
+                        },
+                        &self.counters,
+                    );
+                    inc(&self.counters.tcp.tx_api_timers_fired);
+                }
+            }
+        }
+        count
+    }
 }
 
 #[cfg(test)]
