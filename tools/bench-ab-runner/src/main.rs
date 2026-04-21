@@ -8,12 +8,13 @@
 //!
 //! Contract (spec §D3):
 //! 1. Precondition check (shell out to `check-bench-preconditions`).
-//! 2. `rte_eal_init` via existing dpdk-net-sys FFI.
+//! 2. `dpdk_net_core::engine::eal_init` (wraps `rte_eal_init` with the
+//!    LLQ log-capture window + process-global once-init Mutex).
 //! 3. `Engine::new` from `dpdk-net-core`.
 //! 4. Warmup iterations (discarded).
 //! 5. Measurement window (collect raw RTT samples).
 //! 6. Emit CSV rows to stdout.
-//! 7. Drop engine; `rte_eal_cleanup`.
+//! 7. Drop engine; `rte_eal_cleanup` (via `EalGuard` RAII).
 //! 8. Exit.
 
 use anyhow::Context;
@@ -94,38 +95,64 @@ fn main() -> anyhow::Result<()> {
     // 1. Precondition check.
     let preconditions = run_preconditions_check(mode)?;
     if mode == PreconditionMode::Strict && !preconditions_all_pass(&preconditions) {
-        eprintln!(
-            "bench-ab-runner: precondition failure in strict mode; see CSV for details"
-        );
+        eprintln!("bench-ab-runner: precondition failure in strict mode:");
+        for (name, value) in preconditions_as_pairs(&preconditions) {
+            if !(value.is_pass() || value.is_not_applicable()) {
+                eprintln!("  {name} = {value}");
+            }
+        }
         std::process::exit(1);
     }
 
-    // 2. EAL init + Engine::new.
-    let engine = setup_engine(&args)?;
+    // 2. EAL init. Routed through `dpdk_net_core::engine::eal_init` (NOT
+    //    the raw `rte_eal_init` FFI) so the LLQ log-capture window
+    //    inside that wrapper fires. Building `--features hw-verify-llq`
+    //    without this routing silently yields a "not captured" verdict.
+    eal_init(&args)?;
 
-    // 3. Workload (warmup + measurement).
+    // Install RAII so `rte_eal_cleanup` runs on every exit path —
+    // including `?`-propagated errors below. The guard drops AFTER the
+    // engine because it's declared later in this scope.
+    let _eal_guard = EalGuard;
+
+    // 3. Engine::new.
+    let engine = build_engine(&args)?;
+
+    // 4. Workload (warmup + measurement).
     let samples = workload::run(&engine, &args)?;
 
-    // 4. Summarize + CSV emit.
-    let metadata = build_run_metadata(&args, mode, preconditions)?;
+    // 5. Summarize + CSV emit.
+    let metadata = build_run_metadata(mode, preconditions)?;
     emit_csv(&args, &metadata, &samples)?;
 
-    // 5. Drop the engine (releases mempools, queues, event queue) before
-    //    rte_eal_cleanup — the EAL must outlive any live `Engine`.
-    drop(engine);
-
-    // 6. rte_eal_cleanup. Best-effort per DPDK 23.11 — some paths (e.g.
-    //    VFIO-based PMDs) don't fully unwind. Ignored on failure so the
-    //    CSV the caller is waiting on is not truncated by a late error.
-    //
-    // Safety: we're the only caller of `rte_eal_init` in this process
-    // (single-invocation contract above), and we've dropped every user
-    // of DPDK state. No outstanding mbuf / queue references remain.
-    unsafe {
-        let _ = dpdk_net_sys::rte_eal_cleanup();
-    }
-
+    // 6. Drop the engine (releases mempools, queues, event queue)
+    //    before `_eal_guard` runs rte_eal_cleanup — the EAL must
+    //    outlive any live `Engine`. Rust drops locals in reverse
+    //    declaration order, so this is automatic (engine declared
+    //    after `_eal_guard` → engine drops first).
     Ok(())
+}
+
+/// RAII guard that calls `rte_eal_cleanup` on drop. Instantiated after
+/// `eal_init` succeeds so that every error path out of `main` (via `?`)
+/// still unwinds the EAL cleanly.
+///
+/// Best-effort per DPDK 23.11 — some paths (e.g. VFIO-based PMDs) don't
+/// fully unwind. Ignored on failure so a late cleanup error does not
+/// obscure the primary run result.
+struct EalGuard;
+
+impl Drop for EalGuard {
+    fn drop(&mut self) {
+        // Safety: we're the only caller of `rte_eal_init` in this
+        // process (single-invocation contract per file-level comment),
+        // and by drop order we've already dropped the `Engine`
+        // (declared later in main). No outstanding mbuf / queue
+        // references remain.
+        unsafe {
+            let _ = dpdk_net_sys::rte_eal_cleanup();
+        }
+    }
 }
 
 /// Parse the `--precondition-mode` string into the typed enum. Fails
@@ -299,23 +326,34 @@ fn all_pass_preconditions() -> Preconditions {
 /// `NotApplicable` counts as non-blocking because it means the tool did
 /// not ask the question (spec §4.1 bench-micro carve-out for `wc_active`).
 fn preconditions_all_pass(p: &Preconditions) -> bool {
-    let fields: [&PreconditionValue; 14] = [
-        &p.isolcpus,
-        &p.nohz_full,
-        &p.rcu_nocbs,
-        &p.governor,
-        &p.cstate_max,
-        &p.tsc_invariant,
-        &p.coalesce_off,
-        &p.tso_off,
-        &p.lro_off,
-        &p.rss_on,
-        &p.thermal_throttle,
-        &p.hugepages_reserved,
-        &p.irqbalance_off,
-        &p.wc_active,
-    ];
-    fields.iter().all(|v| v.is_pass() || v.is_not_applicable())
+    preconditions_as_pairs(p)
+        .iter()
+        .all(|(_, v)| v.is_pass() || v.is_not_applicable())
+}
+
+/// Zip every precondition field with its column-name label. Used by the
+/// strict-mode failure reporter (`main`) and `preconditions_all_pass`.
+///
+/// The column names match the spec §14.1 `precondition_*` prefix so the
+/// stderr enumeration reads the same as the CSV header the downstream
+/// bench-report consumer sees.
+fn preconditions_as_pairs(p: &Preconditions) -> [(&'static str, &PreconditionValue); 14] {
+    [
+        ("precondition_isolcpus", &p.isolcpus),
+        ("precondition_nohz_full", &p.nohz_full),
+        ("precondition_rcu_nocbs", &p.rcu_nocbs),
+        ("precondition_governor", &p.governor),
+        ("precondition_cstate_max", &p.cstate_max),
+        ("precondition_tsc_invariant", &p.tsc_invariant),
+        ("precondition_coalesce_off", &p.coalesce_off),
+        ("precondition_tso_off", &p.tso_off),
+        ("precondition_lro_off", &p.lro_off),
+        ("precondition_rss_on", &p.rss_on),
+        ("precondition_thermal_throttle", &p.thermal_throttle),
+        ("precondition_hugepages_reserved", &p.hugepages_reserved),
+        ("precondition_irqbalance_off", &p.irqbalance_off),
+        ("precondition_wc_active", &p.wc_active),
+    ]
 }
 
 /// Parse a dotted-quad IPv4 into a host-byte-order `u32` (the form
@@ -330,8 +368,13 @@ pub(crate) fn parse_ip_host_order(s: &str) -> anyhow::Result<u32> {
     Ok(u32::from_be_bytes(addr.octets()))
 }
 
-/// Bring up the DPDK EAL + build an `Engine`.
-fn setup_engine(args: &Args) -> anyhow::Result<dpdk_net_core::engine::Engine> {
+/// Bring up the DPDK EAL via `dpdk_net_core::engine::eal_init`.
+///
+/// Routed through the core-crate wrapper (not `rte_eal_init` directly)
+/// so the LLQ log-capture window fires under `--features hw-verify-llq`
+/// and the once-per-process Mutex guard in `eal_init` runs. Calling the
+/// bindgen symbol directly compiles fine but silently bypasses both.
+fn eal_init(args: &Args) -> anyhow::Result<()> {
     // EAL argv: argv[0] = binary name; rest comes from --eal-args.
     // Comma-split so the harness can pass things like
     //   --eal-args="-l,2-3,-n,4,--proc-type=primary"
@@ -346,29 +389,19 @@ fn setup_engine(args: &Args) -> anyhow::Result<dpdk_net_core::engine::Engine> {
             .filter(|s| !s.is_empty())
             .map(|s| s.to_string()),
     );
-    let c_strings: Vec<std::ffi::CString> = eal_argv
-        .iter()
-        .map(|s| std::ffi::CString::new(s.as_str()))
-        .collect::<Result<_, _>>()
-        .context("EAL arg contained interior NUL")?;
-    let mut c_ptrs: Vec<*mut std::os::raw::c_char> =
-        c_strings.iter().map(|c| c.as_ptr() as *mut _).collect();
+    let argv_refs: Vec<&str> = eal_argv.iter().map(String::as_str).collect();
+    dpdk_net_core::engine::eal_init(&argv_refs)
+        .map_err(|e| anyhow::anyhow!("eal_init failed: {e:?}"))
+}
 
-    // Safety: `c_ptrs` is a live Vec of pointers backed by `c_strings`
-    // whose storage outlives this call. DPDK mutates argv internally but
-    // does not free the underlying memory.
-    let rc = unsafe {
-        dpdk_net_sys::rte_eal_init(
-            c_ptrs.len() as std::os::raw::c_int,
-            c_ptrs.as_mut_ptr(),
-        )
-    };
-    if rc < 0 {
-        anyhow::bail!("rte_eal_init failed: rc={rc}");
-    }
-
+/// Construct an `Engine` from parsed args. Requires `eal_init` to have
+/// already succeeded.
+fn build_engine(args: &Args) -> anyhow::Result<dpdk_net_core::engine::Engine> {
     if args.lcore > u16::MAX as u32 {
-        anyhow::bail!("--lcore {} exceeds u16::MAX (EngineConfig.lcore_id)", args.lcore);
+        anyhow::bail!(
+            "--lcore {} exceeds u16::MAX (EngineConfig.lcore_id)",
+            args.lcore
+        );
     }
 
     let cfg = dpdk_net_core::engine::EngineConfig {
@@ -378,9 +411,8 @@ fn setup_engine(args: &Args) -> anyhow::Result<dpdk_net_core::engine::Engine> {
         ..dpdk_net_core::engine::EngineConfig::default()
     };
 
-    let engine = dpdk_net_core::engine::Engine::new(cfg)
-        .map_err(|e| anyhow::anyhow!("Engine::new failed: {e:?}"))?;
-    Ok(engine)
+    dpdk_net_core::engine::Engine::new(cfg)
+        .map_err(|e| anyhow::anyhow!("Engine::new failed: {e:?}"))
 }
 
 /// Populate `RunMetadata` from the usual sources — `git`, `hostname`,
@@ -390,7 +422,6 @@ fn setup_engine(args: &Args) -> anyhow::Result<dpdk_net_core::engine::Engine> {
 /// consume rows with partial metadata (it surfaces the gap as an
 /// "incomplete provenance" flag rather than dropping the run).
 fn build_run_metadata(
-    _args: &Args,
     mode: PreconditionMode,
     preconditions: Preconditions,
 ) -> anyhow::Result<RunMetadata> {

@@ -14,7 +14,6 @@ publish = false
 [dependencies]
 bench-common = { path = "../bench-common" }
 dpdk-net-core = { path = "../../crates/dpdk-net-core", default-features = false }
-dpdk-net = { path = "../../crates/dpdk-net" }
 dpdk-net-sys = { path = "../../crates/dpdk-net-sys" }
 clap = { version = "4", features = ["derive"] }
 serde_json = "1"
