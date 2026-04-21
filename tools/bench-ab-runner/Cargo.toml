@@ -1,0 +1,45 @@
+[package]
+name = "bench-ab-runner"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+# One-shot sub-process runner invoked by the A/B harnesses
+# (`bench-offload-ab`, `bench-obs-overhead`). Each invocation is a fresh
+# rebuild with a different `--features` combination that flips compile-time
+# feature gates in `dpdk-net-core`. See spec §D3 for the contract:
+# precondition check → EAL init → Engine::new → warmup → workload → CSV
+# emit → cleanup → exit.
+
+[dependencies]
+bench-common = { path = "../bench-common" }
+dpdk-net-core = { path = "../../crates/dpdk-net-core", default-features = false }
+dpdk-net = { path = "../../crates/dpdk-net" }
+dpdk-net-sys = { path = "../../crates/dpdk-net-sys" }
+clap = { version = "4", features = ["derive"] }
+serde_json = "1"
+csv = "1.3"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+hostname = "0.4"
+anyhow = "1"
+uuid = { version = "1", features = ["v4"] }
+
+[features]
+# Pass-through A-HW offload + observability flags. The caller
+# (`bench-offload-ab` / `bench-obs-overhead`) rebuilds this crate with a
+# different set per A/B config so the feature-gated hot paths in
+# dpdk-net-core compile in / out accordingly.
+hw-verify-llq = ["dpdk-net-core/hw-verify-llq"]
+hw-offload-tx-cksum = ["dpdk-net-core/hw-offload-tx-cksum"]
+hw-offload-rx-cksum = ["dpdk-net-core/hw-offload-rx-cksum"]
+hw-offload-mbuf-fast-free = ["dpdk-net-core/hw-offload-mbuf-fast-free"]
+hw-offload-rss-hash = ["dpdk-net-core/hw-offload-rss-hash"]
+hw-offload-rx-timestamp = ["dpdk-net-core/hw-offload-rx-timestamp"]
+hw-offloads-all = ["dpdk-net-core/hw-offloads-all"]
+obs-byte-counters = ["dpdk-net-core/obs-byte-counters"]
+obs-poll-saturation = ["dpdk-net-core/obs-poll-saturation"]
+obs-all = ["dpdk-net-core/obs-all"]
+# TODO(T4): uncomment when T4 lands the `obs-none` meta-feature on
+# dpdk-net-core. The `bench-obs-overhead` harness needs this variant to
+# exercise the "no hot-path counters at all" A/B slot.
+# obs-none = ["dpdk-net-core/obs-none"]
