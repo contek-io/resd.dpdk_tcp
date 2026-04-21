@@ -129,6 +129,7 @@ mod tests {
     }
 
     #[cfg_attr(miri, ignore = "uses x86_64 _rdtsc inline asm; miri rejects inline asm")]
+    #[cfg(not(feature = "test-server"))]
     #[test]
     fn now_ns_within_one_percent_of_wall_clock() {
         // Force calibration before capturing wall_start so the 50ms calibration

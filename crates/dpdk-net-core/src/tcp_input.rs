@@ -1560,6 +1560,7 @@ mod tests {
     }
 
     #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
+    #[cfg(not(feature = "test-server"))]
     #[test]
     fn handle_syn_sent_wires_maybe_seed_srtt_from_syn() {
         // A5.5 Task 13 wiring gate: the 4 unit tests on
@@ -3101,6 +3102,7 @@ mod tests {
     // xmit_ts is older than RACK.xmit_ts + age exceeds reo_wnd, so it's
     // marked lost and its index is surfaced via Outcome.rack_lost_indexes.
     #[cfg_attr(miri, ignore = "touches DPDK sys::*")]
+    #[cfg(not(feature = "test-server"))]
     #[test]
     fn rack_detects_older_entry_as_lost_when_newer_sacked_and_beyond_reo_wnd() {
         use crate::mempool::Mbuf;

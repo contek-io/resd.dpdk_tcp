@@ -190,6 +190,7 @@ mod tests_a5 {
     use super::*;
 
     #[cfg_attr(miri, ignore = "IssGen::next calls clock::now_ns (rdtsc inline asm)")]
+    #[cfg(not(feature = "test-server"))]
     #[test]
     fn a5_uses_4us_clock_ticks_for_monotonic_component() {
         // The spec §6.5 clock is 4µs ticks. Verify that two calls separated by
