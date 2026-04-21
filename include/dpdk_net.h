@@ -653,6 +653,26 @@ int32_t dpdk_net_conn_rtt_histogram(struct dpdk_net_engine *engine,
  */
 int32_t dpdk_net_resolve_gateway_mac(uint32_t gateway_ip_host_order, uint8_t *out_mac);
 
+/**
+ * Read `/proc/net/route` and return the default-gateway IPv4 address
+ * in *host* byte order via `*out_ip`.
+ *
+ * `iface` may be NULL (accept any default route) or a NUL-terminated
+ * interface name (restrict to that iface). `out_ip` must be non-NULL.
+ *
+ * MUST be called before `dpdk_net_engine_create`: `/proc/net/route`
+ * reflects the kernel's view of the route table, which goes away once
+ * DPDK binds the NIC. Pair with `dpdk_net_resolve_gateway_mac` to seed
+ * both `EngineConfig.gateway_ip` and `.gateway_mac`.
+ *
+ * Returns:
+ *   0 — success, `*out_ip` populated.
+ *  -EINVAL — `out_ip` is NULL, or `iface` is not valid UTF-8.
+ *  -ENOENT — no default route matched (including unknown iface).
+ *  -EIO   — `/proc/net/route` could not be read.
+ */
+int32_t dpdk_net_read_default_gateway_ip(const char *iface, uint32_t *out_ip);
+
 int32_t dpdk_net_connect(struct dpdk_net_engine *p,
                          const struct dpdk_net_connect_opts_t *opts,
                          dpdk_net_conn_t *out);

@@ -412,8 +412,20 @@ pub struct Engine {
     tx_hdr_mempool: Mempool,
     tx_data_mempool: Mempool,
     our_mac: [u8; 6],
+    /// Current best-known MAC of the configured `cfg.gateway_ip`. Seeded
+    /// from `cfg.gateway_mac` at `Engine::new` (caller may leave it zero
+    /// and let runtime ARP fill it in); mutated *only* by the ARP
+    /// handler when it sees a REPLY / gratuitous announce from the
+    /// gateway. All 10 egress sites read through this cell so a gateway
+    /// failover that changes the peer MAC does not silently black-hole.
+    gateway_mac: Cell<[u8; 6]>,
     pmtu: RefCell<PmtuTable>,
     last_garp_ns: RefCell<u64>,
+    /// Throttle for active gateway-MAC probes (ARP REQUEST when
+    /// `gateway_ip != 0` and `gateway_mac == zero`). Mirrors `last_garp_ns`
+    /// but for the probe side of the learner — prevents a broadcast
+    /// storm if a caller boots the engine before their router is up.
+    last_gw_arp_req_ns: Cell<u64>,
     /// bug_010 → feature: runtime-mutable list of secondary local IPs
     /// (host byte order) the engine accepts as `ConnectOpts.local_addr`.
     /// Seeded from `EngineConfig.secondary_local_ips` at `Engine::new`;
@@ -1001,8 +1013,10 @@ impl Engine {
             tx_hdr_mempool,
             tx_data_mempool,
             our_mac,
+            gateway_mac: Cell::new(cfg.gateway_mac),
             pmtu: RefCell::new(PmtuTable::new()),
             last_garp_ns: RefCell::new(0),
+            last_gw_arp_req_ns: Cell::new(0),
             // bug_010 → feature: clone the Rust-side initial list out of
             // cfg; further mutations (add_local_ip) go through this cell
             // without touching cfg. `cfg.secondary_local_ips` stays
@@ -1547,8 +1561,18 @@ impl Engine {
     pub fn secondary_local_ips(&self) -> Vec<u32> {
         self.secondary_local_ips.borrow().clone()
     }
+    /// Best-known gateway MAC. Seeded from `EngineConfig.gateway_mac`
+    /// and refreshed from inbound ARP replies / gratuitous announces
+    /// for `cfg.gateway_ip`.
     pub fn gateway_mac(&self) -> [u8; 6] {
-        self.cfg.gateway_mac
+        self.gateway_mac.get()
+    }
+
+    /// Update the learned gateway MAC. Slow-path; called from the ARP
+    /// handler via `classify_arp` → `UpdateGatewayMac`. Also used by
+    /// tests to seed the cell without a full engine restart.
+    pub(crate) fn set_gateway_mac(&self, mac: [u8; 6]) {
+        self.gateway_mac.set(mac);
     }
     pub fn gateway_ip(&self) -> u32 {
         self.cfg.gateway_ip
@@ -1750,7 +1774,7 @@ impl Engine {
         let syn_opts = build_connect_syn_opts(recv_buffer_bytes, our_mss, now_ns);
         let seg = SegmentTx {
             src_mac: self.our_mac,
-            dst_mac: self.cfg.gateway_mac,
+            dst_mac: self.gateway_mac.get(),
             src_ip: tuple.local_ip,
             dst_ip: tuple.peer_ip,
             src_port: tuple.local_port,
@@ -1868,6 +1892,7 @@ impl Engine {
             self.advance_timer_wheel();
             self.reap_time_wait();
             self.maybe_emit_gratuitous_arp();
+            self.maybe_probe_gateway_mac();
             // A6 (spec §3.2): drain any data-segment TX batched by
             // timer-driven retransmit paths. No-op on empty ring.
             self.drain_tx_pending_data();
@@ -1951,6 +1976,7 @@ impl Engine {
         self.advance_timer_wheel();
         self.reap_time_wait();
         self.maybe_emit_gratuitous_arp();
+        self.maybe_probe_gateway_mac();
         // A6 (spec §3.2): drain any data-segment TX batched this iter
         // (RX-triggered send_bytes, timer-driven retransmit). Runs
         // after all emit sites so the burst coalesces everything.
@@ -2845,19 +2871,20 @@ impl Engine {
         let Ok(pkt) = arp::arp_decode(payload) else {
             return;
         };
-        if pkt.op == arp::ARP_OP_REQUEST
-            && pkt.target_ip == self.cfg.local_ip
-            && self.cfg.local_ip != 0
-        {
-            let mut buf = [0u8; arp::ARP_FRAME_LEN];
-            if arp::build_arp_reply(self.our_mac, self.cfg.local_ip, &pkt, &mut buf).is_some()
-                && self.tx_frame(&buf)
-            {
-                crate::counters::inc(&self.counters.eth.tx_arp);
+        match arp::classify_arp(&pkt, self.cfg.local_ip, self.cfg.gateway_ip) {
+            arp::ArpAction::None => {}
+            arp::ArpAction::SendReply => {
+                let mut buf = [0u8; arp::ARP_FRAME_LEN];
+                if arp::build_arp_reply(self.our_mac, self.cfg.local_ip, &pkt, &mut buf).is_some()
+                    && self.tx_frame(&buf)
+                {
+                    crate::counters::inc(&self.counters.eth.tx_arp);
+                }
+            }
+            arp::ArpAction::UpdateGatewayMac(mac) => {
+                self.set_gateway_mac(mac);
             }
         }
-        // ARP replies that rewrite gateway MAC would be handled here; for
-        // static-gateway A2 we rely on the configured MAC and do not mutate.
     }
 
     /// Returns TCP payload bytes accepted by the inner `tcp_input` (or 0
@@ -3641,7 +3668,7 @@ impl Engine {
 
         let seg = SegmentTx {
             src_mac: self.our_mac,
-            dst_mac: self.cfg.gateway_mac,
+            dst_mac: self.gateway_mac.get(),
             src_ip: t.local_ip,
             dst_ip: t.peer_ip,
             src_port: t.local_port,
@@ -3703,7 +3730,7 @@ impl Engine {
         let ack = incoming.seq.wrapping_add(incoming.payload.len() as u32);
         let seg = SegmentTx {
             src_mac: self.our_mac,
-            dst_mac: self.cfg.gateway_mac,
+            dst_mac: self.gateway_mac.get(),
             src_ip: t.local_ip,
             dst_ip: t.peer_ip,
             src_port: t.local_port,
@@ -3736,7 +3763,7 @@ impl Engine {
         use crate::tcp_output::{build_segment, SegmentTx, TCP_RST};
         let seg = SegmentTx {
             src_mac: self.our_mac,
-            dst_mac: self.cfg.gateway_mac,
+            dst_mac: self.gateway_mac.get(),
             src_ip: tuple.local_ip,
             dst_ip: tuple.peer_ip,
             src_port: tuple.local_port,
@@ -3780,7 +3807,7 @@ impl Engine {
         };
         let seg = SegmentTx {
             src_mac: self.our_mac,
-            dst_mac: self.cfg.gateway_mac,
+            dst_mac: self.gateway_mac.get(),
             src_ip: tuple.local_ip,
             dst_ip: tuple.peer_ip,
             src_port: tuple.local_port,
@@ -3996,7 +4023,7 @@ impl Engine {
         if self.cfg.local_ip == 0 {
             return Err(Error::PeerUnreachable(peer_ip));
         }
-        if self.cfg.gateway_mac == [0u8; 6] {
+        if self.gateway_mac.get() == [0u8; 6] {
             return Err(Error::PeerUnreachable(peer_ip));
         }
         // bug_010 → feature: resolve per-connection source IP via the
@@ -4257,7 +4284,7 @@ impl Engine {
             };
             let seg = SegmentTx {
                 src_mac: self.our_mac,
-                dst_mac: self.cfg.gateway_mac,
+                dst_mac: self.gateway_mac.get(),
                 src_ip: tuple.local_ip,
                 dst_ip: tuple.peer_ip,
                 src_port: tuple.local_port,
@@ -4584,7 +4611,7 @@ impl Engine {
 
         let seg = SegmentTx {
             src_mac: self.our_mac,
-            dst_mac: self.cfg.gateway_mac,
+            dst_mac: self.gateway_mac.get(),
             src_ip: tuple.local_ip,
             dst_ip: tuple.peer_ip,
             src_port: tuple.local_port,
@@ -4826,7 +4853,7 @@ impl Engine {
         };
         let seg = SegmentTx {
             src_mac: self.our_mac,
-            dst_mac: self.cfg.gateway_mac,
+            dst_mac: self.gateway_mac.get(),
             src_ip: tuple.local_ip,
             dst_ip: tuple.peer_ip,
             src_port: tuple.local_port,
@@ -5095,6 +5122,46 @@ impl Engine {
             crate::counters::inc(&self.counters.eth.tx_arp);
         }
         *last = now;
+    }
+
+    /// Emit an ARP REQUEST for `cfg.gateway_ip` when the learned gateway
+    /// MAC is still zero. Throttled to once per second via
+    /// `last_gw_arp_req_ns`. Runs alongside `maybe_emit_gratuitous_arp`
+    /// on the poll loop so there is exactly one path for discovery
+    /// (driven by the idle/busy ticks) and exactly one path for
+    /// learning (inbound ARP → `handle_arp` → `set_gateway_mac`).
+    ///
+    /// Cheap no-op when:
+    /// * `gateway_ip == 0` — caller didn't configure a gateway.
+    /// * `local_ip == 0` — we don't yet have a source IP to put in the
+    ///   ARP request's sender field; without it the gateway can't reply.
+    /// * `gateway_mac` is already learned (non-zero).
+    fn maybe_probe_gateway_mac(&self) {
+        if self.cfg.gateway_ip == 0
+            || self.cfg.local_ip == 0
+            || self.gateway_mac.get() != [0u8; 6]
+        {
+            return;
+        }
+        const PROBE_INTERVAL_NS: u64 = 1_000_000_000;
+        let now = crate::clock::now_ns();
+        let last = self.last_gw_arp_req_ns.get();
+        if now.saturating_sub(last) < PROBE_INTERVAL_NS {
+            return;
+        }
+        let mut buf = [0u8; arp::ARP_FRAME_LEN];
+        if arp::build_arp_request(
+            self.our_mac,
+            self.cfg.local_ip,
+            self.cfg.gateway_ip,
+            &mut buf,
+        )
+        .is_some()
+            && self.tx_frame(&buf)
+        {
+            crate::counters::inc(&self.counters.eth.tx_arp);
+        }
+        self.last_gw_arp_req_ns.set(now);
     }
 }
 
