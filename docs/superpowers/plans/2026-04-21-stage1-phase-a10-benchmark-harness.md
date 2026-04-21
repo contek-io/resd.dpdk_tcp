@@ -2636,6 +2636,13 @@ git commit -m "a10 task 14: bench-report — CSV → JSON + HTML + Markdown (spe
 **Files:**
 - Create: `scripts/bench-nightly.sh`
 
+**Follow-ups from T9 code review (must land before T15 completes — live capture forces multi-connection pcaps into scope):**
+
+- **T9-I1:** Extract shared L2/L3/L4 parser from `tools/bench-vs-linux/src/normalize.rs`. `discover_pins` (pass 1) and `rewrite_frame` (pass 2) currently duplicate Ethernet + IPv4 + TCP header bounds checks. Any protocol-chain fix (IPv6, VLAN) requires synchronised edits in two places. Factor into `parse_l2l3l4(data) -> Option<FrameOffsets>`.
+- **T9-I2:** Port-reuse across connections in the same pcap is silently miscanonicalised today — `FlowState.iss` is keyed by sorted 4-tuple with no connection-instance discrimination. Live capture (this task's tcpdump orchestration) WILL surface this. Fix options: add SYN-timestamp to pin key, bump a per-SYN instance counter, or at minimum a scope-note.
+- **T9-I5:** Add integration test asserting differing packet counts between local+peer pcaps produces non-zero `diff_bytes` + accurate `local_packets`/`peer_packets` CSV rows.
+- **T9 minor:** `CanonError::MalformedSackOption` for SACK option malformed length; fold two option walkers into one `walk_options<F>(slice, visitor: F)`; extract synth-pcap builder from `tests/normalize_roundtrip.rs` (857 lines) into `tests/common/synth.rs`.
+
 ### Steps
 
 - [ ] **Step 15.1: Write the script**
