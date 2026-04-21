@@ -6,6 +6,7 @@ members = [
     "crates/dpdk-net",
     "tests/ffi-test",
     "tools/bench-rx-zero-copy",
+    "tools/scapy-fuzz-runner",
 ]
 # fuzz/ is a sibling sub-Cargo-project pinned to nightly; kept out of the
 # stable main workspace. See crates/dpdk-net-core/fuzz/rust-toolchain.toml.
