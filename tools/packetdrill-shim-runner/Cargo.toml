@@ -1,0 +1,19 @@
+[package]
+name = "packetdrill-shim-runner"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[features]
+default = []
+# Pass-through; enables dpdk-net's test-server which enables
+# dpdk-net-core's test-server.
+test-server = ["dpdk-net/test-server"]
+
+[dependencies]
+dpdk-net = { path = "../../crates/dpdk-net", default-features = false }
+
+[[bin]]
+name = "pdshim-run-one"
+path = "src/main.rs"

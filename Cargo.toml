@@ -6,6 +6,7 @@ members = [
     "crates/dpdk-net",
     "tests/ffi-test",
     "tools/bench-rx-zero-copy",
+    "tools/packetdrill-shim-runner",
 ]
 
 [workspace.package]
