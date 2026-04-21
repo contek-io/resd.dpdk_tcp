@@ -1,0 +1,48 @@
+# A7 ligurio corpus classifier.
+#
+# Rules evaluated in order. First match wins. Each rule:
+#   - matches_regex: applied to the path relative to
+#     third_party/packetdrill-testcases/
+#   - verdict: "runnable" | "skipped-untranslatable" | "skipped-out-of-scope"
+#   - reason: short string; appears in SKIPPED.md when skipped.
+
+[[rule]]
+matches_regex = ".*/ipv6/.*\\.pkt"
+verdict = "skipped-out-of-scope"
+reason = "IPv4 only in Stage 1"
+
+[[rule]]
+matches_regex = ".*SIGIO.*\\.pkt"
+verdict = "skipped-untranslatable"
+reason = "SIGIO semantics not in test-FFI"
+
+[[rule]]
+matches_regex = ".*FIONREAD.*\\.pkt"
+verdict = "skipped-untranslatable"
+reason = "FIONREAD not in test-FFI"
+
+[[rule]]
+matches_regex = ".*SO_RCVLOWAT.*\\.pkt"
+verdict = "skipped-untranslatable"
+reason = "SO_RCVLOWAT not implemented"
+
+[[rule]]
+matches_regex = ".*MSG_PEEK.*\\.pkt"
+verdict = "skipped-untranslatable"
+reason = "MSG_PEEK not in test-FFI"
+
+[[rule]]
+matches_regex = ".*TCP_DEFER_ACCEPT.*\\.pkt"
+verdict = "skipped-untranslatable"
+reason = "TCP_DEFER_ACCEPT not implemented"
+
+[[rule]]
+matches_regex = ".*TCP_CORK.*\\.pkt"
+verdict = "skipped-untranslatable"
+reason = "TCP_CORK not implemented"
+
+# Default — everything else starts as runnable.
+[[rule]]
+matches_regex = ".*\\.pkt"
+verdict = "runnable"
+reason = ""

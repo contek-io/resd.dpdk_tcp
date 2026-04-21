@@ -13,6 +13,9 @@ test-server = ["dpdk-net/test-server"]
 
 [dependencies]
 dpdk-net = { path = "../../crates/dpdk-net", default-features = false }
+regex = "1"
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
 
 [dev-dependencies]
 # A7 Task 12: the two shim direct self-tests (shim_inject_drain_roundtrip
@@ -22,6 +25,7 @@ dpdk-net = { path = "../../crates/dpdk-net", default-features = false }
 # clock::set_virt_ns, test_tx_intercept, test_server::test_packet); the
 # runner crate otherwise only depends on the `dpdk-net` C-ABI facade.
 dpdk-net-core = { path = "../../crates/dpdk-net-core" }
+walkdir = "2"
 
 [[bin]]
 name = "pdshim-run-one"
