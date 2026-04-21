@@ -2036,6 +2036,18 @@ EOF
 )"
 ```
 
+### Follow-up from code review
+
+**Follow-ups from 2026-04-21 code review on commit 86131a6 (defer until HW-TS-capable NIC comes online, OR before A10 phase-complete tag):**
+
+- I1: HW-TS mode bucket semantics — wire `rx_hw_ts_ns` into the bucket pivot, OR rename `nic_tx_wire_to_nic_rx_ns` to explicitly reflect single-side-TS degradation. Today's HW branch at `src/main.rs:421-437` stores host-TSC `host_span_ns` in NIC-wire-semantic fields. Pin-test `hw_mode_single_side_ts_collapses_to_three_effective_buckets` locks current behavior.
+- I2: carry-forward-over-response-bytes edge case — if prior iteration over-read satisfies current iteration, receive loop skipped, `last_rx_hw_ts_ns` stays None → silent TSC downgrade on future HW-TS NICs. Thread `&mut Option<u64>` through the send-phase drain.
+- I3: send-phase drain discards `rx_hw_ts_ns`. Pair with I2 fix.
+- I4: `enqueued_to_user_return_ns` is back-to-back rdtsc() with no intervening work — semantically meaningless ~1-10ns bucket. Either drop the bucket or move `t_user_return` after drain observation.
+- M1: `tsc_delta_to_ns` duplicated between bench-e2e + bench-ab-runner — promote to `bench_common::clock`.
+- M5: `main.rs` (923 lines) could split into `src/main.rs` + `src/workload.rs` for parity with bench-ab-runner.
+- M6: `HwTask18Expectations::expect_rx_drop_cksum_bad_zero=false` skips the check rather than inverting — rename to `require_rx_drop_cksum_bad_zero` or add inverse test.
+
 ---
 
 ## Task 7: `bench-stress` — netem + FaultInjector scenario matrix

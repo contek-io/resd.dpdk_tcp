@@ -31,6 +31,7 @@
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <pthread.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -65,6 +66,10 @@ int main(int argc, char **argv) {
         fprintf(stderr, "invalid port: %s\n", argv[1]);
         return 1;
     }
+    /* Ignore SIGPIPE so a write() to a half-closed or dead peer socket
+     * returns EPIPE on the offending thread instead of terminating the
+     * whole server process and dropping every concurrent connection. */
+    signal(SIGPIPE, SIG_IGN);
     int s = socket(AF_INET, SOCK_STREAM, 0);
     if (s < 0) {
         perror("socket");

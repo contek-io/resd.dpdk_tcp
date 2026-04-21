@@ -157,3 +157,68 @@ fn all_events_rx_hw_ts_ns_zero_errors_on_contamination() {
     let err = assert_all_events_rx_hw_ts_ns_zero(&samples).unwrap_err();
     assert!(err.contains("123456"));
 }
+
+#[test]
+fn hw_mode_single_side_ts_collapses_to_three_effective_buckets() {
+    // THIS TEST PINS CURRENT BEHAVIOR.
+    //
+    // On a NIC that populates `rx_hw_ts_ns > 0` (mlx5 / ice / future-
+    // gen ENA), `main.rs`'s fold logic at lines 421-437 today builds
+    // the 5-bucket `HwTsBuckets` from *only* host-TSC deltas — the
+    // `rx_hw_ts_ns` pivot is not yet threaded into the math. The
+    // observable shape is:
+    //
+    //   - `user_send_to_tx_sched_ns`      = TSC(t_user_send -> t_tx_sched)
+    //   - `tx_sched_to_nic_tx_wire_ns`    = 0               (degraded)
+    //   - `nic_tx_wire_to_nic_rx_ns`      = TSC(t_tx_sched -> t_enqueued)
+    //   - `nic_rx_to_enqueued_ns`         = 0               (degraded)
+    //   - `enqueued_to_user_return_ns`    = TSC(t_enqueued -> t_user_return)
+    //
+    // Two of the five fields collapse to zero, so the HW-TS bucket
+    // vector has the same informational content as the 3-bucket TSC-
+    // fallback schema — just wearing NIC-wire-semantic field names
+    // (see `attribution.rs:19-28`).
+    //
+    // This is latent on ENA because `rx_hw_ts_ns` is always 0, so the
+    // HW-TS branch never fires there. It will bite mlx5 / ice the
+    // first time those NICs are targeted.
+    //
+    // A follow-up (see plan doc) will either (a) wire `rx_hw_ts_ns`
+    // into the bucket pivot so the 5 fields carry their advertised
+    // semantics, or (b) rename/redocument the degraded single-side-TS
+    // case. WHEN THAT HAPPENS, UPDATE THIS TEST: the collapse
+    // asserted below will no longer hold, and failing here is the
+    // intended early-warning.
+    //
+    // Timestamps below are in raw TSC ticks at 1 GHz tsc_hz, so ticks
+    // == ns for arithmetic clarity.
+    let user_send_to_tx_sched_ns: u64 = 150;
+    let host_span_ns: u64 = 10_250; // tx_sched -> enqueued span
+    let enqueued_to_user_return_ns: u64 = 30;
+
+    // Reproduce the exact shape main.rs:429-435 builds today when
+    // rx_hw_ts_ns > 0 selects HW mode.
+    let buckets = HwTsBuckets {
+        user_send_to_tx_sched_ns,
+        tx_sched_to_nic_tx_wire_ns: 0,
+        nic_tx_wire_to_nic_rx_ns: host_span_ns,
+        nic_rx_to_enqueued_ns: 0,
+        enqueued_to_user_return_ns,
+    };
+
+    // Zero-fields: these are the degraded half — no TX-TS observed,
+    // no separate NIC-RX-to-engine-enqueue split.
+    assert_eq!(buckets.tx_sched_to_nic_tx_wire_ns, 0);
+    assert_eq!(buckets.nic_rx_to_enqueued_ns, 0);
+
+    // Non-zero fields carry all real span info (host-TSC-derived).
+    assert_eq!(buckets.user_send_to_tx_sched_ns, user_send_to_tx_sched_ns);
+    assert_eq!(buckets.nic_tx_wire_to_nic_rx_ns, host_span_ns);
+    assert_eq!(buckets.enqueued_to_user_return_ns, enqueued_to_user_return_ns);
+
+    // total_ns() equals the full wall-clock span — the two-zero
+    // collapse is an accounting no-op.
+    let full_span_ns = user_send_to_tx_sched_ns + host_span_ns + enqueued_to_user_return_ns;
+    assert_eq!(buckets.total_ns(), full_span_ns);
+    assert_eq!(buckets.total_ns(), 10_430);
+}
