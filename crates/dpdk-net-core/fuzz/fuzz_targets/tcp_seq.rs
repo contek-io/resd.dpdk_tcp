@@ -12,7 +12,14 @@ fuzz_target!(|data: &[u8]| {
         let _c = u32::from_le_bytes([chunk[8], chunk[9], chunk[10], chunk[11]]);
 
         // Asymmetry
-        assert!(!(seq_lt(a, b) && seq_lt(b, a)));
+        // RFC 1982 / RFC 9293 §3.4: the wrap-safe comparator is UNDEFINED at the
+        // exact 2^31 antipode (|a - b| == 0x8000_0000) because a - b and b - a
+        // both reinterpret to i32::MIN (negative). Exclude that case from the
+        // asymmetry invariant — callers avoid this regime by staying within a
+        // 2^31 window, which is the protocol's window-size ceiling.
+        if a.wrapping_sub(b) != 0x8000_0000 {
+            assert!(!(seq_lt(a, b) && seq_lt(b, a)));
+        }
         // lt ⇒ le
         if seq_lt(a, b) { assert!(seq_le(a, b)); }
         // Reflexivity

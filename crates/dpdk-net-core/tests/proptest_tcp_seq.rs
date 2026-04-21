@@ -28,9 +28,13 @@ proptest! {
     }
 
     /// Asymmetry: a < b and b < a cannot both hold.
+    /// Excludes the 2^31 antipode where the RFC 1982 / RFC 9293 §3.4
+    /// wrap-safe comparator is undefined (both diffs reinterpret to i32::MIN).
     #[test]
     fn lt_asymmetric(a: u32, b: u32) {
-        prop_assert!(!(seq_lt(a, b) && seq_lt(b, a)));
+        if a.wrapping_sub(b) != 0x8000_0000 {
+            prop_assert!(!(seq_lt(a, b) && seq_lt(b, a)));
+        }
     }
 
     /// in_window boundary: seq in [start, start+len) mod 2^32.
