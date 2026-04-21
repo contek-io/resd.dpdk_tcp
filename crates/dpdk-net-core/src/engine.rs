@@ -537,6 +537,20 @@ pub struct Engine {
     /// PMDs every slot is `None` and `scrape_xstats` is a cheap no-op.
     /// Slow-path only; not on any hot path.
     xstat_map: crate::ena_xstats::XstatMap,
+
+    /// A7 Task 5: test-server listen-slot table. RefCell because engine
+    /// internal methods (including `tcp_input`) take `&self`, following
+    /// the pre-existing single-lcore + interior-mutability pattern.
+    /// Feature-gated so the default-build engine never carries the
+    /// allocation.
+    #[cfg(feature = "test-server")]
+    listen_slots: std::cell::RefCell<
+        Vec<(crate::test_server::ListenHandle, crate::test_server::ListenSlot)>,
+    >,
+    /// A7 Task 5: next listen-handle to hand out. Starts at 1 so callers
+    /// can treat `0` as a sentinel; overflow returns `Error::InvalidArgument`.
+    #[cfg(feature = "test-server")]
+    next_listen_id: std::cell::Cell<crate::test_server::ListenHandle>,
 }
 
 /// A4: map an `Outcome` to per-segment `TcpCounters` bumps. Pure slow-path
@@ -877,66 +891,92 @@ impl Engine {
         // `dpdk_consts.rs` for the `RTE_ETH_TX_OFFLOAD_MULTI_SEGS` bit
         // position (DPDK stable ethdev ABI) and spec §4 for the outcome
         // structure.
-        let outcome = Self::configure_port_offloads(&cfg, &counters)?;
+        //
+        // A7 Task 5: when the caller passes `port_id == u16::MAX`, the
+        // entire port-setup block short-circuits to a zeroed
+        // `PortConfigOutcome` + a synthetic MAC. No DPDK port/queue/start
+        // calls are issued. `test-server`-only — production builds never
+        // take this branch. Mempools + counters above are untouched so
+        // `tx_tcp_frame`'s mbuf-alloc and `inject_rx_frame`'s RX-mbuf
+        // alloc still work normally.
+        #[cfg(feature = "test-server")]
+        let test_server_bypass_port = cfg.port_id == u16::MAX;
+        #[cfg(not(feature = "test-server"))]
+        let test_server_bypass_port = false;
 
-        let rc = unsafe {
-            sys::rte_eth_rx_queue_setup(
-                cfg.port_id,
-                cfg.rx_queue_id,
-                cfg.rx_ring_size,
-                socket_id_u,
-                std::ptr::null(),
-                rx_mempool.as_ptr(),
-            )
+        let outcome = if test_server_bypass_port {
+            PortConfigOutcome {
+                applied_rx_offloads: 0,
+                applied_tx_offloads: 0,
+                tx_cksum_offload_active: false,
+                rx_cksum_offload_active: false,
+                rss_hash_offload_active: false,
+                driver_name: [0u8; 32],
+            }
+        } else {
+            Self::configure_port_offloads(&cfg, &counters)?
         };
-        if rc < 0 {
-            return Err(Error::RxQueueSetup(cfg.port_id, unsafe {
-                sys::shim_rte_errno()
-            }));
-        }
 
-        let rc = unsafe {
-            sys::rte_eth_tx_queue_setup(
+        if !test_server_bypass_port {
+            let rc = unsafe {
+                sys::rte_eth_rx_queue_setup(
+                    cfg.port_id,
+                    cfg.rx_queue_id,
+                    cfg.rx_ring_size,
+                    socket_id_u,
+                    std::ptr::null(),
+                    rx_mempool.as_ptr(),
+                )
+            };
+            if rc < 0 {
+                return Err(Error::RxQueueSetup(cfg.port_id, unsafe {
+                    sys::shim_rte_errno()
+                }));
+            }
+
+            let rc = unsafe {
+                sys::rte_eth_tx_queue_setup(
+                    cfg.port_id,
+                    cfg.tx_queue_id,
+                    cfg.tx_ring_size,
+                    socket_id_u,
+                    std::ptr::null(),
+                )
+            };
+            if rc < 0 {
+                return Err(Error::TxQueueSetup(cfg.port_id, unsafe {
+                    sys::shim_rte_errno()
+                }));
+            }
+
+            // A-HW Task 12 fixup: LLQ verification reads the verdict that
+            // `eal_init` recorded at `rte_eal_init` time. The capture window
+            // must wrap EAL init — the ENA PMD emits the "Placement policy:
+            // …" marker during `eth_ena_dev_init` (PCI probe, inside
+            // `rte_eal_init`), NOT inside `rte_eth_dev_start`. No local
+            // capture machinery is needed here. See spec §5 and
+            // `crate::llq_verify` for marker pinning.
+            let rc = unsafe { sys::rte_eth_dev_start(cfg.port_id) };
+            if rc < 0 {
+                return Err(Error::PortStart(cfg.port_id, unsafe {
+                    sys::shim_rte_errno()
+                }));
+            }
+
+            #[cfg(feature = "hw-verify-llq")]
+            crate::llq_verify::verify_llq_activation_from_global(
                 cfg.port_id,
-                cfg.tx_queue_id,
-                cfg.tx_ring_size,
-                socket_id_u,
-                std::ptr::null(),
-            )
-        };
-        if rc < 0 {
-            return Err(Error::TxQueueSetup(cfg.port_id, unsafe {
-                sys::shim_rte_errno()
-            }));
-        }
+                &outcome.driver_name,
+                &counters,
+            )?;
 
-        // A-HW Task 12 fixup: LLQ verification reads the verdict that
-        // `eal_init` recorded at `rte_eal_init` time. The capture window
-        // must wrap EAL init — the ENA PMD emits the "Placement policy:
-        // …" marker during `eth_ena_dev_init` (PCI probe, inside
-        // `rte_eal_init`), NOT inside `rte_eth_dev_start`. No local
-        // capture machinery is needed here. See spec §5 and
-        // `crate::llq_verify` for marker pinning.
-        let rc = unsafe { sys::rte_eth_dev_start(cfg.port_id) };
-        if rc < 0 {
-            return Err(Error::PortStart(cfg.port_id, unsafe {
-                sys::shim_rte_errno()
-            }));
-        }
-
-        #[cfg(feature = "hw-verify-llq")]
-        crate::llq_verify::verify_llq_activation_from_global(
-            cfg.port_id,
-            &outcome.driver_name,
-            &counters,
-        )?;
-
-        // A-HW: RSS reta program. No-op when feature off OR when
-        // the latch is false OR when dev_info.reta_size == 0.
-        if outcome.rss_hash_offload_active {
-            let mut dev_info_post: sys::rte_eth_dev_info = unsafe { std::mem::zeroed() };
-            let _ = unsafe { sys::rte_eth_dev_info_get(cfg.port_id, &mut dev_info_post) };
-            Self::program_rss_reta_single_queue(cfg.port_id, &dev_info_post)?;
+            // A-HW: RSS reta program. No-op when feature off OR when
+            // the latch is false OR when dev_info.reta_size == 0.
+            if outcome.rss_hash_offload_active {
+                let mut dev_info_post: sys::rte_eth_dev_info = unsafe { std::mem::zeroed() };
+                let _ = unsafe { sys::rte_eth_dev_info_get(cfg.port_id, &mut dev_info_post) };
+                Self::program_rss_reta_single_queue(cfg.port_id, &dev_info_post)?;
+            }
         }
 
         // A-HW Task 10: RX timestamp dynfield/dynflag lookup. Runs after
@@ -980,15 +1020,24 @@ impl Engine {
         };
 
         // Read NIC MAC via the shim. `rte_ether_addr` is a 6-byte packed struct.
-        let mut mac_addr: sys::rte_ether_addr = unsafe { std::mem::zeroed() };
-        let rc = unsafe { sys::shim_rte_eth_macaddr_get(cfg.port_id, &mut mac_addr) };
-        if rc != 0 {
-            return Err(Error::MacAddrLookup(cfg.port_id, unsafe {
-                sys::shim_rte_errno()
-            }));
-        }
-        // bindgen names the field `addr_bytes` on rte_ether_addr.
-        let our_mac = mac_addr.addr_bytes;
+        //
+        // A7 Task 5: when `test_server_bypass_port` is set (port_id = u16::MAX),
+        // skip the DPDK call and synthesize a stable test-harness MAC — the
+        // port is virtual, the TX-intercept bypasses `rte_eth_tx_burst`, and
+        // the MAC only needs to be stable for L2 builder/tx-frame comparison.
+        let our_mac = if test_server_bypass_port {
+            [0x02, 0x00, 0x00, 0x00, 0x00, 0x01]
+        } else {
+            let mut mac_addr: sys::rte_ether_addr = unsafe { std::mem::zeroed() };
+            let rc = unsafe { sys::shim_rte_eth_macaddr_get(cfg.port_id, &mut mac_addr) };
+            if rc != 0 {
+                return Err(Error::MacAddrLookup(cfg.port_id, unsafe {
+                    sys::shim_rte_errno()
+                }));
+            }
+            // bindgen names the field `addr_bytes` on rte_ether_addr.
+            mac_addr.addr_bytes
+        };
 
         // A-HW+ Task 5: resolve ENA xstat name→ID map once at
         // engine_create. Scraped later per-call via `scrape_xstats`.
@@ -1067,6 +1116,10 @@ impl Engine {
             xstat_map,
             rtt_histogram_edges,
             cfg,
+            #[cfg(feature = "test-server")]
+            listen_slots: std::cell::RefCell::new(Vec::new()),
+            #[cfg(feature = "test-server")]
+            next_listen_id: std::cell::Cell::new(1),
         })
     }
 
@@ -3197,6 +3250,34 @@ impl Engine {
                 .lookup_by_hash(&tuple, bucket_hash)
         };
         let Some(handle) = handle else {
+            // A7 Task 5: before declaring the segment unmatched, check if
+            // it is a SYN-only packet destined for a LISTEN slot. If so,
+            // route it into the passive-open handler which allocates a
+            // fresh SYN_RCVD conn and emits a SYN-ACK. Feature-gated so
+            // the default build preserves the existing strict "RST any
+            // unmatched segment" behavior byte-for-byte.
+            #[cfg(feature = "test-server")]
+            {
+                use crate::tcp_output::{TCP_ACK, TCP_SYN};
+                let is_syn_only =
+                    (parsed.flags & TCP_SYN) != 0 && (parsed.flags & TCP_ACK) == 0;
+                if is_syn_only {
+                    if let Some(listen_h) = self.match_listen_slot(ip.dst_ip, tuple.local_port) {
+                        inc(&self.counters.tcp.rx_syn_ack); // peer SYN observed
+                        let parsed_opts = crate::tcp_options::parse_options(parsed.options)
+                            .unwrap_or_default();
+                        let _ = self.handle_inbound_syn_listen(
+                            listen_h,
+                            ip.src_ip,
+                            tuple.peer_port,
+                            parsed.seq,
+                            parsed_opts,
+                            crate::clock::now_ns(),
+                        );
+                        return 0;
+                    }
+                }
+            }
             // Unmatched: reply RST per spec §5.1 `reply_rst`.
             inc(&self.counters.tcp.rx_unmatched);
             self.send_rst_unmatched(&tuple, &parsed);
@@ -3576,6 +3657,12 @@ impl Engine {
         }
 
         if outcome.connected {
+            // A7 Task 5: promote the handshake owner from `in_progress`
+            // to `accept_queue` on its matching listen slot. Safe to call
+            // even for the active-open path: if no listen slot references
+            // this conn (the client case), the helper is a no-op.
+            #[cfg(feature = "test-server")]
+            self.listen_promote_to_accept_queue(handle);
             self.events.borrow_mut().push(
                 InternalEvent::Connected {
                     conn: handle,
@@ -5229,12 +5316,287 @@ impl Engine {
 
 impl Drop for Engine {
     fn drop(&mut self) {
+        // A7 Task 5: the test-server rig passes `port_id == u16::MAX`
+        // and `Engine::new` bypasses the queue-setup + dev_start block.
+        // Calling dev_stop / dev_close on a port that was never started
+        // would log noise at best and crash bindgen shims at worst.
+        if self.cfg.port_id == u16::MAX {
+            return;
+        }
         // Safety: we previously started the port; stop and close on drop.
         unsafe {
             sys::rte_eth_dev_stop(self.cfg.port_id);
             sys::rte_eth_dev_close(self.cfg.port_id);
         }
         // Mempools drop via their own Drop impl.
+    }
+}
+
+// A7 Task 5: test-server-only Engine API surface. All methods behind
+// `feature = "test-server"` so the default build has NO server-side
+// passive-open code. Mirror pattern to `test_tx_intercept` (T4).
+#[cfg(feature = "test-server")]
+impl Engine {
+    /// Create a listen slot for (ip, port). Duplicates return
+    /// `Error::InvalidArgument`. Next-id overflow likewise.
+    pub fn listen(
+        &self,
+        ip: u32,
+        port: u16,
+    ) -> Result<crate::test_server::ListenHandle, crate::Error> {
+        let mut slots = self.listen_slots.borrow_mut();
+        if slots.iter().any(|(_, s)| s.local_ip == ip && s.local_port == port) {
+            return Err(crate::Error::InvalidArgument);
+        }
+        let h = self.next_listen_id.get();
+        let next = h.checked_add(1).ok_or(crate::Error::InvalidArgument)?;
+        self.next_listen_id.set(next);
+        slots.push((h, crate::test_server::ListenSlot::new(ip, port)));
+        Ok(h)
+    }
+
+    /// Pop the accept queue (capacity 1) for this listen handle.
+    /// Returns `None` if the handle is unknown OR nothing is queued.
+    pub fn accept_next(
+        &self,
+        h: crate::test_server::ListenHandle,
+    ) -> Option<crate::flow_table::ConnHandle> {
+        let mut slots = self.listen_slots.borrow_mut();
+        let slot = slots.iter_mut().find(|(k, _)| *k == h)?;
+        slot.1.accept_queue.take()
+    }
+
+    /// Snapshot a conn's TCP state; `None` if the handle is unknown.
+    pub fn state_of(
+        &self,
+        h: crate::flow_table::ConnHandle,
+    ) -> Option<crate::tcp_state::TcpState> {
+        self.flow_table.borrow().get(h).map(|c| c.state)
+    }
+
+    /// A7 Task 5: inject a single Ethernet-framed bytes buffer into the
+    /// engine's RX pipeline. Allocates an mbuf from the RX mempool, copies
+    /// the caller's frame bytes in, and invokes `rx_frame` on it (same
+    /// entry point `poll_once` drives with NIC-sourced mbufs). Does NOT
+    /// call `poll_once` itself — callers that need the end-of-poll drains
+    /// (timer wheel, ARP, pending-data) must call `poll_once` separately.
+    pub fn inject_rx_frame(&self, frame: &[u8]) -> Result<(), crate::Error> {
+        if frame.len() > u16::MAX as usize {
+            return Err(crate::Error::TooManyConns); // closest-existing no-memory signal
+        }
+        let m = unsafe { sys::shim_rte_pktmbuf_alloc(self._rx_mempool.as_ptr()) };
+        if m.is_null() {
+            return Err(crate::Error::TooManyConns);
+        }
+        let dst = unsafe { sys::shim_rte_pktmbuf_append(m, frame.len() as u16) };
+        if dst.is_null() {
+            unsafe { sys::shim_rte_pktmbuf_free(m) };
+            return Err(crate::Error::TooManyConns);
+        }
+        // Safety: `dst` covers frame.len() writable bytes inside the mbuf.
+        unsafe {
+            std::ptr::copy_nonoverlapping(frame.as_ptr(), dst as *mut u8, frame.len());
+        }
+        // Matches poll_once: the RX path reads a byte slice (via
+        // `mbuf_data_slice`) and hands the mbuf pointer through for the
+        // OOO reorder path. We skip the HW timestamp / ol_flags / RSS
+        // reads — test-server has no NIC to provide them.
+        let bytes = unsafe { crate::mbuf_data_slice(m) };
+        // The bytes slice borrows the mbuf's data; the rx_frame chain
+        // holds it for the duration of the call.
+        let rx_mbuf = std::ptr::NonNull::new(m);
+        let _ = self.rx_frame(bytes, 0, 0, 0, rx_mbuf);
+        // Free the RX mbuf ref; if OOO-insert up-bumped the refcount
+        // (parallel to poll_once's behavior), the reorder queue still
+        // holds a live ref and the mbuf survives until drained.
+        unsafe { sys::shim_rte_pktmbuf_free(m) };
+        Ok(())
+    }
+
+    /// A7 Task 5: find the listen handle whose local (ip, port) matches.
+    /// `tcp_input`'s passive-open fast-path dispatches to this before the
+    /// 4-tuple flow-table lookup so stray SYNs for LISTEN endpoints don't
+    /// fall into the send_rst_unmatched path.
+    pub(crate) fn match_listen_slot(
+        &self,
+        dst_ip: u32,
+        dst_port: u16,
+    ) -> Option<crate::test_server::ListenHandle> {
+        self.listen_slots
+            .borrow()
+            .iter()
+            .find(|(_, s)| s.local_ip == dst_ip && s.local_port == dst_port)
+            .map(|(h, _)| *h)
+    }
+
+    /// A7 Task 5: inbound SYN landing on a LISTEN slot. Rejects (RST+ACK)
+    /// when the slot already has an in-progress handshake OR a queued
+    /// accept. Otherwise allocates a SYN_RCVD conn + emits SYN-ACK.
+    pub(crate) fn handle_inbound_syn_listen(
+        &self,
+        listen_h: crate::test_server::ListenHandle,
+        peer_ip: u32,
+        peer_port: u16,
+        iss_peer: u32,
+        opts: crate::tcp_options::TcpOpts,
+        now_ns: u64,
+    ) -> Result<(), crate::Error> {
+        let (local_ip, local_port, full) = {
+            let slots = self.listen_slots.borrow();
+            let s = slots
+                .iter()
+                .find(|(k, _)| *k == listen_h)
+                .ok_or(crate::Error::InvalidArgument)?;
+            let full = s.1.accept_queue.is_some() || s.1.in_progress.is_some();
+            (s.1.local_ip, s.1.local_port, full)
+        };
+        if full {
+            self.emit_rst_for_unsolicited_syn(peer_ip, peer_port, local_ip, local_port, iss_peer);
+            return Ok(());
+        }
+        let tuple = crate::flow_table::FourTuple {
+            local_ip,
+            local_port,
+            peer_ip,
+            peer_port,
+        };
+        let conn = crate::tcp_conn::TcpConn::new_passive(
+            tuple,
+            iss_peer,
+            opts,
+            self.cfg.tcp_mss as u16,
+            now_ns,
+            self.cfg.recv_buffer_bytes,
+            self.cfg.send_buffer_bytes,
+            self.cfg.tcp_min_rto_us,
+            self.cfg.tcp_initial_rto_us,
+            self.cfg.tcp_max_rto_us,
+        );
+        let h = self
+            .flow_table
+            .borrow_mut()
+            .insert(conn)
+            .ok_or(crate::Error::TooManyConns)?;
+        {
+            let mut slots = self.listen_slots.borrow_mut();
+            let slot = slots
+                .iter_mut()
+                .find(|(k, _)| *k == listen_h)
+                .expect("listen slot disappeared between lookups");
+            slot.1.in_progress = Some(h);
+        }
+        self.emit_syn_ack_for_passive(h);
+        // SYN-ACK consumes one seq space; bump snd_nxt now so the final
+        // ACK we expect carries `ack = iss + 1`.
+        {
+            let mut ft = self.flow_table.borrow_mut();
+            if let Some(c) = ft.get_mut(h) {
+                c.snd_nxt = c.snd_nxt.wrapping_add(1);
+            }
+        }
+        Ok(())
+    }
+
+    /// Build + tx the SYN-ACK for a SYN_RCVD conn. Mirrors `emit_syn`
+    /// (active side) but flips the flag set to `SYN|ACK` and fills
+    /// `ack = rcv_nxt` (peer's iss + 1).
+    fn emit_syn_ack_for_passive(&self, handle: crate::flow_table::ConnHandle) {
+        use crate::counters::inc;
+        use crate::tcp_output::{build_segment, SegmentTx, TCP_ACK, TCP_SYN};
+        let (tuple, iss_us, ack_val, our_mss, recv_buffer_bytes, now_ns) = {
+            let ft = self.flow_table.borrow();
+            let Some(c) = ft.get(handle) else {
+                return;
+            };
+            (
+                c.four_tuple(),
+                c.iss,
+                c.rcv_nxt,
+                c.peer_mss,
+                self.cfg.recv_buffer_bytes,
+                crate::clock::now_ns(),
+            )
+        };
+        let syn_opts = build_connect_syn_opts(recv_buffer_bytes, our_mss, now_ns);
+        let seg = SegmentTx {
+            src_mac: self.our_mac,
+            dst_mac: self.cfg.gateway_mac,
+            src_ip: tuple.local_ip,
+            dst_ip: tuple.peer_ip,
+            src_port: tuple.local_port,
+            dst_port: tuple.peer_port,
+            seq: iss_us,
+            ack: ack_val,
+            flags: TCP_SYN | TCP_ACK,
+            window: u16::MAX, // pre-WS-negotiation; mirrors active SYN-out.
+            options: syn_opts,
+            payload: &[],
+        };
+        let mut buf = [0u8; 128];
+        let Some(n) = build_segment(&seg, &mut buf) else {
+            return;
+        };
+        if self.tx_tcp_frame(&buf[..n], &seg) {
+            inc(&self.counters.tcp.tx_syn);
+        }
+    }
+
+    /// Reject an unsolicited SYN (accept-queue-full / in-progress clash)
+    /// with RST+ACK per RFC 9293 §3.10.7.1. No conn slot is allocated;
+    /// the frame is built inline from the segment-level info the caller
+    /// already has.
+    fn emit_rst_for_unsolicited_syn(
+        &self,
+        peer_ip: u32,
+        peer_port: u16,
+        local_ip: u32,
+        local_port: u16,
+        iss_peer: u32,
+    ) {
+        use crate::counters::inc;
+        use crate::tcp_output::{build_segment, SegmentTx, TCP_ACK, TCP_RST};
+        let seg = SegmentTx {
+            src_mac: self.our_mac,
+            dst_mac: self.cfg.gateway_mac,
+            src_ip: local_ip,
+            dst_ip: peer_ip,
+            src_port: local_port,
+            dst_port: peer_port,
+            seq: 0,
+            // RFC 9293 §3.10.7.1 — reply to a SYN w/ RST+ACK carrying
+            // ack = seg.seq + 1 (the SYN consumes one seq).
+            ack: iss_peer.wrapping_add(1),
+            flags: TCP_RST | TCP_ACK,
+            window: 0,
+            options: crate::tcp_options::TcpOpts::default(),
+            payload: &[],
+        };
+        let mut buf = [0u8; 64];
+        let Some(n) = build_segment(&seg, &mut buf) else {
+            return;
+        };
+        if self.tx_tcp_frame(&buf[..n], &seg) {
+            inc(&self.counters.tcp.tx_rst);
+        }
+    }
+
+    /// A7 Task 5: promote an in-progress SYN_RCVD conn to the accept
+    /// queue once its final ACK lands. Called from `tcp_input` AFTER
+    /// `dispatch` has run and transitioned the state to ESTABLISHED —
+    /// this helper just moves the handle from `in_progress` to
+    /// `accept_queue` on the matching listen slot.
+    pub(crate) fn listen_promote_to_accept_queue(
+        &self,
+        handle: crate::flow_table::ConnHandle,
+    ) {
+        let mut slots = self.listen_slots.borrow_mut();
+        for (_, slot) in slots.iter_mut() {
+            if slot.in_progress == Some(handle) {
+                slot.in_progress = None;
+                slot.accept_queue = Some(handle);
+                return;
+            }
+        }
     }
 }
 

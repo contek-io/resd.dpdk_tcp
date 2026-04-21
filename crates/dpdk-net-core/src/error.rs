@@ -53,6 +53,14 @@ pub enum Error {
     /// Mapped to `-EINVAL` at the FFI boundary (`dpdk_net_connect`).
     #[error("invalid local source IP for connect: {0:#x}")]
     InvalidLocalAddr(u32),
+    /// A7 (test-server): `Engine::listen`, `accept_next`, or a related
+    /// test-server FFI got an argument that fails validation — duplicate
+    /// (ip,port), listen-id overflow, unknown listen handle, etc.
+    /// Never exists on a default build — the variant is only constructed
+    /// under `feature = "test-server"`.
+    #[cfg(feature = "test-server")]
+    #[error("invalid argument")]
+    InvalidArgument,
 }
 
 #[cfg(test)]

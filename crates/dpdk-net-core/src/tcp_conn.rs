@@ -433,6 +433,99 @@ impl TcpConn {
         }
     }
 
+    /// A7 Task 5: construct a server-side connection in SYN_RCVD from a
+    /// freshly-arrived inbound SYN. Mirrors `new_client` but:
+    ///   - state is `SynReceived` (not Closed),
+    ///   - `iss` is ours (derived by the caller via `IssGen::next`); peer's
+    ///     iss lands in `irs`,
+    ///   - `rcv_nxt = iss_peer + 1` (SYN consumes one seq),
+    ///   - `snd_una = snd_nxt = iss` (caller bumps snd_nxt by 1 after TX'ing
+    ///     the SYN-ACK, mirroring the active path's post-TX bump),
+    ///   - peer options are absorbed from the SYN's `TcpOpts` so the
+    ///     later ESTABLISHED transition doesn't need a second parse.
+    ///
+    /// Behind `feature = "test-server"`: there is no production code path
+    /// that builds a passive-open conn today (A6.6 is client-only).
+    #[cfg(feature = "test-server")]
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_passive(
+        tuple: FourTuple,
+        iss_peer: u32,
+        opts: crate::tcp_options::TcpOpts,
+        our_mss: u16,
+        now_ns: u64,
+        recv_buf_bytes: u32,
+        send_buf_bytes: u32,
+        min_rto_us: u32,
+        initial_rto_us: u32,
+        max_rto_us: u32,
+    ) -> Self {
+        let _ = now_ns; // reserved for future PAWS/ISS-seeding uses
+        // A7: the caller supplies ISS via the engine's IssGen. We mirror
+        // `new_client`'s seed at iss=0 and let the caller overwrite if
+        // desired — but we accept the peer's iss + 1 directly here.
+        let iss: u32 = 0;
+        let rcv_wnd = recv_buf_bytes.min(u16::MAX as u32);
+        Self {
+            four_tuple: tuple,
+            state: TcpState::SynReceived,
+            snd_una: iss,
+            snd_nxt: iss,
+            snd_wnd: 0,
+            snd_wl1: 0,
+            snd_wl2: 0,
+            iss,
+            rcv_nxt: iss_peer.wrapping_add(1),
+            rcv_wnd,
+            irs: iss_peer,
+            peer_mss: opts.mss.unwrap_or(our_mss),
+            ws_shift_out: 0,
+            ws_shift_in: opts.wscale.unwrap_or(0).min(14),
+            ts_enabled: opts.timestamps.is_some(),
+            ts_recent: opts.timestamps.map(|(tsval, _)| tsval).unwrap_or(0),
+            ts_recent_age: if opts.timestamps.is_some() {
+                crate::clock::now_ns()
+            } else {
+                0
+            },
+            sack_enabled: opts.sack_permitted,
+            sack_scoreboard: crate::tcp_sack::SackScoreboard::new(),
+            snd: SendQueue::new(send_buf_bytes),
+            recv: RecvQueue::new(recv_buf_bytes),
+            our_fin_seq: None,
+            time_wait_deadline_ns: None,
+            last_advertised_wnd: None,
+            last_sack_trigger: None,
+            timer_ids: Vec::with_capacity(32),
+            snd_retrans: crate::tcp_retrans::SendRetrans::with_capacity(
+                (send_buf_bytes / our_mss.max(1) as u32 + 1) as usize,
+            ),
+            rtt_est: crate::tcp_rtt::RttEstimator::new(min_rto_us, initial_rto_us, max_rto_us),
+            rto_timer_id: None,
+            tlp_timer_id: None,
+            syn_retrans_count: 0,
+            syn_retrans_timer_id: None,
+            rack_aggressive: false,
+            rto_no_backoff: false,
+            rack: crate::tcp_rack::RackState::new(),
+            tlp_pto_min_floor_us: 0,
+            tlp_pto_srtt_multiplier_x100: crate::tcp_tlp::DEFAULT_MULTIPLIER_X100,
+            tlp_skip_flight_size_gate: false,
+            tlp_max_consecutive_probes: crate::tcp_tlp::DEFAULT_MAX_CONSECUTIVE_PROBES,
+            tlp_skip_rtt_sample_gate: false,
+            tlp_consecutive_probes_fired: 0,
+            tlp_rtt_sample_seen_since_last_tlp: false,
+            tlp_recent_probes: [None; 5],
+            tlp_recent_probes_next_slot: 0,
+            syn_tx_ts_ns: 0,
+            send_refused_pending: false,
+            force_tw_skip: false,
+            rtt_histogram: crate::rtt_histogram::RttHistogram::default(),
+            delivered_segments: smallvec::SmallVec::new(),
+            readable_scratch_iovecs: Vec::new(),
+        }
+    }
+
     /// A5.5 Task 10: project the per-connect TLP tuning into the
     /// pure-function `TlpConfig` consumed by `pto_us`. By the time we
     /// reach here, `tlp_pto_min_floor_us` has already been substituted

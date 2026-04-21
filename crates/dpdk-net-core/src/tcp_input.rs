@@ -334,6 +334,8 @@ pub fn dispatch(
 ) -> Outcome {
     match conn.state {
         TcpState::SynSent => handle_syn_sent(conn, seg, rtt_histogram_edges),
+        #[cfg(feature = "test-server")]
+        TcpState::SynReceived => handle_syn_received(conn, seg, rtt_histogram_edges),
         TcpState::Established => {
             handle_established(conn, seg, rtt_histogram_edges, send_buffer_bytes, mbuf_ctx)
         }
@@ -344,6 +346,79 @@ pub fn dispatch(
         | TcpState::CloseWait
         | TcpState::TimeWait => handle_close_path(conn, seg),
         _ => Outcome::none(),
+    }
+}
+
+/// A7 Task 5 (server FSM, test-server-only): SYN_RECEIVED state handler.
+///
+/// The connection was allocated from an inbound SYN (see
+/// `Engine::handle_inbound_syn_listen`). We've emitted SYN-ACK and bumped
+/// our `snd_nxt` by one. The final ACK from the peer must:
+///   - carry `seq == rcv_nxt` (peer's iss + 1),
+///   - ack our ISS + 1 (i.e. `snd_una + 1 <= ack <= snd_nxt`),
+///   - not carry RST.
+///
+/// On success we absorb the peer window, refresh TS.Recent if the option
+/// is present, and transition to ESTABLISHED. Any RST in a valid window
+/// closes; a bad-ACK yields RST.
+#[cfg(feature = "test-server")]
+fn handle_syn_received(
+    conn: &mut TcpConn,
+    seg: &ParsedSegment,
+    _rtt_histogram_edges: &[u32; 15],
+) -> Outcome {
+    use crate::tcp_seq::seq_le;
+
+    // RST handling mirrors SYN_SENT (RFC 9293 §3.10.7.4).
+    if (seg.flags & TCP_RST) != 0 {
+        return Outcome {
+            tx: TxAction::None,
+            new_state: Some(TcpState::Closed),
+            closed: true,
+            ..Outcome::base()
+        };
+    }
+
+    // The only acceptable next segment is the final-ACK of the handshake:
+    // ACK set, SYN clear, seq == rcv_nxt, ack covers our SYN-ACK.
+    if (seg.flags & TCP_ACK) == 0 || (seg.flags & TCP_SYN) != 0 {
+        return Outcome::none();
+    }
+    if seg.seq != conn.rcv_nxt {
+        return Outcome {
+            tx: TxAction::Ack, // challenge ACK
+            bad_seq: true,
+            ..Outcome::base()
+        };
+    }
+    if !seq_le(conn.snd_una.wrapping_add(1), seg.ack) || !seq_le(seg.ack, conn.snd_nxt) {
+        return Outcome {
+            tx: TxAction::Rst,
+            new_state: Some(TcpState::Closed),
+            closed: true,
+            ..Outcome::base()
+        };
+    }
+
+    // Absorb peer window + timestamps option if present.
+    conn.snd_una = seg.ack;
+    conn.snd_wnd = seg.window as u32;
+    conn.snd_wl1 = seg.seq;
+    conn.snd_wl2 = seg.ack;
+    if conn.ts_enabled {
+        if let Ok(opts) = crate::tcp_options::parse_options(seg.options) {
+            if let Some((tsval, _)) = opts.timestamps {
+                conn.ts_recent = tsval;
+                conn.ts_recent_age = crate::clock::now_ns();
+            }
+        }
+    }
+
+    Outcome {
+        tx: TxAction::None,
+        new_state: Some(TcpState::Established),
+        connected: true,
+        ..Outcome::base()
     }
 }
 
