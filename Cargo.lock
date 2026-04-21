@@ -177,6 +177,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "bench-stress"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bench-common",
+ "bench-e2e",
+ "chrono",
+ "clap 4.6.1",
+ "csv",
+ "dpdk-net",
+ "dpdk-net-core",
+ "dpdk-net-sys",
+ "hostname",
+ "serde",
+ "serde_json",
+ "uuid",
+]
+
+[[package]]
 name = "bindgen"
 version = "0.69.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"

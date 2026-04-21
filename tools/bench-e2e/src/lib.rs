@@ -13,3 +13,4 @@
 pub mod attribution;
 pub mod hw_task_18;
 pub mod sum_identity;
+pub mod workload;

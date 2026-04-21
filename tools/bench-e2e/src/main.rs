@@ -42,24 +42,17 @@ use bench_common::percentile::{summarize, Summary};
 use bench_common::preconditions::{PreconditionMode, PreconditionValue, Preconditions};
 use bench_common::run_metadata::RunMetadata;
 
-use bench_e2e::attribution::{AttributionMode, HwTsBuckets, TscFallbackBuckets};
+use bench_e2e::attribution::AttributionMode;
 use bench_e2e::hw_task_18::{
     assert_all_events_rx_hw_ts_ns_zero, assert_hw_task_18_post_run, HwTask18Expectations,
 };
 use bench_e2e::sum_identity::assert_sum_identity;
+use bench_e2e::workload::{
+    open_connection, request_response_attributed, IterRecord,
+};
 
 use dpdk_net_core::engine::Engine;
-use dpdk_net_core::error::Error;
 use dpdk_net_core::flow_table::ConnHandle;
-use dpdk_net_core::tcp_events::InternalEvent;
-
-/// Timeout for each request-response round-trip. Same ceiling as
-/// bench-ab-runner — tens of microseconds on a healthy host, 10 s is
-/// a floor against wedge.
-const RTT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
-
-/// Timeout for the initial three-way handshake. Matches RTT ceiling.
-const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Command-line args. Mirrors bench-ab-runner's shape (see spec §6.1
 /// for the full list); adds `sum-identity-tol-ns` and
@@ -198,23 +191,15 @@ fn main() -> anyhow::Result<()> {
 
 // ---------------------------------------------------------------------------
 // Workload — warmup + measurement loop over one TCP connection.
+//
+// The per-iter helpers (`request_response_attributed`, `open_connection`,
+// etc.) now live in `bench_e2e::workload` so `bench-stress` can drive the
+// same inner loop. This function composes them with the bench-e2e
+// specifics: sum-identity assertion per iteration + rx_hw_ts_ns capture
+// for the A-HW Task 18 post-run assertion.
 // ---------------------------------------------------------------------------
 
-/// Per-iteration product: wall-clock RTT + the `rx_hw_ts_ns` observed
-/// on the Readable event. Kept as twin vectors so the CSV path can
-/// summarise the RTT stream without allocating any attribution-bucket
-/// history — spec §14 only emits RTT aggregations.
-struct WorkloadSamples {
-    rtt_ns: Vec<f64>,
-    /// Per-iteration `rx_hw_ts_ns` value. Fed to
-    /// `assert_all_events_rx_hw_ts_ns_zero` when --assert-hw-task-18
-    /// is set; on ENA this is the all-zero vector.
-    rx_hw_ts_ns: Vec<u64>,
-}
-
-/// Drive warmup + measurement iterations. Opens the engine's event
-/// queue once and reuses it per iteration (same pattern as bench-
-/// ab-runner — read the module-level comment there for the rationale).
+/// Drive warmup + measurement iterations with sum-identity enforcement.
 fn run_workload(
     engine: &Engine,
     conn: ConnHandle,
@@ -238,12 +223,10 @@ fn run_workload(
     }
 
     // Measurement.
-    let mut samples = WorkloadSamples {
-        rtt_ns: Vec::with_capacity(args.iterations as usize),
-        rx_hw_ts_ns: Vec::with_capacity(args.iterations as usize),
-    };
+    let mut rtt_ns: Vec<f64> = Vec::with_capacity(args.iterations as usize);
+    let mut rx_hw_ts_ns: Vec<u64> = Vec::with_capacity(args.iterations as usize);
     for i in 0..args.iterations {
-        let rec = request_response_attributed(
+        let rec: IterRecord = request_response_attributed(
             engine,
             conn,
             &request,
@@ -270,327 +253,11 @@ fn run_workload(
                 )
             })?;
 
-        samples.rtt_ns.push(rec.rtt_ns as f64);
-        samples.rx_hw_ts_ns.push(rec.rx_hw_ts_ns);
+        rtt_ns.push(rec.rtt_ns as f64);
+        rx_hw_ts_ns.push(rec.rx_hw_ts_ns);
     }
 
-    Ok((samples.rtt_ns, samples.rx_hw_ts_ns))
-}
-
-/// The per-iteration measurement product. `mode` selects which
-/// bucket variant is populated; the unpopulated variant is `None`.
-/// `rx_hw_ts_ns` is the raw value from the Readable event (0 on ENA).
-struct IterRecord {
-    rtt_ns: u64,
-    rx_hw_ts_ns: u64,
-    mode: AttributionMode,
-    hw_buckets: Option<HwTsBuckets>,
-    tsc_buckets: Option<TscFallbackBuckets>,
-}
-
-/// One measured round-trip with attribution buckets.
-///
-/// The implementation mirrors bench-ab-runner's `request_response_once`
-/// (carry-forward accumulator for partial-accept safety) and adds the
-/// timestamp captures needed to compose either the 5-bucket HW-TS
-/// variant or the 3-bucket TSC-fallback variant.
-///
-/// # Bucket derivation
-///
-/// - `t_user_send` = rdtsc at send_bytes() entry.
-/// - `t_tx_sched`  = rdtsc just after the send-loop fully enqueued
-///   the request on the TCP send path. On partial-accept, we re-enter
-///   the poll loop and re-sample; `t_tx_sched` is the LAST rdtsc
-///   post-send-loop because that's the point the engine has actually
-///   scheduled the frame for TX.
-/// - `t_enqueued`  = rdtsc just before the Readable event is popped
-///   from the engine's event queue.
-/// - `t_user_return` = rdtsc just before the function returns — the
-///   full wall-clock RTT.
-/// - `rx_hw_ts_ns` = the `rx_hw_ts_ns` field from the Readable event,
-///   the NIC-reported first-byte-off-wire timestamp. Zero on ENA.
-///
-/// When `rx_hw_ts_ns > 0` (HW-TS mode), the middle three buckets are
-/// derived from the NIC clock + host TSC delta; when 0 (TSC-fallback
-/// mode), the middle bucket is one combined span (t_enqueued -
-/// t_tx_sched).
-///
-/// Spec §6 sum-identity note: the five-bucket total MUST equal
-/// (t_user_return - t_user_send) within `tol_ns`. We construct the
-/// buckets here with that identity in mind: the `nic_tx_wire_to_nic_rx_ns`
-/// and `nic_rx_to_enqueued_ns` split sums to (t_enqueued - t_tx_sched)
-/// on the HW path; on the TSC path, `tx_sched_to_enqueued_ns` holds the
-/// same span as a single bucket. Either way sum-identity == wall RTT.
-fn request_response_attributed(
-    engine: &Engine,
-    conn: ConnHandle,
-    request: &[u8],
-    response_bytes: usize,
-    tsc_hz: u64,
-    carry_forward: &mut usize,
-) -> anyhow::Result<IterRecord> {
-    // Wall-clock entry.
-    let t_user_send = dpdk_net_core::clock::rdtsc();
-
-    // --- Send phase ---
-    let send_deadline = std::time::Instant::now() + RTT_TIMEOUT;
-    let mut sent: usize = 0;
-    while sent < request.len() {
-        let remaining = &request[sent..];
-        let accepted = match engine.send_bytes(conn, remaining) {
-            Ok(n) => n,
-            Err(Error::InvalidConnHandle(_)) => {
-                anyhow::bail!(
-                    "peer closed connection mid-iteration \
-                     (InvalidConnHandle from send_bytes after {sent}/{} bytes)",
-                    request.len()
-                );
-            }
-            Err(e) => anyhow::bail!("send_bytes failed: {e:?}"),
-        };
-        sent += accepted as usize;
-        if sent < request.len() {
-            engine.poll_once();
-            *carry_forward = carry_forward.saturating_add(
-                drain_and_accumulate_readable(engine, conn, &mut None)?,
-            );
-            if std::time::Instant::now() >= send_deadline {
-                anyhow::bail!(
-                    "send timeout ({}/{} bytes accepted)",
-                    sent,
-                    request.len()
-                );
-            }
-        }
-    }
-    let t_tx_sched = dpdk_net_core::clock::rdtsc();
-
-    // --- Receive phase ---
-    let recv_deadline = std::time::Instant::now() + RTT_TIMEOUT;
-    let mut got: usize = *carry_forward;
-    *carry_forward = 0;
-    // Latest Readable event's rx_hw_ts_ns, captured mid-drain.
-    let mut last_rx_hw_ts_ns: Option<u64> = None;
-    while got < response_bytes {
-        engine.poll_once();
-        got += drain_and_accumulate_readable(engine, conn, &mut last_rx_hw_ts_ns)?;
-        if got < response_bytes && std::time::Instant::now() >= recv_deadline {
-            anyhow::bail!(
-                "recv timeout ({}/{} bytes)",
-                got,
-                response_bytes
-            );
-        }
-    }
-    if got > response_bytes {
-        *carry_forward = got - response_bytes;
-    }
-    let t_enqueued = dpdk_net_core::clock::rdtsc();
-
-    // --- Wall-clock exit ---
-    let t_user_return = dpdk_net_core::clock::rdtsc();
-
-    let rtt_ns = tsc_delta_to_ns(t_user_send, t_user_return, tsc_hz);
-    let rx_hw_ts_ns = last_rx_hw_ts_ns.unwrap_or(0);
-    let mode = AttributionMode::from_rx_hw_ts(rx_hw_ts_ns);
-
-    // Compose buckets such that `total_ns()` == rtt_ns exactly: in
-    // both modes we use host-TSC spans only. The HW-TS mode's
-    // five-bucket split is still "attribution" (the `rx_hw_ts_ns`
-    // field is exposed to the caller via `rx_hw_ts_ns` so a future
-    // downstream consumer can derive a wire-time split), but the
-    // sum-identity on a single round-trip is TSC-anchored. Spec §6
-    // calls this out in the sum-identity clause.
-    let (hw_buckets, tsc_buckets) = match mode {
-        AttributionMode::Hw => {
-            // Five-bucket decomposition. We split `t_tx_sched ->
-            // t_enqueued` into the three middle buckets using the
-            // NIC hardware timestamp as the pivot: the ns between
-            // `t_tx_sched` and `rx_hw_ts_ns` covers wire + peer +
-            // wire-back to local NIC; `rx_hw_ts_ns` to `t_enqueued`
-            // covers NIC-RX to engine-readable. The remaining
-            // wire/NIC-TX half is folded into
-            // `tx_sched_to_nic_tx_wire_ns` as 0 on single-side HW-TS
-            // (we only observe the RX side timestamp) — downstream
-            // mlx5/ice expansion can split that when TX-TS is
-            // available.
-            //
-            // On a TSC/NIC-clock skew, we clamp the NIC span to the
-            // host span so sum-identity holds: negative or overshoot
-            // NIC deltas collapse into the TSC-anchored span.
-            let host_span_ns = tsc_delta_to_ns(t_tx_sched, t_enqueued, tsc_hz);
-            // We treat rx_hw_ts_ns as an absolute ns offset relative
-            // to the same TSC epoch. If the NIC clock is on its own
-            // epoch (common on mlx5/ice), a future patch converts
-            // here; for now we sum-compose so identity holds.
-            let bucket_a = tsc_delta_to_ns(t_user_send, t_tx_sched, tsc_hz);
-            let bucket_e = tsc_delta_to_ns(t_enqueued, t_user_return, tsc_hz);
-            (
-                Some(HwTsBuckets {
-                    user_send_to_tx_sched_ns: bucket_a,
-                    tx_sched_to_nic_tx_wire_ns: 0,
-                    nic_tx_wire_to_nic_rx_ns: host_span_ns,
-                    nic_rx_to_enqueued_ns: 0,
-                    enqueued_to_user_return_ns: bucket_e,
-                }),
-                None,
-            )
-        }
-        AttributionMode::Tsc => {
-            let bucket_a = tsc_delta_to_ns(t_user_send, t_tx_sched, tsc_hz);
-            let bucket_b = tsc_delta_to_ns(t_tx_sched, t_enqueued, tsc_hz);
-            let bucket_c = tsc_delta_to_ns(t_enqueued, t_user_return, tsc_hz);
-            (
-                None,
-                Some(TscFallbackBuckets {
-                    user_send_to_tx_sched_ns: bucket_a,
-                    tx_sched_to_enqueued_ns: bucket_b,
-                    enqueued_to_user_return_ns: bucket_c,
-                }),
-            )
-        }
-    };
-
-    Ok(IterRecord {
-        rtt_ns,
-        rx_hw_ts_ns,
-        mode,
-        hw_buckets,
-        tsc_buckets,
-    })
-}
-
-/// Drain events from the engine, accumulating Readable-payload bytes
-/// on `conn`. On each Readable event observed, writes the carried
-/// `rx_hw_ts_ns` into `last_rx_hw_ts_ns` (overwriting; we keep the
-/// last one seen in this drain). Fails on Error/Closed for `conn`.
-///
-/// Called from both send + receive phases, same as bench-ab-runner.
-fn drain_and_accumulate_readable(
-    engine: &Engine,
-    conn: ConnHandle,
-    last_rx_hw_ts_ns: &mut Option<u64>,
-) -> anyhow::Result<usize> {
-    let mut events = engine.events();
-    let mut bytes: usize = 0;
-    while let Some(ev) = events.pop() {
-        match ev {
-            InternalEvent::Readable {
-                conn: ch,
-                total_len,
-                rx_hw_ts_ns,
-                ..
-            } if ch == conn => {
-                bytes = bytes.saturating_add(total_len as usize);
-                *last_rx_hw_ts_ns = Some(rx_hw_ts_ns);
-            }
-            InternalEvent::Error { conn: ch, err, .. } if ch == conn => {
-                anyhow::bail!("tcp error during recv: errno={err}");
-            }
-            InternalEvent::Closed { conn: ch, err, .. } if ch == conn => {
-                anyhow::bail!("connection closed during recv: err={err}");
-            }
-            _ => {
-                // Unrelated event kinds — drop.
-            }
-        }
-    }
-    Ok(bytes)
-}
-
-/// Convert a TSC-cycle delta to nanoseconds. u128 intermediate to
-/// avoid overflow at realistic durations. Same shape as
-/// bench-ab-runner's helper; duplicated because both binaries have
-/// their own copy and neither crate exposes it as public API.
-fn tsc_delta_to_ns(t0: u64, t1: u64, tsc_hz: u64) -> u64 {
-    let delta = t1.wrapping_sub(t0);
-    ((delta as u128).saturating_mul(1_000_000_000u128) / tsc_hz as u128) as u64
-}
-
-// ---------------------------------------------------------------------------
-// Connection bring-up — retry-on-PeerUnreachable until gateway ARP
-// resolves, then drive poll_once until Connected is observed.
-// ---------------------------------------------------------------------------
-
-/// Open a TCP connection to the peer. Same shape as
-/// bench-ab-runner's `open_connection` — retry `connect` on
-/// `PeerUnreachable` (gateway MAC not yet learned), then drive
-/// `poll_once` until the `Connected` event arrives.
-fn open_connection(
-    engine: &Engine,
-    peer_ip: u32,
-    peer_port: u16,
-) -> anyhow::Result<ConnHandle> {
-    let handle = retry_on_peer_unreachable(
-        CONNECT_TIMEOUT,
-        std::time::Duration::from_millis(10),
-        || engine.connect(peer_ip, peer_port, 0),
-        || {
-            engine.poll_once();
-        },
-    )?;
-
-    let deadline = std::time::Instant::now() + CONNECT_TIMEOUT;
-    loop {
-        engine.poll_once();
-        if drain_until_connected_or_error(engine, handle)? {
-            return Ok(handle);
-        }
-        if std::time::Instant::now() >= deadline {
-            anyhow::bail!("connect timeout after {:?}", CONNECT_TIMEOUT);
-        }
-    }
-}
-
-fn retry_on_peer_unreachable<T, F, B>(
-    timeout: std::time::Duration,
-    sleep_dur: std::time::Duration,
-    mut op: F,
-    mut between: B,
-) -> anyhow::Result<T>
-where
-    F: FnMut() -> Result<T, Error>,
-    B: FnMut(),
-{
-    let start = std::time::Instant::now();
-    loop {
-        match op() {
-            Ok(v) => return Ok(v),
-            Err(Error::PeerUnreachable(_)) => {
-                between();
-                if start.elapsed() > timeout {
-                    anyhow::bail!(
-                        "gateway ARP did not resolve within {:?}",
-                        timeout
-                    );
-                }
-                std::thread::sleep(sleep_dur);
-            }
-            Err(e) => anyhow::bail!("engine.connect failed: {e:?}"),
-        }
-    }
-}
-
-fn drain_until_connected_or_error(
-    engine: &Engine,
-    handle: ConnHandle,
-) -> anyhow::Result<bool> {
-    let mut events = engine.events();
-    while let Some(ev) = events.pop() {
-        match ev {
-            InternalEvent::Connected { conn, .. } if conn == handle => return Ok(true),
-            InternalEvent::Error { conn, err, .. } if conn == handle => {
-                anyhow::bail!("connect error: errno={err}");
-            }
-            InternalEvent::Closed { conn, err, .. } if conn == handle => {
-                anyhow::bail!("connection closed during handshake: err={err}");
-            }
-            _ => {
-                // Ignore state-change / writable / other-handle events.
-            }
-        }
-    }
-    Ok(false)
+    Ok((rtt_ns, rx_hw_ts_ns))
 }
 
 // ---------------------------------------------------------------------------
@@ -890,19 +557,6 @@ fn emit_csv(args: &Args, meta: &RunMetadata, samples: &[f64]) -> anyhow::Result<
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn tsc_delta_to_ns_basic() {
-        assert_eq!(tsc_delta_to_ns(0, 3_000, 3_000_000_000), 1_000);
-        assert_eq!(tsc_delta_to_ns(42, 42, 3_000_000_000), 0);
-    }
-
-    #[test]
-    fn tsc_delta_to_ns_handles_wrap() {
-        let t0 = u64::MAX - 999;
-        let t1 = t0.wrapping_add(3_000);
-        assert_eq!(tsc_delta_to_ns(t0, t1, 3_000_000_000), 1_000);
-    }
 
     #[test]
     fn parse_mode_accepts_strict_and_lenient() {

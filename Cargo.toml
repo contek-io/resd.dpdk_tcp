@@ -10,6 +10,7 @@ members = [
     "tools/bench-e2e",
     "tools/bench-micro",
     "tools/bench-rx-zero-copy",
+    "tools/bench-stress",
     "tools/scapy-fuzz-runner",
 ]
 # fuzz/ is a sibling sub-Cargo-project pinned to nightly; kept out of the

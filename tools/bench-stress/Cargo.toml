@@ -1,0 +1,45 @@
+[package]
+name = "bench-stress"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+# A10 Plan B Task 7: stability benchmarks under induced
+# loss/reorder/corruption/duplication. Drives the parent spec §11.4
+# scenario matrix via two fault-injection paths (netem on the peer,
+# FaultInjector post-PMD-RX). Reuses bench-e2e's RTT workload as a
+# library dependency — same request/response inner loop, just run
+# pre + post counter-delta and p999 ratio checks against idle baseline.
+#
+# See docs/superpowers/specs/2026-04-21-stage1-phase-a10-benchmark-
+# harness-design.md §7 and parent spec §11.4.
+
+[lib]
+name = "bench_stress"
+path = "src/lib.rs"
+
+[[bin]]
+name = "bench-stress"
+path = "src/main.rs"
+
+[dependencies]
+bench-common = { path = "../bench-common" }
+bench-e2e = { path = "../bench-e2e" }
+dpdk-net-core = { path = "../../crates/dpdk-net-core" }
+dpdk-net-sys = { path = "../../crates/dpdk-net-sys" }
+dpdk-net = { path = "../../crates/dpdk-net" }
+clap = { version = "4", features = ["derive"] }
+anyhow = "1"
+csv = "1.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+hostname = "0.4"
+uuid = { version = "1", features = ["v4"] }
+
+[features]
+# Enables the A9 FaultInjector middleware in the engine build, which
+# reads DPDK_NET_FAULT_INJECTOR at bring-up. Scenarios whose
+# `fault_injector` field is `Some(...)` require this feature; netem-only
+# scenarios work in either build. See spec §7.
+fault-injector = ["dpdk-net-core/fault-injector"]
