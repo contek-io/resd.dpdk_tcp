@@ -148,6 +148,25 @@ fn apply_scrape_result(
     }
 }
 
+/// Clamp the fetch-phase return value of `rte_eth_xstats_get_names`
+/// against the probe-phase allocation size. Pure helper extracted so it
+/// can be unit-tested without mocking the DPDK FFI.
+///
+/// - `n` is the probe-phase count (allocation size of the names Vec).
+/// - `got` is the raw return from the fetch-phase call.
+///
+/// Returns the safe slice length to use against the allocated Vec:
+/// - `got <= 0`: 0 (error / zero-name PMD).
+/// - `got > n`:  `n`  (PMD grew between calls; excess names weren't written).
+/// - `0 < got <= n`: `got`.
+fn clamped_names_len(n: usize, got: i32) -> usize {
+    if got <= 0 {
+        0
+    } else {
+        (got as usize).min(n)
+    }
+}
+
 /// Resolve XSTAT_NAMES → ids by walking `rte_eth_xstats_get_names`.
 /// Returns an XstatMap that can be reused for every subsequent scrape.
 /// Slow-path resolver; called once per `Engine::new`.
@@ -173,7 +192,13 @@ pub(crate) fn resolve_xstat_ids(port_id: u16) -> XstatMap {
     if got <= 0 {
         return XstatMap::from_lookup(|_| None);
     }
-    let names = &names[..got as usize];
+    // DPDK contract: when `size` < actual count, `rte_eth_xstats_get_names`
+    // returns the *required* size (> what was written). If the PMD's xstat
+    // name set grows between the probe and fetch calls (concurrent port
+    // reconfigure, lazy xstat registration), `got > n`. Clamp to what we
+    // actually allocated; unmatched names resolve to `None` slots — the
+    // documented degradation contract above.
+    let names = &names[..clamped_names_len(n, got)];
     XstatMap::from_lookup(|wanted| {
         for (i, n) in names.iter().enumerate() {
             // rte_eth_xstat_name.name is `[c_char; 64]` NUL-terminated.
@@ -271,6 +296,51 @@ mod tests {
         assert_eq!(counters.eth.eni_bw_in_allowance_exceeded.load(Ordering::Relaxed), 1);
         assert_eq!(counters.eth.tx_q0_doorbells.load(Ordering::Relaxed), 7);
         assert_eq!(counters.eth.rx_q0_mbuf_alloc_fail.load(Ordering::Relaxed), 13);
+    }
+
+    #[test]
+    fn clamped_names_len_normal_case() {
+        // Probe and fetch agree — typical steady-state PMD behavior.
+        assert_eq!(clamped_names_len(80, 80), 80);
+    }
+
+    #[test]
+    fn clamped_names_len_pmd_grew_between_calls() {
+        // Regression: this is the bug_006 panic case. PMD's xstat name
+        // set grew between probe and fetch; DPDK returns the *required*
+        // size (> allocated). Must clamp to allocation, NOT panic.
+        assert_eq!(clamped_names_len(80, 84), 80);
+    }
+
+    #[test]
+    fn clamped_names_len_pmd_shrank() {
+        // PMD wrote fewer names than probed (e.g. tail slots skipped).
+        // We trust `got` as the write count.
+        assert_eq!(clamped_names_len(80, 76), 76);
+    }
+
+    #[test]
+    fn clamped_names_len_zero() {
+        // Zero-name PMD: degraded "every slot None" path.
+        assert_eq!(clamped_names_len(80, 0), 0);
+    }
+
+    #[test]
+    fn clamped_names_len_negative_error() {
+        // Error return from DPDK: treat as zero names, fall through to
+        // the same degradation contract.
+        assert_eq!(clamped_names_len(80, -1), 0);
+    }
+
+    #[test]
+    fn clamped_slice_does_not_panic_when_pmd_grew() {
+        // End-to-end guard: the slice expression in resolve_xstat_ids
+        // must not panic even when got > n.
+        let n: usize = 80;
+        let names: Vec<u8> = vec![0; n];
+        let got: i32 = 84;
+        let slice = &names[..clamped_names_len(n, got)];
+        assert_eq!(slice.len(), 80);
     }
 
     #[test]
