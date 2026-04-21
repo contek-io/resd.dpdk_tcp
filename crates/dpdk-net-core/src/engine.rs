@@ -1596,10 +1596,31 @@ impl Engine {
         unsafe {
             std::ptr::copy_nonoverlapping(bytes.as_ptr(), dst as *mut u8, bytes.len());
         }
+        #[cfg_attr(feature = "test-server", allow(unused_mut))]
         let mut pkts = [m];
-        let sent = unsafe {
-            sys::shim_rte_eth_tx_burst(self.cfg.port_id, self.cfg.tx_queue_id, pkts.as_mut_ptr(), 1)
-        } as usize;
+        let sent = {
+            #[cfg(feature = "test-server")]
+            {
+                // A7 Task 4: intercept TX — copy frame bytes into shim queue.
+                let m = pkts[0];
+                let data = unsafe { sys::shim_rte_pktmbuf_data(m) } as *const u8;
+                let len = unsafe { sys::shim_rte_pktmbuf_data_len(m) } as usize;
+                let mut bytes = Vec::with_capacity(len);
+                unsafe {
+                    std::ptr::copy_nonoverlapping(data, bytes.as_mut_ptr(), len);
+                    bytes.set_len(len);
+                }
+                crate::test_tx_intercept::push_tx_frame(bytes);
+                unsafe { sys::shim_rte_pktmbuf_free(m) };
+                1usize
+            }
+            #[cfg(not(feature = "test-server"))]
+            {
+                (unsafe {
+                    sys::shim_rte_eth_tx_burst(self.cfg.port_id, self.cfg.tx_queue_id, pkts.as_mut_ptr(), 1)
+                }) as usize
+            }
+        };
         if sent == 1 {
             add(&self.counters.eth.tx_bytes, bytes.len() as u64);
             inc(&self.counters.eth.tx_pkts);
@@ -1664,10 +1685,31 @@ impl Engine {
                 self.tx_cksum_offload_active,
             );
         }
+        #[cfg_attr(feature = "test-server", allow(unused_mut))]
         let mut pkts = [m];
-        let sent = unsafe {
-            sys::shim_rte_eth_tx_burst(self.cfg.port_id, self.cfg.tx_queue_id, pkts.as_mut_ptr(), 1)
-        } as usize;
+        let sent = {
+            #[cfg(feature = "test-server")]
+            {
+                // A7 Task 4: intercept TX — copy frame bytes into shim queue.
+                let m = pkts[0];
+                let data = unsafe { sys::shim_rte_pktmbuf_data(m) } as *const u8;
+                let len = unsafe { sys::shim_rte_pktmbuf_data_len(m) } as usize;
+                let mut bytes = Vec::with_capacity(len);
+                unsafe {
+                    std::ptr::copy_nonoverlapping(data, bytes.as_mut_ptr(), len);
+                    bytes.set_len(len);
+                }
+                crate::test_tx_intercept::push_tx_frame(bytes);
+                unsafe { sys::shim_rte_pktmbuf_free(m) };
+                1usize
+            }
+            #[cfg(not(feature = "test-server"))]
+            {
+                (unsafe {
+                    sys::shim_rte_eth_tx_burst(self.cfg.port_id, self.cfg.tx_queue_id, pkts.as_mut_ptr(), 1)
+                }) as usize
+            }
+        };
         if sent == 1 {
             add(&self.counters.eth.tx_bytes, bytes.len() as u64);
             inc(&self.counters.eth.tx_pkts);
@@ -1708,10 +1750,31 @@ impl Engine {
         unsafe {
             std::ptr::copy_nonoverlapping(bytes.as_ptr(), dst as *mut u8, bytes.len());
         }
+        #[cfg_attr(feature = "test-server", allow(unused_mut))]
         let mut pkts = [m];
-        let sent = unsafe {
-            sys::shim_rte_eth_tx_burst(self.cfg.port_id, self.cfg.tx_queue_id, pkts.as_mut_ptr(), 1)
-        } as usize;
+        let sent = {
+            #[cfg(feature = "test-server")]
+            {
+                // A7 Task 4: intercept TX — copy frame bytes into shim queue.
+                let m = pkts[0];
+                let data = unsafe { sys::shim_rte_pktmbuf_data(m) } as *const u8;
+                let len = unsafe { sys::shim_rte_pktmbuf_data_len(m) } as usize;
+                let mut bytes = Vec::with_capacity(len);
+                unsafe {
+                    std::ptr::copy_nonoverlapping(data, bytes.as_mut_ptr(), len);
+                    bytes.set_len(len);
+                }
+                crate::test_tx_intercept::push_tx_frame(bytes);
+                unsafe { sys::shim_rte_pktmbuf_free(m) };
+                1usize
+            }
+            #[cfg(not(feature = "test-server"))]
+            {
+                (unsafe {
+                    sys::shim_rte_eth_tx_burst(self.cfg.port_id, self.cfg.tx_queue_id, pkts.as_mut_ptr(), 1)
+                }) as usize
+            }
+        };
         if sent == 1 {
             add(&self.counters.eth.tx_bytes, bytes.len() as u64);
             inc(&self.counters.eth.tx_pkts);
@@ -2016,19 +2079,43 @@ impl Engine {
         if ring.is_empty() {
             return;
         }
+        #[cfg_attr(feature = "test-server", allow(unused_variables))]
         let n = ring.len() as u16;
         // Safety: `ring` holds `NonNull<sys::rte_mbuf>`. `NonNull<T>` has
         // the same size/alignment as `*mut T` (std guarantee), so the
         // slice-reinterpret cast to `*mut *mut rte_mbuf` is sound and
         // matches `rte_eth_tx_burst`'s expected tx-pkts array layout.
-        let sent = unsafe {
-            sys::shim_rte_eth_tx_burst(
-                self.cfg.port_id,
-                self.cfg.tx_queue_id,
-                ring.as_mut_ptr() as *mut *mut sys::rte_mbuf,
-                n,
-            )
-        } as usize;
+        let sent = {
+            #[cfg(feature = "test-server")]
+            {
+                // A7 Task 4: intercept TX burst — copy every frame's bytes.
+                let nb = ring.len();
+                for i in 0..nb {
+                    let m = ring[i].as_ptr();
+                    let data = unsafe { sys::shim_rte_pktmbuf_data(m) } as *const u8;
+                    let len = unsafe { sys::shim_rte_pktmbuf_data_len(m) } as usize;
+                    let mut bytes = Vec::with_capacity(len);
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(data, bytes.as_mut_ptr(), len);
+                        bytes.set_len(len);
+                    }
+                    crate::test_tx_intercept::push_tx_frame(bytes);
+                    unsafe { sys::shim_rte_pktmbuf_free(m) };
+                }
+                nb
+            }
+            #[cfg(not(feature = "test-server"))]
+            {
+                (unsafe {
+                    sys::shim_rte_eth_tx_burst(
+                        self.cfg.port_id,
+                        self.cfg.tx_queue_id,
+                        ring.as_mut_ptr() as *mut *mut sys::rte_mbuf,
+                        n,
+                    )
+                }) as usize
+            }
+        };
         // Free tail mbufs (DPDK partial-fill: driver took the prefix, we own the rest).
         for i in sent..ring.len() {
             unsafe { sys::shim_rte_pktmbuf_free(ring[i].as_ptr()); }

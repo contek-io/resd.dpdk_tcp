@@ -36,6 +36,8 @@ pub mod tcp_seq;
 pub mod tcp_state;
 pub(crate) mod tcp_timer_wheel;
 pub mod tcp_tlp;
+#[cfg(feature = "test-server")]
+pub mod test_tx_intercept;
 
 pub use error::Error;
 
