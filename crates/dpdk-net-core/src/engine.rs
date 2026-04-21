@@ -1861,40 +1861,9 @@ impl Engine {
     /// back the MSS we advertised in the initial SYN — which is exactly
     /// what retransmits must carry per RFC 9293 §3.7.1.
     fn emit_syn(&self, handle: ConnHandle) -> bool {
-        use crate::tcp_output::{build_segment, SegmentTx, TCP_SYN};
-        let (tuple, iss, our_mss, recv_buffer_bytes, now_ns) = {
-            let ft = self.flow_table.borrow();
-            let Some(c) = ft.get(handle) else {
-                return false;
-            };
-            (
-                c.four_tuple(),
-                c.iss,
-                c.peer_mss,
-                self.cfg.recv_buffer_bytes,
-                crate::clock::now_ns(),
-            )
-        };
-        let syn_opts = build_connect_syn_opts(recv_buffer_bytes, our_mss, now_ns);
-        let seg = SegmentTx {
-            src_mac: self.our_mac,
-            dst_mac: self.cfg.gateway_mac,
-            src_ip: tuple.local_ip,
-            dst_ip: tuple.peer_ip,
-            src_port: tuple.local_port,
-            dst_port: tuple.peer_port,
-            seq: iss,
-            ack: 0,
-            flags: TCP_SYN,
-            window: u16::MAX, // pre-WS-negotiation: advertise maximum.
-            options: syn_opts,
-            payload: &[],
-        };
-        let mut buf = [0u8; 128];
-        let Some(n) = build_segment(&seg, &mut buf) else {
-            return false;
-        };
-        let tx_ok = self.tx_tcp_frame(&buf[..n], &seg);
+        use crate::tcp_output::TCP_SYN;
+        let now_ns = crate::clock::now_ns();
+        let tx_ok = self.emit_syn_with_flags(handle, TCP_SYN, now_ns);
         // A5.5 Task 13: stash SYN TX timestamp on the ORIGINAL SYN only
         // (Karn's rule — the retransmit path increments `syn_retrans_count`
         // before re-entering `emit_syn`, so this guard fires exclusively on
@@ -1909,6 +1878,52 @@ impl Engine {
             }
         }
         tx_ok
+    }
+
+    /// Shared SYN / SYN-ACK emitter. Factored out of `emit_syn` (active
+    /// side) + `emit_syn_ack_for_passive` (A7 passive side) so neither
+    /// duplicates the `build_segment` / `tx_tcp_frame` plumbing. The `ack`
+    /// field is auto-derived from the `flags` bitmask: ACK bit set →
+    /// `ack = rcv_nxt` (passive SYN-ACK); ACK bit clear → `ack = 0`
+    /// (active SYN). Caller retains responsibility for counter increments
+    /// (`tcp.tx_syn`) and state stashing (`syn_tx_ts_ns`) so the two
+    /// paths stay easy to tell apart.
+    fn emit_syn_with_flags(&self, handle: ConnHandle, flags: u8, now_ns: u64) -> bool {
+        use crate::tcp_output::{build_segment, SegmentTx, TCP_ACK};
+        let (tuple, iss, ack_val, our_mss, recv_buffer_bytes) = {
+            let ft = self.flow_table.borrow();
+            let Some(c) = ft.get(handle) else {
+                return false;
+            };
+            let ack_val = if flags & TCP_ACK != 0 { c.rcv_nxt } else { 0 };
+            (
+                c.four_tuple(),
+                c.iss,
+                ack_val,
+                c.peer_mss,
+                self.cfg.recv_buffer_bytes,
+            )
+        };
+        let syn_opts = build_connect_syn_opts(recv_buffer_bytes, our_mss, now_ns);
+        let seg = SegmentTx {
+            src_mac: self.our_mac,
+            dst_mac: self.cfg.gateway_mac,
+            src_ip: tuple.local_ip,
+            dst_ip: tuple.peer_ip,
+            src_port: tuple.local_port,
+            dst_port: tuple.peer_port,
+            seq: iss,
+            ack: ack_val,
+            flags,
+            window: u16::MAX, // pre-WS-negotiation: advertise maximum.
+            options: syn_opts,
+            payload: &[],
+        };
+        let mut buf = [0u8; 128];
+        let Some(n) = build_segment(&seg, &mut buf) else {
+            return false;
+        };
+        self.tx_tcp_frame(&buf[..n], &seg)
     }
 
     /// Pick the next ephemeral source port in the IANA range [49152, 65535].
@@ -5382,16 +5397,24 @@ impl Engine {
     /// (timer wheel, ARP, pending-data) must call `poll_once` separately.
     pub fn inject_rx_frame(&self, frame: &[u8]) -> Result<(), crate::Error> {
         if frame.len() > u16::MAX as usize {
-            return Err(crate::Error::TooManyConns); // closest-existing no-memory signal
+            // Frame exceeds the u16 length field of a DPDK mbuf append — a
+            // bad-argument situation, not a resource-exhaustion one.
+            return Err(crate::Error::InvalidArgument);
         }
         let m = unsafe { sys::shim_rte_pktmbuf_alloc(self._rx_mempool.as_ptr()) };
         if m.is_null() {
-            return Err(crate::Error::TooManyConns);
+            // RX mempool exhausted — no dedicated no-memory variant exists
+            // on this build, so surface as InvalidArgument (the test-server
+            // RX mempool is sized generously; an alloc miss here implies
+            // caller-side misuse rather than a production-path concern).
+            return Err(crate::Error::InvalidArgument);
         }
         let dst = unsafe { sys::shim_rte_pktmbuf_append(m, frame.len() as u16) };
         if dst.is_null() {
             unsafe { sys::shim_rte_pktmbuf_free(m) };
-            return Err(crate::Error::TooManyConns);
+            // mbuf tailroom too small for the requested append — same
+            // bad-argument story as the `frame.len() > u16::MAX` check.
+            return Err(crate::Error::InvalidArgument);
         }
         // Safety: `dst` covers frame.len() writable bytes inside the mbuf.
         unsafe {
@@ -5460,12 +5483,14 @@ impl Engine {
             peer_ip,
             peer_port,
         };
+        let iss_us = self.iss_gen.next(&tuple);
+        let _ = now_ns; // retained in signature for call-site symmetry with other tcp_input paths.
         let conn = crate::tcp_conn::TcpConn::new_passive(
             tuple,
+            iss_us,
             iss_peer,
             opts,
             self.cfg.tcp_mss as u16,
-            now_ns,
             self.cfg.recv_buffer_bytes,
             self.cfg.send_buffer_bytes,
             self.cfg.tcp_min_rto_us,
@@ -5497,46 +5522,14 @@ impl Engine {
         Ok(())
     }
 
-    /// Build + tx the SYN-ACK for a SYN_RCVD conn. Mirrors `emit_syn`
-    /// (active side) but flips the flag set to `SYN|ACK` and fills
-    /// `ack = rcv_nxt` (peer's iss + 1).
+    /// Build + tx the SYN-ACK for a SYN_RCVD conn. Thin wrapper around
+    /// `emit_syn_with_flags` with `flags = SYN|ACK`; the helper auto-fills
+    /// `ack = rcv_nxt` (peer's iss + 1) when the ACK bit is set.
     fn emit_syn_ack_for_passive(&self, handle: crate::flow_table::ConnHandle) {
         use crate::counters::inc;
-        use crate::tcp_output::{build_segment, SegmentTx, TCP_ACK, TCP_SYN};
-        let (tuple, iss_us, ack_val, our_mss, recv_buffer_bytes, now_ns) = {
-            let ft = self.flow_table.borrow();
-            let Some(c) = ft.get(handle) else {
-                return;
-            };
-            (
-                c.four_tuple(),
-                c.iss,
-                c.rcv_nxt,
-                c.peer_mss,
-                self.cfg.recv_buffer_bytes,
-                crate::clock::now_ns(),
-            )
-        };
-        let syn_opts = build_connect_syn_opts(recv_buffer_bytes, our_mss, now_ns);
-        let seg = SegmentTx {
-            src_mac: self.our_mac,
-            dst_mac: self.cfg.gateway_mac,
-            src_ip: tuple.local_ip,
-            dst_ip: tuple.peer_ip,
-            src_port: tuple.local_port,
-            dst_port: tuple.peer_port,
-            seq: iss_us,
-            ack: ack_val,
-            flags: TCP_SYN | TCP_ACK,
-            window: u16::MAX, // pre-WS-negotiation; mirrors active SYN-out.
-            options: syn_opts,
-            payload: &[],
-        };
-        let mut buf = [0u8; 128];
-        let Some(n) = build_segment(&seg, &mut buf) else {
-            return;
-        };
-        if self.tx_tcp_frame(&buf[..n], &seg) {
+        use crate::tcp_output::{TCP_ACK, TCP_SYN};
+        let now_ns = crate::clock::now_ns();
+        if self.emit_syn_with_flags(handle, TCP_SYN | TCP_ACK, now_ns) {
             inc(&self.counters.tcp.tx_syn);
         }
     }
