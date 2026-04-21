@@ -24,6 +24,10 @@ pub enum Error {
     GatewayMacNotFound(u32),
     #[error("failed to read /proc/net/arp: {0}")]
     ProcArpRead(String),
+    #[error("default gateway not found in /proc/net/route (iface filter: {0:?})")]
+    GatewayIpNotFound(Option<String>),
+    #[error("failed to read /proc/net/route: {0}")]
+    ProcRouteRead(String),
     #[error("could not read NIC MAC for port {0}: rte_errno={1}")]
     MacAddrLookup(u16, i32),
     #[error("too many open connections (max_connections reached)")]

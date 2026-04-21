@@ -766,6 +766,51 @@ pub unsafe extern "C" fn dpdk_net_resolve_gateway_mac(
     }
 }
 
+/// Read `/proc/net/route` and return the default-gateway IPv4 address
+/// in *host* byte order via `*out_ip`.
+///
+/// `iface` may be NULL (accept any default route) or a NUL-terminated
+/// interface name (restrict to that iface). `out_ip` must be non-NULL.
+///
+/// MUST be called before `dpdk_net_engine_create`: `/proc/net/route`
+/// reflects the kernel's view of the route table, which goes away once
+/// DPDK binds the NIC. Pair with `dpdk_net_resolve_gateway_mac` to seed
+/// both `EngineConfig.gateway_ip` and `.gateway_mac`.
+///
+/// Returns:
+///   0 — success, `*out_ip` populated.
+///  -EINVAL — `out_ip` is NULL, or `iface` is not valid UTF-8.
+///  -ENOENT — no default route matched (including unknown iface).
+///  -EIO   — `/proc/net/route` could not be read.
+#[no_mangle]
+pub unsafe extern "C" fn dpdk_net_read_default_gateway_ip(
+    iface: *const libc::c_char,
+    out_ip: *mut u32,
+) -> i32 {
+    if out_ip.is_null() {
+        return -libc::EINVAL;
+    }
+    let iface_str = if iface.is_null() {
+        None
+    } else {
+        match CStr::from_ptr(iface).to_str() {
+            Ok(s) => Some(s),
+            // Malformed caller input, not a /proc read failure — keep
+            // this distinct from -EIO so the C caller can tell the two
+            // cases apart.
+            Err(_) => return -libc::EINVAL,
+        }
+    };
+    match dpdk_net_core::arp::read_default_gateway_ip(iface_str) {
+        Ok(ip) => {
+            *out_ip = ip;
+            0
+        }
+        Err(dpdk_net_core::Error::GatewayIpNotFound(_)) => -libc::ENOENT,
+        Err(_) => -libc::EIO,
+    }
+}
+
 /// A5.5 Task 10: pure default-substitution + range validation for the
 /// five TLP tuning knobs on `dpdk_net_connect_opts_t`. Factored out so
 /// rejection paths are unit-testable without standing up a live engine.
@@ -1108,6 +1153,26 @@ mod tests {
         // 0.0.0.1 will not be in any /proc/net/arp.
         let rc = unsafe { dpdk_net_resolve_gateway_mac(0x0000_0001, mac.as_mut_ptr()) };
         assert_eq!(rc, -libc::ENOENT);
+    }
+
+    #[test]
+    fn read_gateway_ip_null_out_returns_einval() {
+        // Null out_ip must be rejected before any /proc read.
+        let rc = unsafe {
+            dpdk_net_read_default_gateway_ip(std::ptr::null(), std::ptr::null_mut())
+        };
+        assert_eq!(rc, -libc::EINVAL);
+    }
+
+    #[test]
+    fn read_gateway_ip_unknown_iface_returns_enoent() {
+        // Filter on an iface that cannot exist on any host.
+        let iface = std::ffi::CString::new("nope_xxxxx").unwrap();
+        let mut out: u32 = 0;
+        let rc = unsafe { dpdk_net_read_default_gateway_ip(iface.as_ptr(), &mut out) };
+        assert_eq!(rc, -libc::ENOENT);
+        // out_ip must be left untouched on the error path.
+        assert_eq!(out, 0);
     }
 
     #[test]
