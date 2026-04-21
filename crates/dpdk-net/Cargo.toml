@@ -15,6 +15,9 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 # verify panic = "abort" at the C ABI boundary; never enabled in
 # production builds and never emitted into dpdk_net.h via cbindgen.
 test-panic-entry = []
+# A7: enables the test-only FFI surface (src/test_ffi.rs) and pass-through
+# to dpdk-net-core's test-server feature.
+test-server = ["dpdk-net-core/test-server"]
 
 [dependencies]
 dpdk-net-core = { path = "../dpdk-net-core" }

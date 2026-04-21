@@ -58,6 +58,10 @@ hw-offloads-all = [
     "hw-offload-rss-hash",
     "hw-offload-rx-timestamp",
 ]
+# A7: gates the test-only server FSM (src/test_server.rs), the virtual
+# clock swap in clock.rs, and the TX-intercept shim in test_tx_intercept.rs.
+# Never on in production builds.
+test-server = []
 # Meta for the A8 counter-coverage audit.
 obs-all = ["obs-byte-counters", "obs-poll-saturation"]
 # A6.5 Group 5: counting GlobalAlloc wrapper + steady-state
