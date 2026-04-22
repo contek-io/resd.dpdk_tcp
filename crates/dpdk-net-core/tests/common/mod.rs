@@ -406,4 +406,145 @@ impl CovHarness {
         let v = c.load(Ordering::Relaxed);
         assert!(v > 0, "counter {name} expected > 0, got {v}");
     }
+
+    // -----------------------------------------------------------------
+    // A8 Task 5: hardware-path-only counter bump helper + injection
+    // helpers used by `tests/counter-coverage.rs` to drive the remaining
+    // counters in eth.*, ip.*, and poll.* groups.
+    // -----------------------------------------------------------------
+
+    /// For counters whose real bump site fires only on live NIC
+    /// bring-up (ENA xstats, LLQ verification, per-queue ENA xstats)
+    /// or on paths the test-server bypass cannot reach (TX-ring-full
+    /// in the interceptor, `rte_eth_rx_burst` on port_id=u16::MAX).
+    ///
+    /// The static audit (T3 / `scripts/counter-coverage-static.sh`)
+    /// has already verified the source has an increment site in the
+    /// default OR all-features build. This helper demonstrates the
+    /// counter-path is addressable via `lookup_counter` (closes the
+    /// "renamed but not rewired" bug class), not that the production
+    /// path fires end-to-end. Each scenario using this helper also
+    /// carries a doc-comment pointing at the real bump site per spec
+    /// §3.3 acceptability clause.
+    pub fn bump_counter_one_shot(&self, name: &str) {
+        use std::sync::atomic::Ordering;
+        let c = dpdk_net_core::counters::lookup_counter(self.eng.counters(), name)
+            .unwrap_or_else(|| panic!("unknown counter path: {name}"));
+        c.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Inject a 14-byte Ethernet frame whose dst MAC matches neither
+    /// `our_mac` (synthesized to `02:00:00:00:00:01` by the test-server
+    /// bypass — see engine.rs:1028) nor the broadcast address. L2
+    /// decoder returns `L2Drop::MissMac` → `eth.rx_drop_miss_mac` bump.
+    pub fn inject_frame_wrong_dst_mac(&mut self) {
+        // dst = 0xaa:0xaa:0xaa:0xaa:0xaa:0xaa (not us, not broadcast)
+        // src = arbitrary; ethertype = IPv4 (0x0800); no payload needed —
+        // l2_decode rejects on dst-MAC before reading ethertype.
+        let frame: [u8; 14] = [
+            0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, // dst
+            0x02, 0x00, 0x00, 0x00, 0x00, 0x02, // src (arbitrary)
+            0x08, 0x00, // ethertype IPv4
+        ];
+        let _ = self.eng.inject_rx_frame(&frame);
+    }
+
+    /// Inject a 14-byte Ethernet frame whose ethertype is IPv6
+    /// (0x86DD) — not IPv4 / not ARP. L2 decoder returns
+    /// `L2Drop::UnknownEthertype` → `eth.rx_drop_unknown_ethertype`
+    /// bump.
+    pub fn inject_frame_unknown_ethertype(&mut self) {
+        // dst = our MAC (otherwise MissMac drops first); src = peer;
+        // ethertype = IPv6 = 0x86DD.
+        let frame: [u8; 14] = [
+            0x02, 0x00, 0x00, 0x00, 0x00, 0x01, // dst = our_mac
+            0x02, 0x00, 0x00, 0x00, 0x00, 0x02, // src
+            0x86, 0xdd, // IPv6 ethertype
+        ];
+        let _ = self.eng.inject_rx_frame(&frame);
+    }
+
+    /// Inject an ARP REQUEST frame targeting OUR_IP. `handle_arp`
+    /// bumps `eth.rx_arp` on decode; the subsequent `build_arp_reply`
+    /// + `tx_frame` path then bumps `eth.tx_arp` + `eth.tx_pkts` +
+    /// `eth.tx_bytes`. Reuses the ARP wire shape from
+    /// `tests/l2_l3_tap.rs` (Case 7).
+    pub fn inject_arp_request_to_us(&mut self) {
+        let peer_mac: [u8; 6] = [0xde, 0xad, 0xbe, 0xef, 0x00, 0x01];
+        let mut frame = Vec::with_capacity(14 + 28);
+        // L2: broadcast dst, peer src, ARP ethertype.
+        frame.extend_from_slice(&[0xff; 6]);
+        frame.extend_from_slice(&peer_mac);
+        frame.extend_from_slice(&0x0806u16.to_be_bytes());
+        // ARP body (28 bytes): htype=1, ptype=0x0800, hlen=6, plen=4,
+        // op=REQUEST, sender_mac, sender_ip, target_mac=0, target_ip=us.
+        frame.extend_from_slice(&1u16.to_be_bytes()); // htype ETH
+        frame.extend_from_slice(&0x0800u16.to_be_bytes()); // ptype IPv4
+        frame.push(6); // hlen
+        frame.push(4); // plen
+        frame.extend_from_slice(&1u16.to_be_bytes()); // op=REQUEST
+        frame.extend_from_slice(&peer_mac); // sender_mac
+        frame.extend_from_slice(&PEER_IP.to_be_bytes()); // sender_ip
+        frame.extend_from_slice(&[0u8; 6]); // target_mac (unknown)
+        frame.extend_from_slice(&OUR_IP.to_be_bytes()); // target_ip
+        // handle_arp checks `target_ip == cfg.local_ip` (= OUR_IP) and
+        // `cfg.local_ip != 0`; our config sets local_ip = OUR_IP so
+        // this satisfies both conditions — engine builds + tx's the
+        // ARP reply, which drives the tx_arp counter.
+        let _ = self.eng.inject_rx_frame(&frame);
+    }
+
+    /// Build an Ethernet+IPv4 frame with the given IP-header bytes +
+    /// payload. Caller supplies an already-valid or deliberately-bad
+    /// IP header; this helper just wraps L2 around it and injects.
+    /// dst MAC = our MAC so L2 accept, src MAC arbitrary.
+    ///
+    /// Used by IP-decode drop scenarios (short, bad_version, bad_hl,
+    /// bad_total_len, ttl_zero, csum_bad, fragment, not_ours,
+    /// unsupported_proto) — each sets a specific IP-header byte to a
+    /// bad value and relies on `ip_decode` to return the matching
+    /// `L3Drop` arm, which bumps the corresponding counter.
+    pub fn inject_eth_ip_frame(&mut self, ip_bytes: &[u8]) {
+        let mut frame = Vec::with_capacity(14 + ip_bytes.len());
+        frame.extend_from_slice(&[0x02, 0x00, 0x00, 0x00, 0x00, 0x01]); // dst = us
+        frame.extend_from_slice(&[0x02, 0x00, 0x00, 0x00, 0x00, 0x02]); // src = peer
+        frame.extend_from_slice(&0x0800u16.to_be_bytes()); // ethertype IPv4
+        frame.extend_from_slice(ip_bytes);
+        let _ = self.eng.inject_rx_frame(&frame);
+    }
+
+    /// Build a minimal well-formed IPv4 header (20 bytes, no options,
+    /// DF set, checksum computed) with caller-supplied protocol /
+    /// src_ip / dst_ip / ttl / payload. Used by IP-decode scenarios
+    /// that need to pass the structural checks but mutate specific
+    /// fields (e.g., ttl=0 → TtlZero, proto=17 → UnsupportedProto,
+    /// dst != OUR_IP → NotOurs).
+    pub fn build_ipv4_header(
+        proto: u8,
+        src: u32,
+        dst: u32,
+        ttl: u8,
+        payload: &[u8],
+    ) -> Vec<u8> {
+        let total = 20 + payload.len();
+        let mut v = vec![
+            0x45,                       // version=4, IHL=5
+            0x00,                       // DSCP/ECN
+            (total >> 8) as u8,
+            (total & 0xff) as u8,       // total_length
+            0x00, 0x01,                 // identification
+            0x40, 0x00,                 // flags=DF, frag_off=0
+            ttl,                        // TTL
+            proto,                      // protocol
+            0x00, 0x00,                 // checksum placeholder
+        ];
+        v.extend_from_slice(&src.to_be_bytes());
+        v.extend_from_slice(&dst.to_be_bytes());
+        let c = dpdk_net_core::l3_ip::internet_checksum(&[&v]);
+        v[10] = (c >> 8) as u8;
+        v[11] = (c & 0xff) as u8;
+        v.extend_from_slice(payload);
+        v
+    }
 }
+
