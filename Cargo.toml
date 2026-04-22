@@ -9,6 +9,7 @@ members = [
     "tools/bench-common",
     "tools/bench-e2e",
     "tools/bench-micro",
+    "tools/bench-offload-ab",
     "tools/bench-rx-zero-copy",
     "tools/bench-stress",
     "tools/bench-vs-linux",

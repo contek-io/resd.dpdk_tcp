@@ -168,6 +168,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "bench-offload-ab"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bench-common",
+ "chrono",
+ "clap 4.6.1",
+ "csv",
+ "serde_json",
+ "uuid",
+]
+
+[[package]]
 name = "bench-rx-zero-copy"
 version = "0.1.0"
 dependencies = [
