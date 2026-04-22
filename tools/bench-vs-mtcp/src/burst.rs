@@ -23,7 +23,10 @@
 //!
 //! One bucket → summarise p50/p99/p999/mean/stddev/ci95_lo/ci95_hi →
 //! emit 7 CSV rows tagged with the bucket's dimensions. Throughput is
-//! bits-per-second (spec §11.1 explicit).
+//! bits-per-second (spec §11.1 explicit); the CSV `metric_unit` column
+//! is `"bits_per_sec"` (not the ambiguous `"bps"` — in IT tooling
+//! "bps" often means bytes-per-sec, so we spell the unit out per spec
+//! §14.1's unit-column convention).
 //!
 //! Secondary decomposition (t_first_wire, initiation, steady) per
 //! spec §11.1 is captured by the per-burst sample collector in
@@ -35,6 +38,7 @@ use bench_common::csv_row::{CsvRow, MetricAggregation};
 use bench_common::percentile::{summarize, Summary};
 use bench_common::run_metadata::RunMetadata;
 
+use crate::dpdk_burst::TxTsMode;
 use crate::preflight::BucketVerdict;
 use crate::Stack;
 
@@ -194,6 +198,13 @@ pub struct BucketAggregate {
     /// Raw sample count — not the same as samples consumed, which
     /// equals `len - warmup`. Useful for the sanity invariant check.
     pub measurement_sample_count: usize,
+    /// TX-TS mode the runner used. `None` on rows produced by non-
+    /// dpdk_net stacks (e.g. the mTCP stub) where the concept does not
+    /// apply; `Some(mode)` on dpdk_net rows. Emitted into
+    /// `dimensions_json.tx_ts_mode` so downstream reports can
+    /// distinguish HW-TS rows from TSC-fallback rows on the same NIC /
+    /// across NICs.
+    pub tx_ts_mode: Option<TxTsMode>,
 }
 
 impl BucketAggregate {
@@ -205,11 +216,15 @@ impl BucketAggregate {
     /// row carries a record (samples may still be present — caller
     /// decides whether to summarise them) but the Summary slots are
     /// skipped to avoid writing untrustworthy percentiles.
+    ///
+    /// `tx_ts_mode` is `None` on rows that don't involve the dpdk_net
+    /// TX path (e.g. mTCP stub marker rows).
     pub fn from_samples(
         bucket: Bucket,
         stack: Stack,
         samples: &[BurstSample],
         verdict: BucketVerdict,
+        tx_ts_mode: Option<TxTsMode>,
     ) -> Self {
         let count = samples.len();
         let (t, i, s) = if verdict.is_ok() && !samples.is_empty() {
@@ -232,6 +247,21 @@ impl BucketAggregate {
             initiation_ns: i,
             steady_bps: s,
             measurement_sample_count: count,
+            tx_ts_mode,
+        }
+    }
+
+    /// Aggregate verdict for post-run override. After a bucket runs to
+    /// completion, the harness may flip the verdict based on a post-
+    /// run check (e.g. NIC saturation). This swaps in the new verdict
+    /// and nukes the Summary slots if it's an Invalid so the emit path
+    /// produces a marker row instead of untrustworthy percentiles.
+    pub fn override_verdict(&mut self, verdict: BucketVerdict) {
+        self.verdict = verdict;
+        if !self.verdict.is_ok() {
+            self.throughput_bps = None;
+            self.initiation_ns = None;
+            self.steady_bps = None;
         }
     }
 }
@@ -239,7 +269,11 @@ impl BucketAggregate {
 /// Build `dimensions_json` string for a bucket row per spec §11.3.
 ///
 /// The spec schema is
-/// `{"workload":"burst","K_bytes":<int>,"G_ms":<float>,"stack":<str>}`.
+/// `{"workload":"burst","K_bytes":<int>,"G_ms":<float>,"stack":<str>}`;
+/// we additionally append `"tx_ts_mode": <str>` when the row's runner
+/// knows which TX-TS source it used (dpdk_net side) so downstream
+/// reports can filter HW-TS rows from TSC-fallback rows. The mTCP stub
+/// leaves it unset.
 /// `G_ms` is emitted as `f64` (0.0, 1.0, 10.0, 100.0) to match the
 /// `<float>` designation; downstream bench-report parses it as
 /// `serde_json::Value::Number` so either integer or float form works
@@ -252,6 +286,7 @@ pub fn build_dimensions_json(
     bucket: Bucket,
     stack: Stack,
     invalid_reason: Option<&str>,
+    tx_ts_mode: Option<&str>,
 ) -> String {
     let mut v = serde_json::json!({
         "workload": "burst",
@@ -259,11 +294,17 @@ pub fn build_dimensions_json(
         "G_ms": bucket.gap_ms as f64,
         "stack": stack.as_dimension(),
     });
-    if let Some(r) = invalid_reason {
-        if let Some(m) = v.as_object_mut() {
+    if let Some(m) = v.as_object_mut() {
+        if let Some(r) = invalid_reason {
             m.insert(
                 "bucket_invalid".to_string(),
                 serde_json::Value::String(r.to_string()),
+            );
+        }
+        if let Some(mode) = tx_ts_mode {
+            m.insert(
+                "tx_ts_mode".to_string(),
+                serde_json::Value::String(mode.to_string()),
             );
         }
     }
@@ -319,7 +360,12 @@ pub fn emit_bucket_rows<W: std::io::Write>(
     feature_set: &str,
     aggregate: &BucketAggregate,
 ) -> Result<(), csv::Error> {
-    let dims = build_dimensions_json(aggregate.bucket, aggregate.stack, aggregate.verdict.reason());
+    let dims = build_dimensions_json(
+        aggregate.bucket,
+        aggregate.stack,
+        aggregate.verdict.reason(),
+        aggregate.tx_ts_mode.map(|m| m.as_str()),
+    );
 
     match &aggregate.throughput_bps {
         Some(summary) => {
@@ -330,7 +376,7 @@ pub fn emit_bucket_rows<W: std::io::Write>(
                 feature_set,
                 &dims,
                 "throughput_per_burst_bps",
-                "bps",
+                "bits_per_sec",
                 summary,
             )?;
         }
@@ -346,7 +392,7 @@ pub fn emit_bucket_rows<W: std::io::Write>(
                 feature_set: feature_set.to_string(),
                 dimensions_json: dims.clone(),
                 metric_name: "throughput_per_burst_bps".to_string(),
-                metric_unit: "bps".to_string(),
+                metric_unit: "bits_per_sec".to_string(),
                 metric_value: 0.0,
                 metric_aggregation: MetricAggregation::Mean,
             };
@@ -374,7 +420,7 @@ pub fn emit_bucket_rows<W: std::io::Write>(
             feature_set,
             &dims,
             "burst_steady_bps",
-            "bps",
+            "bits_per_sec",
             summary,
         )?;
     }
@@ -538,7 +584,13 @@ mod tests {
     fn bucket_aggregate_happy_path_summarises_all_three_metrics() {
         let bucket = Bucket::new(64 * 1024, 0);
         let samples = synthetic_samples(10_000);
-        let agg = BucketAggregate::from_samples(bucket, Stack::DpdkNet, &samples, BucketVerdict::Ok);
+        let agg = BucketAggregate::from_samples(
+            bucket,
+            Stack::DpdkNet,
+            &samples,
+            BucketVerdict::Ok,
+            Some(TxTsMode::TscFallback),
+        );
         assert!(agg.verdict.is_ok());
         assert!(agg.throughput_bps.is_some());
         assert!(agg.initiation_ns.is_some());
@@ -559,6 +611,7 @@ mod tests {
             Stack::DpdkNet,
             &samples,
             BucketVerdict::Invalid("NIC-bound".to_string()),
+            Some(TxTsMode::TscFallback),
         );
         assert!(!agg.verdict.is_ok());
         assert!(agg.throughput_bps.is_none());
@@ -570,7 +623,13 @@ mod tests {
     #[test]
     fn bucket_aggregate_empty_samples_skips_summary() {
         let bucket = Bucket::new(64 * 1024, 0);
-        let agg = BucketAggregate::from_samples(bucket, Stack::DpdkNet, &[], BucketVerdict::Ok);
+        let agg = BucketAggregate::from_samples(
+            bucket,
+            Stack::DpdkNet,
+            &[],
+            BucketVerdict::Ok,
+            Some(TxTsMode::TscFallback),
+        );
         assert!(agg.throughput_bps.is_none());
     }
 
@@ -583,6 +642,7 @@ mod tests {
         let dims = build_dimensions_json(
             Bucket::new(64 * 1024, 0),
             Stack::DpdkNet,
+            None,
             None,
         );
         let parsed: serde_json::Value = serde_json::from_str(&dims).unwrap();
@@ -599,6 +659,7 @@ mod tests {
         );
         assert_eq!(parsed["stack"], "dpdk_net");
         assert!(parsed.get("bucket_invalid").is_none());
+        assert!(parsed.get("tx_ts_mode").is_none());
     }
 
     #[test]
@@ -607,6 +668,7 @@ mod tests {
             Bucket::new(1 << 20, 100),
             Stack::Mtcp,
             Some("NIC-bound"),
+            None,
         );
         let parsed: serde_json::Value = serde_json::from_str(&dims).unwrap();
         assert_eq!(parsed["stack"], "mtcp");
@@ -617,9 +679,29 @@ mod tests {
     fn dimensions_json_is_stable_across_calls() {
         // bench-report groups rows by the verbatim string; serialisation
         // must be deterministic.
-        let a = build_dimensions_json(Bucket::new(256 * 1024, 10), Stack::Mtcp, None);
-        let b = build_dimensions_json(Bucket::new(256 * 1024, 10), Stack::Mtcp, None);
+        let a = build_dimensions_json(Bucket::new(256 * 1024, 10), Stack::Mtcp, None, None);
+        let b = build_dimensions_json(Bucket::new(256 * 1024, 10), Stack::Mtcp, None, None);
         assert_eq!(a, b);
+    }
+
+    #[test]
+    fn dimensions_json_emits_tx_ts_mode_when_provided() {
+        let hw = build_dimensions_json(
+            Bucket::new(64 * 1024, 0),
+            Stack::DpdkNet,
+            None,
+            Some(TxTsMode::HwTs.as_str()),
+        );
+        let parsed: serde_json::Value = serde_json::from_str(&hw).unwrap();
+        assert_eq!(parsed["tx_ts_mode"], "hw_ts");
+        let tsc = build_dimensions_json(
+            Bucket::new(64 * 1024, 0),
+            Stack::DpdkNet,
+            None,
+            Some(TxTsMode::TscFallback.as_str()),
+        );
+        let parsed: serde_json::Value = serde_json::from_str(&tsc).unwrap();
+        assert_eq!(parsed["tx_ts_mode"], "tsc_fallback");
     }
 
     // ----------------------------------------------------------------
@@ -658,7 +740,13 @@ mod tests {
     fn emit_bucket_rows_happy_path_emits_21_rows() {
         let bucket = Bucket::new(64 * 1024, 0);
         let samples = synthetic_samples(1_000);
-        let agg = BucketAggregate::from_samples(bucket, Stack::DpdkNet, &samples, BucketVerdict::Ok);
+        let agg = BucketAggregate::from_samples(
+            bucket,
+            Stack::DpdkNet,
+            &samples,
+            BucketVerdict::Ok,
+            Some(TxTsMode::TscFallback),
+        );
         let mut buf = Vec::new();
         {
             let mut writer = csv::Writer::from_writer(&mut buf);
@@ -678,6 +766,7 @@ mod tests {
             Stack::DpdkNet,
             &[],
             BucketVerdict::Invalid("NIC-bound".to_string()),
+            Some(TxTsMode::TscFallback),
         );
         let mut buf = Vec::new();
         {
@@ -687,5 +776,101 @@ mod tests {
             writer.flush().unwrap();
         }
         assert_eq!(count_csv_rows(&buf), 1);
+    }
+
+    // ----------------------------------------------------------------
+    // CSV emit: HW-TS vs TSC-fallback tagging in dimensions_json.
+    // Proves the tx_ts_mode wire path from BucketRun → BucketAggregate
+    // → emit_bucket_rows → CSV column. Future-proofs the HW-TS row
+    // being distinguishable once Engine::last_tx_hw_ts lands.
+    // ----------------------------------------------------------------
+
+    /// Read back a rendered CSV and extract the `dimensions_json`
+    /// column from the first data row. The CSV writer escapes inner
+    /// double quotes, so inspecting the raw buffer for
+    /// `"tx_ts_mode":"hw_ts"` needs to go through the CSV parser.
+    fn first_row_dimensions_json(buf: &[u8]) -> serde_json::Value {
+        let mut reader = csv::Reader::from_reader(buf);
+        let headers = reader.headers().unwrap().clone();
+        let idx = headers
+            .iter()
+            .position(|h| h == "dimensions_json")
+            .expect("dimensions_json column present");
+        let row = reader
+            .records()
+            .next()
+            .expect("at least one data row")
+            .unwrap();
+        serde_json::from_str(row.get(idx).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn emit_bucket_rows_tags_hw_ts_rows_in_dimensions_json() {
+        let bucket = Bucket::new(64 * 1024, 0);
+        let samples = synthetic_samples(100);
+        let agg = BucketAggregate::from_samples(
+            bucket,
+            Stack::DpdkNet,
+            &samples,
+            BucketVerdict::Ok,
+            Some(TxTsMode::HwTs),
+        );
+        let mut buf = Vec::new();
+        {
+            let mut writer = csv::Writer::from_writer(&mut buf);
+            emit_bucket_rows(&mut writer, &sample_metadata(), "bench-vs-mtcp", "trading-latency", &agg)
+                .unwrap();
+            writer.flush().unwrap();
+        }
+        let dims = first_row_dimensions_json(&buf);
+        assert_eq!(dims["tx_ts_mode"], "hw_ts");
+    }
+
+    #[test]
+    fn emit_bucket_rows_tags_tsc_fallback_rows_in_dimensions_json() {
+        let bucket = Bucket::new(64 * 1024, 0);
+        let samples = synthetic_samples(100);
+        let agg = BucketAggregate::from_samples(
+            bucket,
+            Stack::DpdkNet,
+            &samples,
+            BucketVerdict::Ok,
+            Some(TxTsMode::TscFallback),
+        );
+        let mut buf = Vec::new();
+        {
+            let mut writer = csv::Writer::from_writer(&mut buf);
+            emit_bucket_rows(&mut writer, &sample_metadata(), "bench-vs-mtcp", "trading-latency", &agg)
+                .unwrap();
+            writer.flush().unwrap();
+        }
+        let dims = first_row_dimensions_json(&buf);
+        assert_eq!(dims["tx_ts_mode"], "tsc_fallback");
+    }
+
+    #[test]
+    fn emit_bucket_rows_omits_tx_ts_mode_when_none() {
+        // mTCP stub rows don't carry a tx_ts_mode; absence = downstream
+        // reports group them separately from the dpdk_net rows.
+        let bucket = Bucket::new(64 * 1024, 0);
+        let agg = BucketAggregate::from_samples(
+            bucket,
+            Stack::Mtcp,
+            &[],
+            BucketVerdict::Invalid("mtcp stub".to_string()),
+            None,
+        );
+        let mut buf = Vec::new();
+        {
+            let mut writer = csv::Writer::from_writer(&mut buf);
+            emit_bucket_rows(&mut writer, &sample_metadata(), "bench-vs-mtcp", "trading-latency", &agg)
+                .unwrap();
+            writer.flush().unwrap();
+        }
+        let dims = first_row_dimensions_json(&buf);
+        assert!(
+            dims.get("tx_ts_mode").is_none(),
+            "expected dimensions_json to omit tx_ts_mode when None; got {dims}"
+        );
     }
 }

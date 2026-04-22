@@ -10,6 +10,7 @@ use bench_vs_mtcp::burst::{
     enumerate_filtered_grid, enumerate_grid, Bucket, BucketAggregate, BurstSample, BUCKET_COUNT,
     G_MS, K_BYTES,
 };
+use bench_vs_mtcp::dpdk_burst::TxTsMode;
 use bench_vs_mtcp::maxtp;
 use bench_vs_mtcp::mtcp::{self, MtcpConfig};
 use bench_vs_mtcp::preflight::{
@@ -155,8 +156,13 @@ fn bucket_aggregate_happy_path_summarises_all_metrics() {
             BurstSample::from_timestamps(64 * 1024, t0, t_first_wire, t1)
         })
         .collect();
-    let agg =
-        BucketAggregate::from_samples(bucket, Stack::DpdkNet, &samples, BucketVerdict::Ok);
+    let agg = BucketAggregate::from_samples(
+        bucket,
+        Stack::DpdkNet,
+        &samples,
+        BucketVerdict::Ok,
+        Some(TxTsMode::TscFallback),
+    );
     assert!(agg.throughput_bps.is_some());
     assert!(agg.initiation_ns.is_some());
     assert!(agg.steady_bps.is_some());
@@ -174,6 +180,7 @@ fn bucket_aggregate_invalid_verdict_skips_all_summaries() {
         Stack::DpdkNet,
         &samples,
         BucketVerdict::Invalid("NIC-bound".to_string()),
+        Some(TxTsMode::TscFallback),
     );
     assert!(agg.throughput_bps.is_none());
     assert!(agg.initiation_ns.is_none());
@@ -321,8 +328,13 @@ fn emit_bucket_rows_dimensions_json_matches_spec_11_3_shape() {
             BurstSample::from_timestamps(1 << 20, t0, t0 + 100, t0 + 1_000)
         })
         .collect();
-    let agg =
-        BucketAggregate::from_samples(bucket, Stack::DpdkNet, &samples, BucketVerdict::Ok);
+    let agg = BucketAggregate::from_samples(
+        bucket,
+        Stack::DpdkNet,
+        &samples,
+        BucketVerdict::Ok,
+        Some(TxTsMode::TscFallback),
+    );
     let metadata = sample_metadata();
     let mut buf = Vec::new();
     {
@@ -339,6 +351,7 @@ fn emit_bucket_rows_dimensions_json_matches_spec_11_3_shape() {
         .position(|h| h == "dimensions_json")
         .expect("dimensions_json column present");
     let metric_name_idx = headers.iter().position(|h| h == "metric_name").unwrap();
+    let metric_unit_idx = headers.iter().position(|h| h == "metric_unit").unwrap();
     let mut seen_throughput = false;
     let mut seen_initiation = false;
     let mut seen_steady = false;
@@ -357,10 +370,26 @@ fn emit_bucket_rows_dimensions_json_matches_spec_11_3_shape() {
         );
         assert_eq!(dims["stack"], "dpdk_net");
         assert!(dims.get("bucket_invalid").is_none());
-        match rec.get(metric_name_idx).unwrap() {
-            "throughput_per_burst_bps" => seen_throughput = true,
-            "burst_initiation_ns" => seen_initiation = true,
-            "burst_steady_bps" => seen_steady = true,
+        // I3: every dpdk_net row tags the TX-TS measurement source so
+        // CSV consumers can filter HW-TS vs TSC-fallback rows.
+        assert_eq!(dims["tx_ts_mode"], "tsc_fallback");
+        let metric_name = rec.get(metric_name_idx).unwrap();
+        let metric_unit = rec.get(metric_unit_idx).unwrap();
+        match metric_name {
+            "throughput_per_burst_bps" => {
+                // I1: throughput unit is spelled out as `bits_per_sec`
+                // (not the ambiguous `bps`) per spec §14.1.
+                assert_eq!(metric_unit, "bits_per_sec");
+                seen_throughput = true;
+            }
+            "burst_initiation_ns" => {
+                assert_eq!(metric_unit, "ns");
+                seen_initiation = true;
+            }
+            "burst_steady_bps" => {
+                assert_eq!(metric_unit, "bits_per_sec");
+                seen_steady = true;
+            }
             other => panic!("unexpected metric_name {other}"),
         }
     }

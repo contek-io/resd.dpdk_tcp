@@ -2658,6 +2658,10 @@ git commit -m "a10 task 14: bench-report — CSV → JSON + HTML + Markdown (spe
 - **T9-I5:** Add integration test asserting differing packet counts between local+peer pcaps produces non-zero `diff_bytes` + accurate `local_packets`/`peer_packets` CSV rows.
 - **T9 minor:** `CanonError::MalformedSackOption` for SACK option malformed length; fold two option walkers into one `walk_options<F>(slice, visitor: F)`; extract synth-pcap builder from `tests/normalize_roundtrip.rs` (857 lines) into `tests/common/synth.rs`.
 
+**Follow-up from T12 code review:**
+
+- **T12-I4 (peer rwnd tautology):** `tools/bench-vs-mtcp/src/main.rs:run_burst_grid_dpdk` plugs `peer_rwnd = bucket.burst_bytes` into `check_peer_window(peer_rwnd, K)`, which makes the spec §11.1 check (1) a `K >= K` tautology — it can never fail. Real peer-window introspection requires either (a) parsing the last observed ACK's scaled window via an engine hook (`Engine::last_peer_rwnd(conn)`), or (b) an out-of-band peer-host stats query. T15 owns peer orchestration (SSH to peer, starts `/opt/bench-peer-linux/bench-peer`) so wiring real rwnd introspection belongs here. Fix options: expose `last_peer_rwnd` on the engine's public API OR scrape the peer's `ss -ti` output over SSH and plumb the value through. The TODO(T15) comment in `run_burst_grid_dpdk` marks the site.
+
 ### Steps
 
 - [ ] **Step 15.1: Write the script**

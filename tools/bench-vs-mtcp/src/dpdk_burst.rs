@@ -70,8 +70,12 @@ use crate::burst::{BurstSample, Bucket};
 /// visible in bench-report).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TxTsMode {
-    /// Read `rte_mbuf::tx_timestamp` dynfield. Unavailable on ENA.
-    #[allow(dead_code)] // Will be used on mlx5/ice; shape reserved.
+    /// Read `rte_mbuf::tx_timestamp` dynfield. Unavailable on ENA;
+    /// selected by the operator (via `DpdkBurstCfg.tx_ts_mode`) on
+    /// NICs that advertise the dynfield (mlx5/ice). The variant is
+    /// live once `Engine::last_tx_hw_ts(conn)` lands; today the
+    /// enum value still participates in `dimensions_json.tx_ts_mode`
+    /// so CSV consumers can filter rows by measurement source.
     HwTs,
     /// TSC captured at `rte_eth_tx_burst` return (ENA fallback).
     TscFallback,
@@ -155,23 +159,21 @@ pub fn run_bucket(cfg: &DpdkBurstCfg<'_>) -> anyhow::Result<BucketRun> {
 
         // Remaining bytes — push them, drive poll, drain until the
         // stack has accepted the full K bytes + the TX ring has
-        // flushed the final segment through `rte_eth_tx_burst`.
-        drive_burst_remainder_to_completion(
+        // flushed the final segment through `rte_eth_tx_burst`. The
+        // helper captures `t1_tsc` immediately on return of that
+        // final `rte_eth_tx_burst` (spec §11.1: TSC-at-
+        // `rte_eth_tx_burst`-return) so poll/drain noise doesn't
+        // bias the (t1 − t0) window.
+        //
+        // Once `Engine::last_tx_hw_ts(conn)` lands, swap this line
+        // for the HW-TS read at the same point.
+        let t1_tsc = drive_burst_remainder_to_completion(
             cfg.engine,
             cfg.conn,
             cfg.payload,
             initial_accepted,
         )
         .with_context(|| format!("burst {i} drain ({})", cfg.bucket.label()))?;
-
-        // t1 = TSC at end of drain (TSC fallback) OR
-        // `rte_mbuf::tx_timestamp` on the last segment (HW TS path).
-        // The HW TS read is not plumbed through the engine's send-
-        // path API in T12 — see TxTsMode docs — so we always
-        // capture TSC here. The TX-TS HW path requires a new
-        // engine-level hook (`Engine::last_tx_hw_ts(conn)` or similar)
-        // that doesn't exist today.
-        let t1_tsc = dpdk_net_core::clock::rdtsc();
 
         let t0_ns = tsc_to_absolute_ns(t0_tsc, cfg.tsc_hz);
         let t_first_wire_ns = tsc_to_absolute_ns(t_first_wire_tsc, cfg.tsc_hz);
@@ -301,22 +303,28 @@ fn send_first_segment_and_capture_wire_time(
 /// `poll_once` + `drain_and_accumulate_readable` starting from byte
 /// offset `already_sent` (the count returned by
 /// `send_first_segment_and_capture_wire_time`) until the full K bytes
-/// have been handed to the stack and the TX ring has been polled at
-/// least once post-accept.
+/// have been handed to the stack, then issues a final flush `poll_once`
+/// (which invokes `rte_eth_tx_burst` for the last segment), captures
+/// `t1_tsc` immediately on return, and only then drains any residual
+/// Readable events.
 ///
-/// The MVP approximates "last segment hit the wire" by checking that
-/// every byte has been accepted into the stack's send path, then
-/// issuing one more `poll_once` so `rte_eth_tx_burst` flushes the
-/// last segment. This is an upper-bound on t1 — the real wire time
-/// is slightly earlier. Once `Engine::last_tx_hw_ts(conn)` lands, the
-/// HW-TS path reads the exact value. Error on drain timeout (60s) so
-/// a jammed peer produces a visible failure instead of wedging.
+/// Returns `t1_tsc`: the TSC value sampled right after the final
+/// `rte_eth_tx_burst` (the closest observable point to "segment N hit
+/// the wire" without HW TS — spec §11.1: "TSC-at-`rte_eth_tx_burst`-
+/// return"). Capturing here — BEFORE the post-flush drain — keeps the
+/// t1−t0 window tight to what the TX path actually spent; capturing
+/// after the drain would fold poll-loop / Readable-drain noise into
+/// the throughput denominator and bias throughput low.
+///
+/// Once `Engine::last_tx_hw_ts(conn)` lands, the HW-TS path reads the
+/// exact NIC timestamp instead. Error on drain timeout (60s) so a
+/// jammed peer produces a visible failure instead of wedging.
 fn drive_burst_remainder_to_completion(
     engine: &Engine,
     conn: ConnHandle,
     payload: &[u8],
     already_sent: usize,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<u64> {
     let mut sent = already_sent;
     let deadline = std::time::Instant::now() + Duration::from_secs(60);
     let mut last_rx: Option<u64> = None;
@@ -338,11 +346,16 @@ fn drive_burst_remainder_to_completion(
             Err(e) => anyhow::bail!("send_bytes failed mid-burst: {e:?}"),
         }
     }
-    // Final flush poll so the TX ring drains.
+    // Final flush poll → `rte_eth_tx_burst` pushes the last segment.
+    // Capture t1_tsc IMMEDIATELY on return so the throughput window
+    // is bounded at the closest-to-wire observable point. Any work
+    // that comes after (the Readable drain below) is excluded from
+    // (t1 − t0) — see spec §11.1 "TSC-at-`rte_eth_tx_burst`-return".
     engine.poll_once();
+    let t1_tsc = dpdk_net_core::clock::rdtsc();
     let _ = drain_and_accumulate_readable(engine, conn, &mut last_rx)
         .context("burst final drain")?;
-    Ok(())
+    Ok(t1_tsc)
 }
 
 /// Absolute-time conversion: TSC cycles → nanoseconds, anchored at
