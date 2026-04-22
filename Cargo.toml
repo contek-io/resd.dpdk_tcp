@@ -11,6 +11,7 @@ members = [
     "tools/bench-micro",
     "tools/bench-obs-overhead",
     "tools/bench-offload-ab",
+    "tools/bench-report",
     "tools/bench-rx-zero-copy",
     "tools/bench-stress",
     "tools/bench-vs-linux",

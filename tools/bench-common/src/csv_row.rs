@@ -36,6 +36,30 @@ use std::fmt;
 use crate::preconditions::{PreconditionMode, Preconditions};
 use crate::run_metadata::RunMetadata;
 
+/// The 14 precondition column names in spec §14.1 order. Used by the
+/// `Deserialize` visitor to emit a "missing precondition column X" error
+/// if an older/newer tool writes a schema-drifted CSV that omits one.
+///
+/// Exported for test-side construction of deliberately-dropped-column fixtures
+/// (see `tools/bench-common/tests/csv_row_roundtrip.rs`) so the list stays in
+/// sync with the actual visitor keys.
+pub const PRECONDITION_COLUMNS: &[&str] = &[
+    "precondition_isolcpus",
+    "precondition_nohz_full",
+    "precondition_rcu_nocbs",
+    "precondition_governor",
+    "precondition_cstate_max",
+    "precondition_tsc_invariant",
+    "precondition_coalesce_off",
+    "precondition_tso_off",
+    "precondition_lro_off",
+    "precondition_rss_on",
+    "precondition_thermal_throttle",
+    "precondition_hugepages_reserved",
+    "precondition_irqbalance_off",
+    "precondition_wc_active",
+];
+
 pub use crate::preconditions::PreconditionValue;
 
 /// Aggregation bucket a `metric_value` represents. Spec §14.2.
@@ -220,7 +244,25 @@ impl<'de> Visitor<'de> for CsvRowVisitor {
         let mut ami_id: Option<String> = None;
         let mut precondition_mode: Option<PreconditionMode> = None;
 
-        let mut p = Preconditions::default();
+        // RI1 follow-up (T14): track each precondition column individually so
+        // a schema-drifted CSV that silently omits one fails with a clear
+        // "missing precondition column X" error rather than defaulting the
+        // missing cell to `PreconditionValue::default()` (= `Pass(None)`) and
+        // reporting a false green.
+        let mut isolcpus: Option<PreconditionValue> = None;
+        let mut nohz_full: Option<PreconditionValue> = None;
+        let mut rcu_nocbs: Option<PreconditionValue> = None;
+        let mut governor: Option<PreconditionValue> = None;
+        let mut cstate_max: Option<PreconditionValue> = None;
+        let mut tsc_invariant: Option<PreconditionValue> = None;
+        let mut coalesce_off: Option<PreconditionValue> = None;
+        let mut tso_off: Option<PreconditionValue> = None;
+        let mut lro_off: Option<PreconditionValue> = None;
+        let mut rss_on: Option<PreconditionValue> = None;
+        let mut thermal_throttle: Option<PreconditionValue> = None;
+        let mut hugepages_reserved: Option<PreconditionValue> = None;
+        let mut irqbalance_off: Option<PreconditionValue> = None;
+        let mut wc_active: Option<PreconditionValue> = None;
 
         let mut tool: Option<String> = None;
         let mut test_case: Option<String> = None;
@@ -246,22 +288,20 @@ impl<'de> Visitor<'de> for CsvRowVisitor {
                 "nic_fw" => nic_fw = Some(map.next_value()?),
                 "ami_id" => ami_id = Some(map.next_value()?),
                 "precondition_mode" => precondition_mode = Some(map.next_value()?),
-                "precondition_isolcpus" => {
-                    p.isolcpus = map.next_value::<PreconditionValue>()?;
-                }
-                "precondition_nohz_full" => p.nohz_full = map.next_value()?,
-                "precondition_rcu_nocbs" => p.rcu_nocbs = map.next_value()?,
-                "precondition_governor" => p.governor = map.next_value()?,
-                "precondition_cstate_max" => p.cstate_max = map.next_value()?,
-                "precondition_tsc_invariant" => p.tsc_invariant = map.next_value()?,
-                "precondition_coalesce_off" => p.coalesce_off = map.next_value()?,
-                "precondition_tso_off" => p.tso_off = map.next_value()?,
-                "precondition_lro_off" => p.lro_off = map.next_value()?,
-                "precondition_rss_on" => p.rss_on = map.next_value()?,
-                "precondition_thermal_throttle" => p.thermal_throttle = map.next_value()?,
-                "precondition_hugepages_reserved" => p.hugepages_reserved = map.next_value()?,
-                "precondition_irqbalance_off" => p.irqbalance_off = map.next_value()?,
-                "precondition_wc_active" => p.wc_active = map.next_value()?,
+                "precondition_isolcpus" => isolcpus = Some(map.next_value()?),
+                "precondition_nohz_full" => nohz_full = Some(map.next_value()?),
+                "precondition_rcu_nocbs" => rcu_nocbs = Some(map.next_value()?),
+                "precondition_governor" => governor = Some(map.next_value()?),
+                "precondition_cstate_max" => cstate_max = Some(map.next_value()?),
+                "precondition_tsc_invariant" => tsc_invariant = Some(map.next_value()?),
+                "precondition_coalesce_off" => coalesce_off = Some(map.next_value()?),
+                "precondition_tso_off" => tso_off = Some(map.next_value()?),
+                "precondition_lro_off" => lro_off = Some(map.next_value()?),
+                "precondition_rss_on" => rss_on = Some(map.next_value()?),
+                "precondition_thermal_throttle" => thermal_throttle = Some(map.next_value()?),
+                "precondition_hugepages_reserved" => hugepages_reserved = Some(map.next_value()?),
+                "precondition_irqbalance_off" => irqbalance_off = Some(map.next_value()?),
+                "precondition_wc_active" => wc_active = Some(map.next_value()?),
                 "tool" => tool = Some(map.next_value()?),
                 "test_case" => test_case = Some(map.next_value()?),
                 "feature_set" => feature_set = Some(map.next_value()?),
@@ -282,6 +322,23 @@ impl<'de> Visitor<'de> for CsvRowVisitor {
             v.ok_or_else(|| E::missing_field(name))
         }
 
+        let preconditions = Preconditions {
+            isolcpus: require(isolcpus, "precondition_isolcpus")?,
+            nohz_full: require(nohz_full, "precondition_nohz_full")?,
+            rcu_nocbs: require(rcu_nocbs, "precondition_rcu_nocbs")?,
+            governor: require(governor, "precondition_governor")?,
+            cstate_max: require(cstate_max, "precondition_cstate_max")?,
+            tsc_invariant: require(tsc_invariant, "precondition_tsc_invariant")?,
+            coalesce_off: require(coalesce_off, "precondition_coalesce_off")?,
+            tso_off: require(tso_off, "precondition_tso_off")?,
+            lro_off: require(lro_off, "precondition_lro_off")?,
+            rss_on: require(rss_on, "precondition_rss_on")?,
+            thermal_throttle: require(thermal_throttle, "precondition_thermal_throttle")?,
+            hugepages_reserved: require(hugepages_reserved, "precondition_hugepages_reserved")?,
+            irqbalance_off: require(irqbalance_off, "precondition_irqbalance_off")?,
+            wc_active: require(wc_active, "precondition_wc_active")?,
+        };
+
         let run_metadata = RunMetadata {
             run_id: require(run_id, "run_id")?,
             run_started_at: require(run_started_at, "run_started_at")?,
@@ -296,7 +353,7 @@ impl<'de> Visitor<'de> for CsvRowVisitor {
             nic_fw: require(nic_fw, "nic_fw")?,
             ami_id: require(ami_id, "ami_id")?,
             precondition_mode: require(precondition_mode, "precondition_mode")?,
-            preconditions: p,
+            preconditions,
         };
 
         Ok(CsvRow {

@@ -197,6 +197,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "bench-report"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bench-common",
+ "clap 4.6.1",
+ "csv",
+ "serde",
+ "serde_json",
+ "uuid",
+ "walkdir",
+]
+
+[[package]]
 name = "bench-rx-zero-copy"
 version = "0.1.0"
 dependencies = [
