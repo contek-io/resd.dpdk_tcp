@@ -2750,16 +2750,15 @@ impl Engine {
         // `conn_timeout_syn_sent` counter, same `force_close_etimedout`
         // teardown (emits `Error{err=-ETIMEDOUT}`).
         //
-        // A8 T11 NOTE: listen-slot `in_progress` cleanup on passive
-        // budget-exhaust is NOT wired in T11. T12 (S1(b)) adds a
-        // `clear_in_progress_for_conn` helper at every SYN_RCVD→Closed
-        // site (handle_syn_received RST/bad-ACK branch, this fire
-        // handler, etc.). In T11 scope: `force_close_etimedout`
-        // transitions the conn to Closed + removes its flow-table slot,
-        // but the listen slot's `in_progress: Some(h)` reference
-        // dangles until T12 clears it. Single-shot per-test scope (A7
-        // design spec §1.1) keeps this benign — a second SYN on the
-        // same listen slot would be rejected with RST until T12 lands.
+        // A8 T12 (S1(b)): on passive-open budget exhaust, clear the
+        // listen slot's `in_progress` BEFORE `force_close_etimedout`
+        // removes the conn slot. `clear_in_progress_for_conn` is
+        // idempotent and safe to call on active-open conns (no match),
+        // but we only call it when `is_passive` to keep the borrow
+        // scope narrow + self-document the intent. This is the third
+        // SYN_RCVD → Closed site (the other two route via the Outcome
+        // `clear_listen_slot_on_close` field in `handle_syn_received`).
+        // Retires AD-A7-listen-slot-leak-on-failed-handshake.
         let new_count = {
             let mut ft = self.flow_table.borrow_mut();
             match ft.get_mut(handle) {
@@ -2772,6 +2771,12 @@ impl Engine {
         };
         if new_count > 3 {
             crate::counters::inc(&self.counters.tcp.conn_timeout_syn_sent);
+            #[cfg(feature = "test-server")]
+            if is_passive {
+                self.clear_in_progress_for_conn(handle);
+            }
+            #[cfg(not(feature = "test-server"))]
+            let _ = is_passive;
             self.force_close_etimedout(handle);
             return;
         }
@@ -3759,6 +3764,18 @@ impl Engine {
                 &self.counters,
             );
             inc(&self.counters.tcp.conn_open);
+        }
+
+        // A8 T12 (S1(b)): any SYN_RCVD → Closed transition (RST-in-SYN_RCVD
+        // or bad-ACK-in-SYN_RCVD) must clear the listen slot's
+        // `in_progress` so subsequent SYNs can land. `handle_syn_received`
+        // sets `clear_listen_slot_on_close = true` on those arms; the
+        // third site (SYN-retrans budget exhaust) clears the slot inline
+        // in `on_syn_retrans_fire` since it doesn't flow through the
+        // dispatch path. Retires AD-A7-listen-slot-leak-on-failed-handshake.
+        #[cfg(feature = "test-server")]
+        if outcome.clear_listen_slot_on_close {
+            self.clear_in_progress_for_conn(handle);
         }
 
         if outcome.delivered > 0 {
@@ -5713,6 +5730,31 @@ impl Engine {
             if slot.in_progress == Some(handle) {
                 slot.in_progress = None;
                 slot.accept_queue = Some(handle);
+                return;
+            }
+        }
+    }
+
+    /// A8 T12 (S1(b) per AD-A7-listen-slot-leak-on-failed-handshake):
+    /// clear any listen slot's `in_progress` if it currently pairs with
+    /// `handle`. Idempotent + safe to call on handles that weren't
+    /// passive-opened (active-open conns never appear in a listen slot).
+    ///
+    /// Called from every SYN_RCVD → Closed site so the listen slot
+    /// accepts fresh SYNs after any failed handshake:
+    ///   1. RST-in-SYN_RCVD (tcp_input `handle_syn_received` RST arm)
+    ///   2. bad-ACK in SYN_RCVD (same handler, bad-ACK arm → RST + Closed)
+    ///   3. SYN-retrans budget exhaust (`on_syn_retrans_fire` `> 3` arm,
+    ///      which invokes `force_close_etimedout`; this helper is called
+    ///      right before the force-close on passive-open conns).
+    pub(crate) fn clear_in_progress_for_conn(
+        &self,
+        handle: crate::flow_table::ConnHandle,
+    ) {
+        let mut slots = self.listen_slots.borrow_mut();
+        for (_, slot) in slots.iter_mut() {
+            if slot.in_progress == Some(handle) {
+                slot.in_progress = None;
                 return;
             }
         }

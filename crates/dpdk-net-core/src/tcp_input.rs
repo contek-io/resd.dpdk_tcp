@@ -267,6 +267,16 @@ pub struct Outcome {
     pub in_order_delivered_from_seg: u32,
     pub connected: bool,
     pub closed: bool,
+    /// A8 T12 (S1(b)): signals the engine that a SYN_RCVD→Closed transition
+    /// happened and the listen slot's `in_progress` should be cleared so
+    /// subsequent SYNs on the same listen can land. Set `true` by
+    /// `handle_syn_received` on the RST and bad-ACK arms (both transition
+    /// to Closed). The engine consumer calls
+    /// `Engine::clear_in_progress_for_conn(handle)` after the outcome-based
+    /// state transition has fired. Feature-gated: only the test-server
+    /// build carries a listen-slot table to clear.
+    #[cfg(feature = "test-server")]
+    pub clear_listen_slot_on_close: bool,
 }
 
 impl Outcome {
@@ -299,6 +309,8 @@ impl Outcome {
             in_order_delivered_from_seg: 0,
             connected: false,
             closed: false,
+            #[cfg(feature = "test-server")]
+            clear_listen_slot_on_close: false,
         }
     }
     pub fn none() -> Self {
@@ -370,11 +382,17 @@ fn handle_syn_received(
     use crate::tcp_seq::seq_le;
 
     // RST handling mirrors SYN_SENT (RFC 9293 §3.10.7.4).
+    //
+    // A8 T12 (S1(b)): `clear_listen_slot_on_close = true` signals the
+    // engine to clear the matching listen slot's `in_progress` so a
+    // fresh SYN on the same (dst_ip, dst_port) can land. Without this,
+    // a failed passive handshake wedges the listen slot forever.
     if (seg.flags & TCP_RST) != 0 {
         return Outcome {
             tx: TxAction::None,
             new_state: Some(TcpState::Closed),
             closed: true,
+            clear_listen_slot_on_close: true,
             ..Outcome::base()
         };
     }
@@ -391,11 +409,14 @@ fn handle_syn_received(
             ..Outcome::base()
         };
     }
+    // A8 T12 (S1(b)): bad-ACK → RST + Closed; also clear the listen slot
+    // so subsequent SYNs on the same listen can be accepted.
     if !seq_le(conn.snd_una.wrapping_add(1), seg.ack) || !seq_le(seg.ack, conn.snd_nxt) {
         return Outcome {
             tx: TxAction::Rst,
             new_state: Some(TcpState::Closed),
             closed: true,
+            clear_listen_slot_on_close: true,
             ..Outcome::base()
         };
     }
