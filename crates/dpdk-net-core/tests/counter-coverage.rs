@@ -1597,8 +1597,11 @@ fn build_icmp_frag_needed_inner(inner_dst: u32, mtu: u16) -> Vec<u8> {
 //     `TcpConn` directly in `SynReceived` via `TcpConn::new_passive`
 //     (no transition_conn call). Row 1 and column 1 are all
 //     Unreachable.
-//   - SYN_RECEIVED → LISTEN (S1(c) RST handling) is not yet wired;
-//     lands in T13. Cell [3][1] is Unreachable("awaits T13 S1(c)").
+//   - SYN_RECEIVED → LISTEN (S1(c) RST handling): A8 T13 wired this
+//     edge via `Engine::re_listen_if_from_passive` (RFC 9293 §3.10.7.4
+//     First). Cell [3][1] is now Reached (feature=test-server only;
+//     production spec §6 "Never transition to LISTEN" is preserved
+//     because the helper is not compiled in).
 //   - TIME_WAIT → CLOSED requires `reap_time_wait`, which is only
 //     invoked from `poll_once` in production. The test harness calls
 //     the test-server shim `Engine::test_reap_time_wait` after
@@ -1671,7 +1674,7 @@ const STATE_TRANS_COVERAGE: [[CellCoverage; NSTATES]; NSTATES] = [
     // row 3: from SynReceived
     [
         r(scen_syn_received_to_closed_bad_ack, 1),
-        u("A8 T8: awaits T13 S1(c) (RST→LISTEN on test-server); no current wiring"),
+        r(scen_syn_received_to_listen_rst, 1),
         u("no direct edge"),
         u("self-edge"),
         r(scen_syn_received_to_established, 1),
@@ -1857,6 +1860,17 @@ fn scen_syn_sent_to_established(h: &mut CovHarness) {
 fn scen_syn_received_to_closed_bad_ack(h: &mut CovHarness) {
     let _ = h.do_passive_open_syn_ack_only();
     h.inject_peer_bad_ack_to_syn_rcvd();
+}
+
+/// [3][1] SynReceived → Listen: A8 T13 S1(c). Passive-opened conn in
+/// SYN_RCVD receives a RST; per RFC 9293 §3.10.7.4 First it "returns
+/// to the LISTEN state". `re_listen_if_from_passive` records the
+/// synthetic edge directly (not via `transition_conn`) because the
+/// project rule spec §6 line 365 forbids the LISTEN state anywhere
+/// except test-server builds.
+fn scen_syn_received_to_listen_rst(h: &mut CovHarness) {
+    let _ = h.do_passive_open_syn_ack_only();
+    h.inject_rst_to_syn_rcvd();
 }
 
 /// [3][4] SynReceived → Established: final ACK completes the passive

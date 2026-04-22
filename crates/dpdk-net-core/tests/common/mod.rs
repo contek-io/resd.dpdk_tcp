@@ -1448,6 +1448,39 @@ impl CovHarness {
         (listen_h, our_iss)
     }
 
+    /// A8 T13 (S1(c)): inject an in-window RST while the passive-opened
+    /// conn is in SYN_RCVD. Per RFC 9293 §3.10.7.4 First, the conn
+    /// "returns to the LISTEN state"; `re_listen_if_from_passive`
+    /// records a synthetic SYN_RCVD → LISTEN transition in
+    /// `state_trans[3][1]` and tears down the flow-table entry. The
+    /// listen slot stays live and accepts a same-4-tuple SYN retry.
+    ///
+    /// Uses the same `peer_seq` snapshot layout as `do_passive_open_syn_ack_only`
+    /// (seq == `peer_iss + 1`, ack == 0, flags == RST, window == 0) so
+    /// the RST lands in-window and the handler's RST arm fires cleanly.
+    pub fn inject_rst_to_syn_rcvd(&mut self) {
+        use dpdk_net_core::clock::set_virt_ns;
+        use dpdk_net_core::tcp_options::TcpOpts;
+        use dpdk_net_core::tcp_output::TCP_RST;
+
+        set_virt_ns(2_000_000);
+        let frame = build_tcp_frame(
+            PEER_IP,
+            40_000,
+            OUR_IP,
+            5555,
+            self.peer_seq.get(),
+            0,
+            TCP_RST,
+            0,
+            TcpOpts::default(),
+            &[],
+        );
+        self.eng
+            .inject_rx_frame(&frame)
+            .expect("inject RST to SYN_RCVD");
+    }
+
     /// A8 T8: inject a final-ACK with a bad ack value while conn is in
     /// SYN_RCVD. `handle_syn_received` returns `TxAction::Rst` +
     /// `new_state = Closed` → `state_trans[3][0]` bumps. Ack is way

@@ -270,13 +270,37 @@ pub struct Outcome {
     /// A8 T12 (S1(b)): signals the engine that a SYN_RCVD→Closed transition
     /// happened and the listen slot's `in_progress` should be cleared so
     /// subsequent SYNs on the same listen can land. Set `true` by
-    /// `handle_syn_received` on the RST and bad-ACK arms (both transition
-    /// to Closed). The engine consumer calls
+    /// `handle_syn_received` on the bad-ACK arm (transitions to Closed).
+    /// The engine consumer calls
     /// `Engine::clear_in_progress_for_conn(handle)` after the outcome-based
     /// state transition has fired. Feature-gated: only the test-server
     /// build carries a listen-slot table to clear.
+    ///
+    /// A8 T13 (S1(c)): the RST-in-SYN_RCVD arm now routes via
+    /// `re_listen_if_passive` instead (Option B — it records
+    /// SYN_RCVD→LISTEN in state_trans + tears down the conn; setting both
+    /// fields would double-clear the slot).
     #[cfg(feature = "test-server")]
     pub clear_listen_slot_on_close: bool,
+    /// A8 T13 (S1(c) per AD-A7-rst-in-syn-rcvd-close-not-relisten): signals
+    /// the engine that a RST landed on a passive-opened SYN_RCVD conn and
+    /// the connection should be returned to the LISTEN state per RFC 9293
+    /// §3.10.7.4 First. When `true`, the engine calls
+    /// `re_listen_if_from_passive(handle)` which clears the listen slot's
+    /// `in_progress`, records a synthetic SYN_RCVD→LISTEN transition in
+    /// `counters.tcp.state_trans`, and tears down the flow-table entry.
+    ///
+    /// Mutually exclusive with `clear_listen_slot_on_close` on the RST
+    /// arm: `handle_syn_received` sets this field only when
+    /// `conn.is_passive_open` is true. On active-opened (client-style)
+    /// SYN_RCVD conns — not yet reachable in Stage 1, but the guard is
+    /// defensive — the RST arm falls back to the T12 Closed-with-slot-
+    /// cleanup path. The engine supplies its own `handle` to
+    /// `re_listen_if_from_passive`; this field is plain bool so the
+    /// handler (which only has `&mut TcpConn`) can signal without
+    /// knowing its own handle — matching the T12 plumbing shape.
+    #[cfg(feature = "test-server")]
+    pub re_listen_if_passive: bool,
 }
 
 impl Outcome {
@@ -311,6 +335,8 @@ impl Outcome {
             closed: false,
             #[cfg(feature = "test-server")]
             clear_listen_slot_on_close: false,
+            #[cfg(feature = "test-server")]
+            re_listen_if_passive: false,
         }
     }
     pub fn none() -> Self {
@@ -381,13 +407,35 @@ fn handle_syn_received(
 ) -> Outcome {
     use crate::tcp_seq::seq_le;
 
-    // RST handling mirrors SYN_SENT (RFC 9293 §3.10.7.4).
+    // RST handling per RFC 9293 §3.10.7.4 First (SYN-RECEIVED):
+    //   - passive-opened conn: "return this connection to the LISTEN
+    //     state and return" → A8 T13 (S1(c)): signal the engine via
+    //     `re_listen_if_passive = true` so it records a synthetic
+    //     SYN_RCVD→LISTEN state_trans, clears the listen slot's
+    //     `in_progress`, and drops the conn. We do NOT set
+    //     `new_state = Some(Closed)` on this branch — Option B design:
+    //     only the SYN_RCVD→LISTEN edge fires, not SYN_RCVD→Closed.
+    //   - active-opened conn (defensive: not reachable in Stage 1 but
+    //     kept for future simultaneous-open coverage): fall back to
+    //     the T12 Closed + `clear_listen_slot_on_close` path.
     //
-    // A8 T12 (S1(b)): `clear_listen_slot_on_close = true` signals the
-    // engine to clear the matching listen slot's `in_progress` so a
-    // fresh SYN on the same (dst_ip, dst_port) can land. Without this,
-    // a failed passive handshake wedges the listen slot forever.
+    // A8 T12 (S1(b)): `clear_listen_slot_on_close = true` continues to
+    // cover non-passive fallbacks + the bad-ACK arm below so a failed
+    // handshake does not wedge the listen slot.
+    // `handle_syn_received` is itself `#[cfg(feature = "test-server")]`
+    // (see fn signature above), so `re_listen_if_passive` +
+    // `clear_listen_slot_on_close` Outcome fields are always in scope
+    // here — no nested `#[cfg]` needed.
     if (seg.flags & TCP_RST) != 0 {
+        if conn.is_passive_open {
+            return Outcome {
+                tx: TxAction::None,
+                new_state: None, // conn teardown runs via re_listen_if_from_passive
+                closed: true,
+                re_listen_if_passive: true,
+                ..Outcome::base()
+            };
+        }
         return Outcome {
             tx: TxAction::None,
             new_state: Some(TcpState::Closed),

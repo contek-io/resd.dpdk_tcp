@@ -3766,8 +3766,8 @@ impl Engine {
             inc(&self.counters.tcp.conn_open);
         }
 
-        // A8 T12 (S1(b)): any SYN_RCVD → Closed transition (RST-in-SYN_RCVD
-        // or bad-ACK-in-SYN_RCVD) must clear the listen slot's
+        // A8 T12 (S1(b)): any SYN_RCVD → Closed transition (bad-ACK arm,
+        // and — pre-T13 — the RST arm) must clear the listen slot's
         // `in_progress` so subsequent SYNs can land. `handle_syn_received`
         // sets `clear_listen_slot_on_close = true` on those arms; the
         // third site (SYN-retrans budget exhaust) clears the slot inline
@@ -3776,6 +3776,25 @@ impl Engine {
         #[cfg(feature = "test-server")]
         if outcome.clear_listen_slot_on_close {
             self.clear_in_progress_for_conn(handle);
+        }
+
+        // A8 T13 (S1(c)): passive-opened SYN_RCVD + RST → return to LISTEN
+        // per RFC 9293 §3.10.7.4 First. Mutually exclusive with the T12
+        // `clear_listen_slot_on_close` branch above: `handle_syn_received`
+        // sets exactly one of the two flags on the RST arm depending on
+        // `conn.is_passive_open`. This helper does all three pieces —
+        // clear slot `in_progress`, record SYN_RCVD→LISTEN in
+        // state_trans, tear down the flow-table entry. Retires
+        // AD-A7-rst-in-syn-rcvd-close-not-relisten. Must run BEFORE the
+        // `outcome.closed` block below so the Closed event can still
+        // reference the handle (by value — `handle` is a `u32`, the
+        // event push doesn't re-borrow the flow table on the conn
+        // slot). The closed-path's own `flow_table.remove` at the
+        // "state == Some(Closed)" guard is a no-op here because we
+        // skipped the SYN_RCVD→Closed transition on this branch.
+        #[cfg(feature = "test-server")]
+        if outcome.re_listen_if_passive {
+            self.re_listen_if_from_passive(handle);
         }
 
         if outcome.delivered > 0 {
@@ -5758,6 +5777,95 @@ impl Engine {
                 return;
             }
         }
+    }
+
+    /// A8 T13 (S1(c) per AD-A7-rst-in-syn-rcvd-close-not-relisten):
+    /// return a passive-opened SYN_RCVD conn to the LISTEN state on RST
+    /// per RFC 9293 §3.10.7.4 First. Does three things:
+    ///   1. Clear the matching listen slot's `in_progress` (redundant
+    ///      with `clear_in_progress_for_conn` — called explicitly here
+    ///      rather than via the T12 helper so the three steps read as
+    ///      one atomic "return to LISTEN" unit, and so the caller sees
+    ///      a single entry point).
+    ///   2. Record a synthetic `SYN_RCVD → LISTEN` transition in
+    ///      `counters.tcp.state_trans[3][1]`. The T8 audit matrix
+    ///      previously marked this cell Unreachable("awaits T13
+    ///      S1(c)"); T13 opens the edge and T8 flips it to Reached.
+    ///   3. Tear down the conn by removing its flow-table entry. The
+    ///      listen slot itself stays live, so `match_listen_slot` will
+    ///      find it on a subsequent SYN (even on the same 4-tuple);
+    ///      that SYN lands on a fresh `new_passive` conn.
+    ///
+    /// Guarded by `conn.is_passive_open`: no-op on active-opened conns.
+    /// Stage 1's FSM only reaches SYN_RCVD via the passive path (see
+    /// AD-6 simultaneous-open deferred), so the guard is defensive but
+    /// the production no-op branch is currently unreachable.
+    ///
+    /// Project rule preserved (spec §6 line 365): the LISTEN transition
+    /// only ever fires under `feature = "test-server"`; the production
+    /// build has no listen path and this helper is not compiled in.
+    #[cfg(feature = "test-server")]
+    pub(crate) fn re_listen_if_from_passive(
+        &self,
+        handle: crate::flow_table::ConnHandle,
+    ) {
+        use crate::tcp_state::TcpState;
+        // Gate on passive-open — active-opened SYN_RCVD conns (not yet
+        // reachable in Stage 1) fall through to the T12 Closed path at
+        // the call site, not here. We also verify the conn is still
+        // in the flow table: in theory a race could have removed it
+        // already, but on the current single-lcore + RefCell shape
+        // this is impossible.
+        let is_passive = {
+            let ft = self.flow_table.borrow();
+            match ft.get(handle) {
+                Some(c) => c.is_passive_open,
+                None => return,
+            }
+        };
+        if !is_passive {
+            return;
+        }
+
+        // Step 1: clear the listen slot's `in_progress` (single pass).
+        self.clear_in_progress_for_conn(handle);
+
+        // Step 2: record the synthetic SYN_RCVD → LISTEN edge so the
+        // state_trans audit sees it. We bypass `transition_conn` on
+        // purpose: that helper writes `conn.state` + emits a
+        // `StateChange` event, neither of which is appropriate here —
+        // the conn is about to be torn down, and we never actually
+        // land in `TcpState::Listen` per project rule spec §6.
+        let from = TcpState::SynReceived as usize;
+        let to = TcpState::Listen as usize;
+        crate::counters::inc(&self.counters.tcp.state_trans[from][to]);
+
+        // Step 3: tear down the conn. Remove from the flow table so a
+        // fresh same-4-tuple SYN lands on a new `new_passive` conn via
+        // `handle_inbound_syn_listen`. No wire frames are emitted
+        // (RFC 9293 §3.10.7.4 First: passive-OPEN RST is absorbed
+        // silently, no RST-on-RST response). No timers to cancel:
+        // SYN_RCVD conns carry at most a `syn_retrans_timer_id` which
+        // the caller-side dispatch plumbing cancels via the usual
+        // Outcome path once the conn is gone; a stale fire lands on
+        // the is_current/get-mut guards and is a no-op.
+        //
+        // A8 T11 hand-off: if the passive-open SYN-retrans timer was
+        // still armed, cancel it here before the flow-table remove
+        // releases the conn (the fire handler's Phase-1 lookup would
+        // then observe `None` and early-return). This keeps the wheel
+        // from firing on a stale handle after removal.
+        let timer_id = {
+            let mut ft = self.flow_table.borrow_mut();
+            match ft.get_mut(handle) {
+                Some(c) => c.syn_retrans_timer_id.take(),
+                None => None,
+            }
+        };
+        if let Some(id) = timer_id {
+            self.timer_wheel.borrow_mut().cancel(id);
+        }
+        self.flow_table.borrow_mut().remove(handle);
     }
 
     /// A7 Task 8: run the per-conn TX flush path once. Returns `true`
