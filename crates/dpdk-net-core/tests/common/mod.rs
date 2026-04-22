@@ -669,8 +669,14 @@ impl CovHarness {
     /// the conn to CLOSE_WAIT. Counter bumps: `tcp.rx_fin` (line 3343)
     /// + `tcp.rx_ack`.
     pub fn inject_peer_fin(&mut self) {
-        use dpdk_net_core::clock::set_virt_ns;
-        set_virt_ns(10_000_000);
+        use dpdk_net_core::clock::{now_ns, set_virt_ns};
+        // A8 T8: monotonic-safe advance — some T8 scenarios stack
+        // inject_peer_fin AFTER an inject_peer_ack_our_fin (which
+        // advanced virt to 30 ms), so a fixed `set_virt_ns(10_000_000)`
+        // would panic. `max(now, 10 ms)` preserves the original 10-ms
+        // floor for T6 scenarios while letting T8 compose.
+        let t = now_ns().max(10_000_000);
+        set_virt_ns(t);
         let peer_seq = self.peer_seq.get();
         let our_iss = self.our_iss.get();
         let fin = build_tcp_fin(
@@ -1308,6 +1314,251 @@ impl CovHarness {
             &[],
         );
         self.eng.inject_rx_frame(&frame).expect("inject ts-ack");
+    }
+
+    // -----------------------------------------------------------------
+    // A8 Task 8: state_trans coverage helpers. Drive specific edges of
+    // the 11-state TCP FSM so each `Reached` cell in the 121-cell
+    // `state_trans[from][to]` matrix lights up under a targeted scenario.
+    // All helpers use the canonical tuple (PEER_IP:40000 → OUR_IP:5555)
+    // for passive-open derived scenarios; active-open helpers parse the
+    // emitted SYN to recover our ephemeral src_port + ISS.
+    // -----------------------------------------------------------------
+
+    /// A8 T8: active-open kickoff — `connect()` inserts a fresh conn in
+    /// `Closed`, emits SYN, then transition_conn fires
+    /// `Closed → SynSent` (bumps `state_trans[0][2]`). We drain the
+    /// emitted SYN frame + stash our src_port + ISS so follow-up helpers
+    /// (`inject_rst_to_syn_sent`, `inject_peer_syn_ack_complete_3whs`)
+    /// can craft correct peer responses.
+    ///
+    /// Returns `(our_src_port, our_iss)`.
+    pub fn do_active_open_only(&mut self) -> (u16, u32) {
+        use dpdk_net_core::clock::set_virt_ns;
+        use dpdk_net_core::test_tx_intercept::drain_tx_frames;
+
+        set_virt_ns(0);
+        let _ = drain_tx_frames();
+        let _handle = self.eng.connect(PEER_IP, 7777, 0).expect("connect");
+        let frames = drain_tx_frames();
+        assert_eq!(frames.len(), 1, "exactly one active-open SYN expected");
+        let emitted = &frames[0];
+        let ihl = (emitted[14] & 0x0f) as usize;
+        let tcp_off = 14 + ihl * 4;
+        let our_src_port = u16::from_be_bytes([emitted[tcp_off], emitted[tcp_off + 1]]);
+        let our_iss = u32::from_be_bytes([
+            emitted[tcp_off + 4],
+            emitted[tcp_off + 5],
+            emitted[tcp_off + 6],
+            emitted[tcp_off + 7],
+        ]);
+        self.our_iss.set(our_iss);
+        (our_src_port, our_iss)
+    }
+
+    /// A8 T8: inject a peer RST to our SynSent conn. Must carry a valid
+    /// ACK of our SYN (`ack = our_iss + 1`) per RFC 9293 §3.10.7.3 so
+    /// `handle_syn_sent` takes the RST-with-ACK → Closed branch, firing
+    /// `state_trans[2][0]`. Takes `(our_src_port, our_iss)` from
+    /// `do_active_open_only`.
+    pub fn inject_rst_to_syn_sent(&mut self, our_src_port: u16, our_iss: u32) {
+        use dpdk_net_core::clock::set_virt_ns;
+        use dpdk_net_core::tcp_options::TcpOpts;
+        use dpdk_net_core::tcp_output::{TCP_ACK, TCP_RST};
+
+        set_virt_ns(1_000_000);
+        // peer_iss arbitrary; ack must cover our SYN (= our_iss + 1).
+        let frame = build_tcp_frame(
+            PEER_IP,
+            7777,
+            OUR_IP,
+            our_src_port,
+            0x20000000,
+            our_iss.wrapping_add(1),
+            TCP_RST | TCP_ACK,
+            u16::MAX,
+            TcpOpts::default(),
+            &[],
+        );
+        self.eng
+            .inject_rx_frame(&frame)
+            .expect("inject RST to SynSent");
+    }
+
+    /// A8 T8: active-open complete 3WHS. `connect()` → SYN-ACK injected →
+    /// final ACK emitted → ESTABLISHED. Drives both `state_trans[0][2]`
+    /// (Closed→SynSent) and `state_trans[2][4]` (SynSent→Established).
+    pub fn do_active_open_full(&mut self) {
+        use dpdk_net_core::clock::set_virt_ns;
+        use dpdk_net_core::tcp_options::TcpOpts;
+        use dpdk_net_core::tcp_output::{TCP_ACK, TCP_SYN};
+        use dpdk_net_core::test_tx_intercept::drain_tx_frames;
+
+        let (our_src_port, our_iss) = self.do_active_open_only();
+        set_virt_ns(1_000_000);
+        let peer_iss: u32 = 0x20000000;
+        let mut opts = TcpOpts::default();
+        opts.mss = Some(1460);
+        let syn_ack = build_tcp_frame(
+            PEER_IP,
+            7777,
+            OUR_IP,
+            our_src_port,
+            peer_iss,
+            our_iss.wrapping_add(1),
+            TCP_SYN | TCP_ACK,
+            u16::MAX,
+            opts,
+            &[],
+        );
+        self.eng
+            .inject_rx_frame(&syn_ack)
+            .expect("inject SYN-ACK");
+        // Drain our final ACK.
+        let _ = drain_tx_frames();
+    }
+
+    /// A8 T8: passive-open stopped at SYN_RCVD (listen + peer SYN →
+    /// engine emits SYN-ACK but final ACK not injected). Useful for
+    /// scenarios that need to inject a malformed segment while the conn
+    /// sits in SYN_RCVD. Returns the `ListenHandle` + our server-side
+    /// ISS so the caller can craft follow-up segments.
+    pub fn do_passive_open_syn_ack_only(
+        &mut self,
+    ) -> (dpdk_net_core::test_server::ListenHandle, u32) {
+        use dpdk_net_core::clock::set_virt_ns;
+        use dpdk_net_core::test_tx_intercept::drain_tx_frames;
+
+        let listen_h = self.eng.listen(OUR_IP, 5555).expect("listen");
+        let _ = drain_tx_frames();
+        set_virt_ns(1_000_000);
+        let syn = build_tcp_syn(PEER_IP, 40_000, OUR_IP, 5555, 0x10000000, 1460);
+        self.eng.inject_rx_frame(&syn).expect("inject SYN");
+        let frames = drain_tx_frames();
+        assert_eq!(frames.len(), 1, "one SYN-ACK expected");
+        let (our_iss, _ack) = parse_syn_ack(&frames[0]).expect("parse SYN-ACK");
+        self.our_iss.set(our_iss);
+        self.peer_seq.set(0x10000001);
+        (listen_h, our_iss)
+    }
+
+    /// A8 T8: inject a final-ACK with a bad ack value while conn is in
+    /// SYN_RCVD. `handle_syn_received` returns `TxAction::Rst` +
+    /// `new_state = Closed` → `state_trans[3][0]` bumps. Ack is way
+    /// ahead of `snd_nxt` so the range check `snd_una+1 <= ack <= snd_nxt`
+    /// fails.
+    pub fn inject_peer_bad_ack_to_syn_rcvd(&mut self) {
+        use dpdk_net_core::clock::set_virt_ns;
+        use dpdk_net_core::tcp_options::TcpOpts;
+        use dpdk_net_core::tcp_output::TCP_ACK;
+
+        set_virt_ns(2_000_000);
+        let frame = build_tcp_frame(
+            PEER_IP,
+            40_000,
+            OUR_IP,
+            5555,
+            0x10000001,
+            0xdeadbeef, // way past our snd_nxt
+            TCP_ACK,
+            u16::MAX,
+            TcpOpts::default(),
+            &[],
+        );
+        self.eng
+            .inject_rx_frame(&frame)
+            .expect("inject bad-ACK to SYN_RCVD");
+    }
+
+    /// A8 T8: our-side close — `close_conn` drives Established → FinWait1
+    /// or CloseWait → LastAck depending on current state. Bumps
+    /// `state_trans[4][5]` (Est→FW1) or `state_trans[7][9]` (CW→LastAck).
+    pub fn close_conn(&mut self, conn: dpdk_net_core::flow_table::ConnHandle) {
+        use dpdk_net_core::clock::set_virt_ns;
+        use dpdk_net_core::test_tx_intercept::drain_tx_frames;
+
+        set_virt_ns(20_000_000);
+        self.eng.close_conn(conn).expect("close_conn");
+        // Drain our FIN so subsequent drain_tx_frames in peer-ACK
+        // helpers sees only the response.
+        let _ = drain_tx_frames();
+    }
+
+    /// A8 T8: peer ACK covering our FIN seq. Must follow `close_conn`
+    /// which emitted a FIN at our `snd_nxt`; after FIN emission
+    /// `snd_nxt = our_fin_seq + 1`. Peer ACK carries
+    /// `ack = our_fin_seq + 1` so `fin_has_been_acked` returns true.
+    ///
+    /// In FinWait1: → FinWait2 (if no FIN) or TimeWait (if FIN set).
+    /// In Closing: → TimeWait.
+    /// In LastAck: → Closed.
+    pub fn inject_peer_ack_our_fin(&mut self) {
+        use dpdk_net_core::clock::set_virt_ns;
+
+        set_virt_ns(30_000_000);
+        let peer_seq = self.peer_seq.get();
+        // our FIN seq lived at our_iss+1 + data; after close our_fin_seq
+        // is snd_nxt_before_fin. With no data on conn, FIN was emitted
+        // at seq = our_iss + 1 so ack = our_iss + 2 ACKs it.
+        let our_iss = self.our_iss.get();
+        let ack = our_iss.wrapping_add(2);
+        let frame = build_tcp_ack(PEER_IP, 40_000, OUR_IP, 5555, peer_seq, ack);
+        self.eng
+            .inject_rx_frame(&frame)
+            .expect("inject peer-ACK-our-FIN");
+    }
+
+    /// A8 T8: peer FIN that does NOT ACK our pending FIN (simultaneous
+    /// close: peer's FIN crosses ours in flight). `handle_close_path` in
+    /// FinWait1 sees `fin_acked=false, peer_has_fin=true` → transitions
+    /// to Closing. Ack value is left at our `snd_una` (still = our_iss+1)
+    /// so `fin_has_been_acked` returns false (our FIN at our_iss+1 NOT
+    /// covered by ack = our_iss+1; RFC says `<=` but our FIN seq is
+    /// snd_una's value, not beyond it).
+    pub fn inject_peer_fin_no_ack_of_our_fin(&mut self) {
+        use dpdk_net_core::clock::set_virt_ns;
+
+        set_virt_ns(25_000_000);
+        let peer_seq = self.peer_seq.get();
+        let our_iss = self.our_iss.get();
+        // Ack only our SYN (= our_iss + 1), not our FIN.
+        let ack = our_iss.wrapping_add(1);
+        let fin = build_tcp_fin(PEER_IP, 40_000, OUR_IP, 5555, peer_seq, ack);
+        self.eng
+            .inject_rx_frame(&fin)
+            .expect("inject peer FIN no ACK");
+        self.peer_seq.set(peer_seq.wrapping_add(1));
+    }
+
+    /// A8 T8: peer FIN that also ACKs our FIN. Used to drive FinWait1 →
+    /// TimeWait in one segment (fin_acked=true, peer_has_fin=true).
+    pub fn inject_peer_fin_ack_combined(&mut self) {
+        use dpdk_net_core::clock::set_virt_ns;
+
+        set_virt_ns(25_000_000);
+        let peer_seq = self.peer_seq.get();
+        let our_iss = self.our_iss.get();
+        let ack = our_iss.wrapping_add(2); // covers our FIN
+        let fin = build_tcp_fin(PEER_IP, 40_000, OUR_IP, 5555, peer_seq, ack);
+        self.eng
+            .inject_rx_frame(&fin)
+            .expect("inject peer FIN+ACK");
+        self.peer_seq.set(peer_seq.wrapping_add(1));
+    }
+
+    /// A8 T8: advance the virt-clock past 2×MSL and drive
+    /// `reap_time_wait`. Uses the test-server-only `test_reap_time_wait`
+    /// shim so we don't need `poll_once` (which is UB on
+    /// `port_id == u16::MAX`). Transitions all eligible TIME_WAIT conns
+    /// to CLOSED, bumping `state_trans[10][0]`.
+    pub fn advance_virt_past_2msl_and_reap(&self) {
+        use dpdk_net_core::clock::set_virt_ns;
+        // Default tcp_msl_ms is 100 ms (test_server_config); 2×MSL =
+        // 200 ms. Jump a full second past our last set_virt_ns
+        // checkpoint (which sits at ≤ 30 ms in close_conn sequences) to
+        // ensure `now >= deadline`.
+        set_virt_ns(5_000_000_000);
+        self.eng.test_reap_time_wait();
     }
 }
 

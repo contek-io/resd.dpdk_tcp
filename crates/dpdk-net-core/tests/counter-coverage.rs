@@ -1573,3 +1573,382 @@ fn build_icmp_frag_needed_inner(inner_dst: u32, mtu: u16) -> Vec<u8> {
     icmp.extend_from_slice(&inner);
     icmp
 }
+
+// ---------------------------------------------------------------------
+// T8: exhaustive 121-cell `state_trans[from][to]` coverage matrix
+// (spec §3.3 Q3d, §6.1 FSM).
+//
+// TcpState enum discriminant order (see src/tcp_state.rs):
+//   0 Closed, 1 Listen, 2 SynSent, 3 SynReceived, 4 Established,
+//   5 FinWait1, 6 FinWait2, 7 CloseWait, 8 Closing, 9 LastAck,
+//   10 TimeWait.
+//
+// Each of the 121 cells is tagged `Reached(scenario, expected)` or
+// `Unreachable(reason)`. The single driver test
+// `state_trans_coverage_exhaustive` iterates every cell:
+//   - `Reached` cells must increment under their scenario.
+//   - For each `Reached` scenario the cross-check verifies that no
+//     `Unreachable` cell was accidentally incremented — this catches
+//     the "we opened an edge we didn't mean to" regression class.
+//
+// Notes:
+//   - LISTEN is never entered or left via `transition_conn`: engine
+//     manages listen slots separately; a passive-open creates its
+//     `TcpConn` directly in `SynReceived` via `TcpConn::new_passive`
+//     (no transition_conn call). Row 1 and column 1 are all
+//     Unreachable.
+//   - SYN_RECEIVED → LISTEN (S1(c) RST handling) is not yet wired;
+//     lands in T13. Cell [3][1] is Unreachable("awaits T13 S1(c)").
+//   - TIME_WAIT → CLOSED requires `reap_time_wait`, which is only
+//     invoked from `poll_once` in production. The test harness calls
+//     the test-server shim `Engine::test_reap_time_wait` after
+//     advancing the virt-clock past 2×MSL.
+// ---------------------------------------------------------------------
+
+const NSTATES: usize = 11;
+
+#[derive(Clone, Copy)]
+enum CellCoverage {
+    Reached(fn(&mut CovHarness), u64),
+    /// The `&'static str` reason is intentionally held but never
+    /// machine-read — it's for the human maintainer grepping the
+    /// matrix to understand why a cell is locked. `#[allow(dead_code)]`
+    /// suppresses the dead-field lint.
+    Unreachable(#[allow(dead_code)] &'static str),
+}
+
+const fn u(reason: &'static str) -> CellCoverage {
+    CellCoverage::Unreachable(reason)
+}
+const fn r(f: fn(&mut CovHarness), n: u64) -> CellCoverage {
+    CellCoverage::Reached(f, n)
+}
+
+#[rustfmt::skip]
+const STATE_TRANS_COVERAGE: [[CellCoverage; NSTATES]; NSTATES] = [
+    // row 0: from Closed
+    [
+        u("self-edge never emitted"),
+        u("LISTEN is a listen slot, not a transition_conn target"),
+        r(scen_closed_to_syn_sent, 1),
+        u("SYN_RCVD is entered via new_passive construction, not transition"),
+        u("ESTABLISHED reached via SYN_SENT or SYN_RCVD"),
+        u("FIN_WAIT_1 reached from ESTABLISHED"),
+        u("FIN_WAIT_2 reached from FIN_WAIT_1"),
+        u("CLOSE_WAIT reached from ESTABLISHED"),
+        u("CLOSING reached from FIN_WAIT_1"),
+        u("LAST_ACK reached from CLOSE_WAIT"),
+        u("TIME_WAIT reached from FIN_WAIT_1/FIN_WAIT_2/CLOSING"),
+    ],
+    // row 1: from Listen
+    [
+        u("LISTEN is never entered via transition_conn; row is dead"),
+        u("self-edge"),
+        u("no LISTEN→SynSent edge"),
+        u("SYN_RCVD conn is constructed in place (new_passive), not transitioned"),
+        u("no direct edge"),
+        u("no direct edge"),
+        u("no direct edge"),
+        u("no direct edge"),
+        u("no direct edge"),
+        u("no direct edge"),
+        u("no direct edge"),
+    ],
+    // row 2: from SynSent
+    [
+        r(scen_syn_sent_to_closed_rst, 1),
+        u("§6 project rule: no transition to LISTEN in production"),
+        u("self-edge"),
+        u("simultaneous-open (SynSent→SynReceived) deferred to A4 AD-6"),
+        r(scen_syn_sent_to_established, 1),
+        u("no direct edge"),
+        u("no direct edge"),
+        u("no direct edge"),
+        u("no direct edge"),
+        u("no direct edge"),
+        u("no direct edge"),
+    ],
+    // row 3: from SynReceived
+    [
+        r(scen_syn_received_to_closed_bad_ack, 1),
+        u("A8 T8: awaits T13 S1(c) (RST→LISTEN on test-server); no current wiring"),
+        u("no direct edge"),
+        u("self-edge"),
+        r(scen_syn_received_to_established, 1),
+        u("no direct edge"),
+        u("no direct edge"),
+        u("no direct edge"),
+        u("no direct edge"),
+        u("no direct edge"),
+        u("no direct edge"),
+    ],
+    // row 4: from Established
+    [
+        r(scen_established_to_closed_rst, 1),
+        u("§6 project rule: no transition to LISTEN"),
+        u("no direct edge"),
+        u("no direct edge"),
+        u("self-edge"),
+        r(scen_established_to_fin_wait_1, 1),
+        u("no direct edge"),
+        r(scen_established_to_close_wait, 1),
+        u("no direct edge"),
+        u("no direct edge"),
+        u("no direct edge"),
+    ],
+    // row 5: from FinWait1
+    [
+        u("FinWait1→Closed only via RST; not exercised here (symmetric to [4][0])"),
+        u("§6 no-LISTEN rule"),
+        u("no direct edge"),
+        u("no direct edge"),
+        u("no direct edge"),
+        u("self-edge"),
+        r(scen_fin_wait_1_to_fin_wait_2, 1),
+        u("no direct edge (FW1→CW not an FSM edge)"),
+        r(scen_fin_wait_1_to_closing, 1),
+        u("no direct edge"),
+        r(scen_fin_wait_1_to_time_wait, 1),
+    ],
+    // row 6: from FinWait2
+    [
+        u("FinWait2→Closed only via RST; not exercised"),
+        u("§6 no-LISTEN rule"),
+        u("no direct edge"),
+        u("no direct edge"),
+        u("no direct edge"),
+        u("no direct edge"),
+        u("self-edge"),
+        u("no direct edge"),
+        u("no direct edge"),
+        u("no direct edge"),
+        r(scen_fin_wait_2_to_time_wait, 1),
+    ],
+    // row 7: from CloseWait
+    [
+        u("CloseWait→Closed only via RST; not exercised"),
+        u("§6 no-LISTEN rule"),
+        u("no direct edge"),
+        u("no direct edge"),
+        u("no direct edge"),
+        u("no direct edge"),
+        u("no direct edge"),
+        u("self-edge"),
+        u("no direct edge"),
+        r(scen_close_wait_to_last_ack, 1),
+        u("no direct edge"),
+    ],
+    // row 8: from Closing
+    [
+        u("Closing→Closed only via RST; not exercised"),
+        u("§6 no-LISTEN rule"),
+        u("no direct edge"),
+        u("no direct edge"),
+        u("no direct edge"),
+        u("no direct edge"),
+        u("no direct edge"),
+        u("no direct edge"),
+        u("self-edge"),
+        u("no direct edge"),
+        r(scen_closing_to_time_wait, 1),
+    ],
+    // row 9: from LastAck
+    [
+        r(scen_last_ack_to_closed, 1),
+        u("§6 no-LISTEN rule"),
+        u("no direct edge"),
+        u("no direct edge"),
+        u("no direct edge"),
+        u("no direct edge"),
+        u("no direct edge"),
+        u("no direct edge"),
+        u("no direct edge"),
+        u("self-edge"),
+        u("LastAck has no TIME_WAIT transition (passive close skips TW)"),
+    ],
+    // row 10: from TimeWait
+    [
+        r(scen_time_wait_to_closed, 1),
+        u("§6 no-LISTEN rule"),
+        u("no direct edge"),
+        u("no direct edge"),
+        u("no direct edge"),
+        u("no direct edge"),
+        u("no direct edge"),
+        u("no direct edge"),
+        u("no direct edge"),
+        u("no direct edge"),
+        u("self-edge"),
+    ],
+];
+
+/// T8 driver: iterate all 121 `state_trans` cells. Reached cells must
+/// increment under their scenario fn; for each Reached scenario the
+/// cross-check verifies no Unreachable cell fired under the same fresh
+/// engine (catches accidentally-opened edges).
+///
+/// Each scenario runs on a fresh `std::thread::spawn` worker so the
+/// thread-local virt-clock (`clock::VIRT_NS`) starts at 0 for every
+/// scenario — successive scenarios on the same thread would otherwise
+/// panic when an earlier scenario left the clock advanced past where
+/// the later scenario's `set_virt_ns` calls want to reset.
+#[test]
+fn state_trans_coverage_exhaustive() {
+    for from in 0..NSTATES {
+        for to in 0..NSTATES {
+            let cell = STATE_TRANS_COVERAGE[from][to];
+            if let CellCoverage::Reached(f, expected) = cell {
+                let res = std::thread::spawn(move || run_reached_cell(from, to, f, expected))
+                    .join();
+                res.expect("scenario thread panicked");
+            }
+        }
+    }
+}
+
+fn run_reached_cell(from: usize, to: usize, f: fn(&mut CovHarness), expected: u64) {
+    use std::sync::atomic::Ordering;
+    let mut h = CovHarness::new();
+    f(&mut h);
+    let ctrs = h.eng.counters();
+    let got = ctrs.tcp.state_trans[from][to].load(Ordering::Relaxed);
+    assert_eq!(
+        got, expected,
+        "state_trans[{from}][{to}] expected {expected} got {got} under scenario"
+    );
+    // Cross-check: no Unreachable cell fired under this scenario.
+    for f2 in 0..NSTATES {
+        for t2 in 0..NSTATES {
+            if matches!(STATE_TRANS_COVERAGE[f2][t2], CellCoverage::Unreachable(_)) {
+                let v = ctrs.tcp.state_trans[f2][t2].load(Ordering::Relaxed);
+                assert_eq!(
+                    v, 0,
+                    "unreachable state_trans[{f2}][{t2}] fired under scenario \
+                     for cell ({from}->{to}) — either open the cell or fix the scenario"
+                );
+            }
+        }
+    }
+}
+
+// ---- Reached-cell scenarios ----------------------------------------
+
+/// [0][2] Closed → SynSent: `connect()` inserts a fresh conn in Closed,
+/// emits SYN, then transitions to SynSent.
+fn scen_closed_to_syn_sent(h: &mut CovHarness) {
+    let _ = h.do_active_open_only();
+}
+
+/// [2][0] SynSent → Closed: RST with valid ACK of our SYN per
+/// RFC 9293 §3.10.7.3.
+fn scen_syn_sent_to_closed_rst(h: &mut CovHarness) {
+    let (our_src_port, our_iss) = h.do_active_open_only();
+    h.inject_rst_to_syn_sent(our_src_port, our_iss);
+}
+
+/// [2][4] SynSent → Established: full active 3WHS (SYN → SYN-ACK → our
+/// final ACK emitted automatically).
+fn scen_syn_sent_to_established(h: &mut CovHarness) {
+    h.do_active_open_full();
+}
+
+/// [3][0] SynReceived → Closed: bad-ACK in SYN_RCVD triggers
+/// `TxAction::Rst` + transition to Closed.
+fn scen_syn_received_to_closed_bad_ack(h: &mut CovHarness) {
+    let _ = h.do_passive_open_syn_ack_only();
+    h.inject_peer_bad_ack_to_syn_rcvd();
+}
+
+/// [3][4] SynReceived → Established: final ACK completes the passive
+/// 3WHS via `do_passive_open`.
+fn scen_syn_received_to_established(h: &mut CovHarness) {
+    let _ = h.do_passive_open();
+}
+
+/// [4][0] Established → Closed: peer RST on ESTABLISHED conn.
+fn scen_established_to_closed_rst(h: &mut CovHarness) {
+    let _ = h.do_passive_open();
+    h.inject_rst_to_established();
+}
+
+/// [4][5] Established → FinWait1: our `close_conn` on an ESTABLISHED
+/// conn emits FIN and transitions to FIN_WAIT_1.
+fn scen_established_to_fin_wait_1(h: &mut CovHarness) {
+    let conn = h.do_passive_open();
+    h.close_conn(conn);
+}
+
+/// [4][7] Established → CloseWait: peer FIN on an ESTABLISHED conn.
+fn scen_established_to_close_wait(h: &mut CovHarness) {
+    let _ = h.do_passive_open();
+    h.inject_peer_fin();
+}
+
+/// [5][6] FinWait1 → FinWait2: peer ACKs our FIN but does NOT send its
+/// own FIN.
+fn scen_fin_wait_1_to_fin_wait_2(h: &mut CovHarness) {
+    let conn = h.do_passive_open();
+    h.close_conn(conn);
+    h.inject_peer_ack_our_fin();
+}
+
+/// [5][8] FinWait1 → Closing: simultaneous close — peer FIN arrives
+/// without ACK of our FIN (peer's FIN crossed ours in flight).
+fn scen_fin_wait_1_to_closing(h: &mut CovHarness) {
+    let conn = h.do_passive_open();
+    h.close_conn(conn);
+    h.inject_peer_fin_no_ack_of_our_fin();
+}
+
+/// [5][10] FinWait1 → TimeWait: peer's ACK of our FIN and peer's FIN
+/// arrive in one combined segment.
+fn scen_fin_wait_1_to_time_wait(h: &mut CovHarness) {
+    let conn = h.do_passive_open();
+    h.close_conn(conn);
+    h.inject_peer_fin_ack_combined();
+}
+
+/// [6][10] FinWait2 → TimeWait: first peer ACK covers our FIN (→ FW2);
+/// then peer FIN (→ TW).
+fn scen_fin_wait_2_to_time_wait(h: &mut CovHarness) {
+    let conn = h.do_passive_open();
+    h.close_conn(conn);
+    h.inject_peer_ack_our_fin();
+    h.inject_peer_fin();
+}
+
+/// [8][10] Closing → TimeWait: simultaneous close path — peer FIN
+/// (without ACK of our FIN) → Closing; then peer ACK covers our FIN →
+/// TW.
+fn scen_closing_to_time_wait(h: &mut CovHarness) {
+    let conn = h.do_passive_open();
+    h.close_conn(conn);
+    h.inject_peer_fin_no_ack_of_our_fin();
+    h.inject_peer_ack_our_fin();
+}
+
+/// [7][9] CloseWait → LastAck: peer FIN (→ CW) + our `close_conn`
+/// (→ LastAck).
+fn scen_close_wait_to_last_ack(h: &mut CovHarness) {
+    let conn = h.do_passive_open();
+    h.inject_peer_fin();
+    h.close_conn(conn);
+}
+
+/// [9][0] LastAck → Closed: passive-close full path — peer FIN + our
+/// close + peer ACK of our FIN.
+fn scen_last_ack_to_closed(h: &mut CovHarness) {
+    let conn = h.do_passive_open();
+    h.inject_peer_fin();
+    h.close_conn(conn);
+    h.inject_peer_ack_our_fin();
+}
+
+/// [10][0] TimeWait → Closed: reach TW via FIN+ACK combined, then
+/// advance virt-clock past 2×MSL + invoke `test_reap_time_wait`.
+fn scen_time_wait_to_closed(h: &mut CovHarness) {
+    let conn = h.do_passive_open();
+    h.close_conn(conn);
+    h.inject_peer_fin_ack_combined(); // → TimeWait
+    h.advance_virt_past_2msl_and_reap(); // → Closed
+}

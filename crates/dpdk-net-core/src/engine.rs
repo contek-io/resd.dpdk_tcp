@@ -5688,6 +5688,16 @@ impl Engine {
             }
         }
     }
+
+    /// A8 T8: test-server-only shim that invokes the private
+    /// `reap_time_wait` so counter-coverage scenarios can drive the
+    /// TIME_WAIT → CLOSED `state_trans[10][0]` transition without
+    /// going through `poll_once`, which is UB on `port_id == u16::MAX`.
+    /// Production callers never need this — `poll_once` invokes
+    /// `reap_time_wait` on every tick.
+    pub fn test_reap_time_wait(&self) {
+        self.reap_time_wait();
+    }
 }
 
 #[cfg(test)]
