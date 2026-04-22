@@ -87,6 +87,7 @@ _None._ (see AD-3 / AD-4 — retransmit scope is explicitly out of A7 per commit
   - mTCP: `tcp_in.c:759-764` `Handle_TCP_ST_LISTEN` ends with `AddtoControlList`; `tcp_out.c:617-625` `SendControlPacket` emits SYN+ACK with `snd_nxt = iss`. `tcp_in.c:896-902` (no-ACK in SYN_RCVD) re-enqueues via `AddtoControlList`. Combined with `timer.c:182-358` `HandleRTO`, a lost final-ACK triggers SYN-ACK retransmit.
   - Ours: `engine.rs:5534-5541` `emit_syn_ack_for_passive` is a one-shot emit — no equivalent of `AddtoRTOList` for passive SYN-ACK. If the final ACK is dropped, the peer's SYN retransmit hits `handle_syn_received` which silently drops it (AD-4); our conn stays in SYN_RCVD (no `CheckConnectionTimeout` wired for test-server conns either).
   - Citation: A7 commit message frames scope as a *pragmatic floor* for scripted packetdrill use where drops do not occur by design (virtual clock + in-memory TX intercept → deterministic delivery). T15 ("0 runnable scripts") is the accepted pragmatic floor per commit log. A8+ closes SYN-ACK retransmit + SYN_RCVD→LISTEN on peer-SYN-retransmit. Upgrade path is wiring (reuse existing RTO wheel infra used by active-open), not new algorithm.
+  - **RETIRED 2026-04-22 (A8 T11):** passive SYN-ACK retransmit now reuses the active-open `SynRetrans` timer wheel — precisely the wiring upgrade anticipated above. `emit_syn_ack_for_passive` arms the wheel on successful TX, and the `on_syn_retrans_fire` handler branches on `TcpConn::is_passive_open` to retransmit `SYN|ACK` (passive) vs plain `SYN` (active) with identical ISS/ACK fields. Budget shared with active-open (hardcoded `> 3` cap, doubling backoff off `tcp_initial_rto_us`); budget exhaust closes the conn with `tcp.conn_timeout_syn_sent` + `InternalEvent::Error{err=-ETIMEDOUT}`. Matches mTCP `Handle_TCP_ST_LISTEN` + `HandleRTO` semantics for this path. Regression: `crates/dpdk-net-core/tests/ad_a7_syn_retrans.rs`. The companion AD-4 (peer-SYN-in-SYN_RCVD silent drop) remains open; AD-3 retires independently.
 
 - **AD-4** — Retransmitted peer SYN in SYN_RCVD: silently dropped vs SYN-ACK resent
   - mTCP: `tcp_in.c:1308-1311` detects `tcph->syn && seq == cur_stream->rcvvar->irs` in SYN_RCVD and jumps to `Handle_TCP_ST_LISTEN`, retransmitting SYN-ACK via control list.
@@ -123,7 +124,7 @@ _None._
 ### Accepted divergence — citations attached
 - [x] **AD-1** — Citation attached: A7 spec §10.12 (listen-slot scope) — capacity-1 is test-server goal; A8+ deferred.
 - [x] **AD-2** — Citation attached: RFC 9293 §3.10.7.1 (RST latitude) + A7 AD-1 coupling.
-- [x] **AD-3** — Citation attached: A7 commit message (pragmatic floor) + T15 0-script classification + A8+ retransmit hardening.
+- [x] **AD-3** — Citation attached: A7 commit message (pragmatic floor) + T15 0-script classification + A8+ retransmit hardening. **RETIRED 2026-04-22 (A8 T11).**
 - [x] **AD-4** — Citation attached: A7 plan T5 acceptance + A8+ deferred + RFC 9293 §3.10.7.3 scope narrowing.
 - [x] **AD-5** — Citation attached: A7 plan T5 option-bundle scope + RFC 7323 §1.3/§2.2 header-hygiene vs behavioural-inert.
 

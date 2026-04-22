@@ -2708,12 +2708,19 @@ impl Engine {
         fired_id: crate::tcp_timer_wheel::TimerId,
     ) {
         // Phase 1: validate fired_id + capture current state.
-        let (is_current, in_syn_sent) = {
+        //
+        // A8 T11: passive-open path — `is_passive_open=true` conns sit in
+        // SynReceived until the final ACK lands; on a lost final ACK we
+        // need to retransmit the SYN-ACK. Accept either SynSent
+        // (active-open) or SynReceived (passive-open) as live retrans
+        // candidates; the shape distinction lives in `conn.is_passive_open`.
+        let (is_current, in_handshake_state, is_passive) = {
             let ft = self.flow_table.borrow();
             let Some(c) = ft.get(handle) else { return };
             let current = c.syn_retrans_timer_id == Some(fired_id);
-            let in_syn = c.state == TcpState::SynSent;
-            (current, in_syn)
+            let in_hs =
+                c.state == TcpState::SynSent || c.state == TcpState::SynReceived;
+            (current, in_hs, c.is_passive_open)
         };
         if !is_current {
             // Stale fire (cancel raced, or slot reused). Ignore.
@@ -2728,7 +2735,7 @@ impl Engine {
                 c.timer_ids.retain(|t| *t != fired_id);
             }
         }
-        if !in_syn_sent {
+        if !in_handshake_state {
             // SYN-ACK already landed (or conn already closed). The
             // Outcome-path cancel normally beats us, but on a race the
             // cleared id above is sufficient — nothing more to do.
@@ -2738,7 +2745,21 @@ impl Engine {
         // Phase 3: bump retrans count + check budget. Count semantics:
         // initial SYN = 0; fire 1/2/3 = 1/2/3 retransmit; fire 4 → > 3 →
         // abandon. Total: 3 retransmits + 1 initial = 4 SYN TXes ≈ 75 ms
-        // to ETIMEDOUT with 5 ms base (5+10+20+40).
+        // to ETIMEDOUT with 5 ms base (5+10+20+40). Budget is shared
+        // with the passive-open path (A8 T11) — same `> 3` cap, same
+        // `conn_timeout_syn_sent` counter, same `force_close_etimedout`
+        // teardown (emits `Error{err=-ETIMEDOUT}`).
+        //
+        // A8 T11 NOTE: listen-slot `in_progress` cleanup on passive
+        // budget-exhaust is NOT wired in T11. T12 (S1(b)) adds a
+        // `clear_in_progress_for_conn` helper at every SYN_RCVD→Closed
+        // site (handle_syn_received RST/bad-ACK branch, this fire
+        // handler, etc.). In T11 scope: `force_close_etimedout`
+        // transitions the conn to Closed + removes its flow-table slot,
+        // but the listen slot's `in_progress: Some(h)` reference
+        // dangles until T12 clears it. Single-shot per-test scope (A7
+        // design spec §1.1) keeps this benign — a second SYN on the
+        // same listen slot would be rejected with RST until T12 lands.
         let new_count = {
             let mut ft = self.flow_table.borrow_mut();
             match ft.get_mut(handle) {
@@ -2755,8 +2776,27 @@ impl Engine {
             return;
         }
 
-        // Phase 4: re-TX SYN via the shared helper.
-        self.emit_syn(handle);
+        // Phase 4: re-TX the handshake segment. Shape dispatches on
+        // `is_passive_open`:
+        //   - active-open (`is_passive_open=false`): retransmit plain SYN
+        //     via `emit_syn` (also stashes `syn_tx_ts_ns` for Karn-safe
+        //     SRTT seeding on the first retransmit only).
+        //   - passive-open (`is_passive_open=true`): retransmit SYN|ACK
+        //     via `emit_syn_with_flags`. `emit_syn_with_flags` reuses the
+        //     exact option bundle + header-building pipeline of the
+        //     initial emit so the retransmit is byte-identical. We
+        //     bump `tx_retrans` (not `tx_syn`) since this is a
+        //     retransmission of a segment we already counted at
+        //     initial-SYN-ACK time.
+        if is_passive {
+            use crate::tcp_output::{TCP_ACK, TCP_SYN};
+            let now_ns_tx = crate::clock::now_ns();
+            if self.emit_syn_with_flags(handle, TCP_SYN | TCP_ACK, now_ns_tx) {
+                crate::counters::inc(&self.counters.tcp.tx_retrans);
+            }
+        } else {
+            self.emit_syn(handle);
+        }
 
         // Phase 5: re-arm with exponential backoff. `shl` clamp at 6
         // caps the backoff multiplier at 64× base (~320 ms), which is
@@ -5577,12 +5617,46 @@ impl Engine {
     /// Build + tx the SYN-ACK for a SYN_RCVD conn. Thin wrapper around
     /// `emit_syn_with_flags` with `flags = SYN|ACK`; the helper auto-fills
     /// `ack = rcv_nxt` (peer's iss + 1) when the ACK bit is set.
+    ///
+    /// A8 T11 (S1(a)): arms the `SynRetrans` timer wheel on successful
+    /// TX so a lost final ACK doesn't wedge the passive-open conn in
+    /// SYN_RCVD forever (retires AD-A7-no-syn-ack-retransmit + mTCP AD-3;
+    /// RFC 9293 §3.8.1 + RFC 6298 §2). Retransmit shape is handled by
+    /// the fire handler via `conn.is_passive_open`. Called from both
+    /// the initial SYN-ACK emit (`handle_inbound_syn_listen`) and the
+    /// retransmit branch of `on_syn_retrans_fire` — in the latter case
+    /// the caller drives the arm explicitly with `new_count` from the
+    /// fire path, so this entry point arms only for the initial emit.
     fn emit_syn_ack_for_passive(&self, handle: crate::flow_table::ConnHandle) {
         use crate::counters::inc;
         use crate::tcp_output::{TCP_ACK, TCP_SYN};
         let now_ns = crate::clock::now_ns();
         if self.emit_syn_with_flags(handle, TCP_SYN | TCP_ACK, now_ns) {
             inc(&self.counters.tcp.tx_syn);
+            // A8 T11: arm SynRetrans with the same initial delay the
+            // active-open path uses (see `connect` ~ engine.rs:4393).
+            // Budget + backoff + re-arm live inside `on_syn_retrans_fire`
+            // and are shared with the active path; the fire handler
+            // dispatches on `conn.is_passive_open` to pick the right
+            // retransmit shape.
+            let initial_delay_us = self.cfg.tcp_initial_rto_us.max(self.cfg.tcp_min_rto_us);
+            let fire_at_ns = now_ns + (initial_delay_us as u64 * 1_000);
+            let id = self.timer_wheel.borrow_mut().add(
+                now_ns,
+                crate::tcp_timer_wheel::TimerNode {
+                    fire_at_ns,
+                    owner_handle: handle,
+                    kind: crate::tcp_timer_wheel::TimerKind::SynRetrans,
+                    user_data: 0,
+                    generation: 0,
+                    cancelled: false,
+                },
+            );
+            let mut ft = self.flow_table.borrow_mut();
+            if let Some(c) = ft.get_mut(handle) {
+                c.syn_retrans_timer_id = Some(id);
+                c.timer_ids.push(id);
+            }
         }
     }
 

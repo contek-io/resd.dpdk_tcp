@@ -244,6 +244,14 @@ pub struct TcpConn {
     pub syn_retrans_count: u8,
     /// Handle of the SYN retrans timer.
     pub syn_retrans_timer_id: Option<crate::tcp_timer_wheel::TimerId>,
+    /// A8 T11: true when this conn originated from a `LISTEN + peer SYN`
+    /// (see `new_passive`), false for the client-side active-open path
+    /// (see `new_client`). The `SynRetrans` timer-wheel fire handler
+    /// dispatches on this flag to retransmit the correct handshake
+    /// shape: plain `SYN` for active-open, `SYN|ACK` for passive-open
+    /// (RFC 9293 §3.8.1 + RFC 6298 §2). Retires AD-A7-no-syn-ack-retransmit
+    /// and mTCP AD-3 from the A7 review set.
+    pub is_passive_open: bool,
     /// Per-connect opt: when true, RACK `reo_wnd` forced to 0.
     pub rack_aggressive: bool,
     /// Per-connect opt: when true, RTO does not double on retransmit.
@@ -394,6 +402,10 @@ impl TcpConn {
             tlp_timer_id: None,
             syn_retrans_count: 0,
             syn_retrans_timer_id: None,
+            // A8 T11: active-open by default. `new_passive` overrides
+            // this to `true` so the SynRetrans fire handler retransmits
+            // `SYN|ACK` instead of plain `SYN`.
+            is_passive_open: false,
             rack_aggressive: false,
             rto_no_backoff: false,
             rack: crate::tcp_rack::RackState::new(),
@@ -476,6 +488,9 @@ impl TcpConn {
         );
         // Deltas from the active-open seed:
         c.state = TcpState::SynReceived;
+        // A8 T11: flag the conn as passive-open so the SynRetrans fire
+        // handler retransmits `SYN|ACK` on this tuple (not plain `SYN`).
+        c.is_passive_open = true;
         c.rcv_nxt = iss_peer.wrapping_add(1);
         c.irs = iss_peer;
         // Absorb peer options from the SYN.

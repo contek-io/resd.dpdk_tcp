@@ -414,10 +414,18 @@ fn handle_syn_received(
         }
     }
 
+    // A8 T11: final ACK landed — hand the engine the passive SYN-retrans
+    // timer id so it can cancel the pending fire. `take()` zeros the
+    // field so a subsequent fire observes the cancelled-without-id path
+    // (Phase 1 `is_current` check returns false). Mirrors `handle_syn_sent`
+    // at line 555 for the active-open path.
+    let syn_retrans_timer_to_cancel = conn.syn_retrans_timer_id.take();
+
     Outcome {
         tx: TxAction::None,
         new_state: Some(TcpState::Established),
         connected: true,
+        syn_retrans_timer_to_cancel,
         ..Outcome::base()
     }
 }
