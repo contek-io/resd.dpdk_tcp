@@ -124,6 +124,7 @@ pub struct dpdk_net_connect_opts_t {
 }
 
 #[repr(u32)]
+#[derive(Copy, Clone)]
 pub enum dpdk_net_event_kind_t {
     DPDK_NET_EVT_CONNECTED = 1,
     DPDK_NET_EVT_READABLE = 2,

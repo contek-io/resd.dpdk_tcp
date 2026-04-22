@@ -433,6 +433,65 @@ impl TcpConn {
         }
     }
 
+    /// A7 Task 5: construct a server-side connection in SYN_RCVD from a
+    /// freshly-arrived inbound SYN. Delegates to `new_client` and then
+    /// overrides only the fields that differ on the passive path:
+    ///   - state is `SynReceived` (not `Closed`),
+    ///   - `rcv_nxt = iss_peer + 1` and `irs = iss_peer` (peer's SYN consumes
+    ///     one seq),
+    ///   - peer options (MSS / WS / Timestamps / SACK-permitted) are absorbed
+    ///     from the SYN's `TcpOpts` so the later ESTABLISHED transition
+    ///     doesn't need a second parse.
+    ///
+    /// `iss` is our ISS for this flow — the caller derives it via the
+    /// engine's `IssGen::next`, matching the active path's shape. Snd_nxt
+    /// is bumped past our SYN-ACK by the caller post-TX (mirroring the
+    /// active path's post-TX `snd_nxt += 1`).
+    ///
+    /// Behind `feature = "test-server"`: there is no production code path
+    /// that builds a passive-open conn today (A6.6 is client-only).
+    #[cfg(feature = "test-server")]
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_passive(
+        tuple: FourTuple,
+        iss: u32,
+        iss_peer: u32,
+        opts: crate::tcp_options::TcpOpts,
+        our_mss: u16,
+        recv_buf_bytes: u32,
+        send_buf_bytes: u32,
+        min_rto_us: u32,
+        initial_rto_us: u32,
+        max_rto_us: u32,
+    ) -> Self {
+        let mut c = Self::new_client(
+            tuple,
+            iss,
+            our_mss,
+            recv_buf_bytes,
+            send_buf_bytes,
+            min_rto_us,
+            initial_rto_us,
+            max_rto_us,
+        );
+        // Deltas from the active-open seed:
+        c.state = TcpState::SynReceived;
+        c.rcv_nxt = iss_peer.wrapping_add(1);
+        c.irs = iss_peer;
+        // Absorb peer options from the SYN.
+        if let Some(mss) = opts.mss {
+            c.peer_mss = mss;
+        }
+        c.ws_shift_in = opts.wscale.unwrap_or(0).min(14);
+        c.ts_enabled = opts.timestamps.is_some();
+        if let Some((tsval, _)) = opts.timestamps {
+            c.ts_recent = tsval;
+            c.ts_recent_age = crate::clock::now_ns();
+        }
+        c.sack_enabled = opts.sack_permitted;
+        c
+    }
+
     /// A5.5 Task 10: project the per-connect TLP tuning into the
     /// pure-function `TlpConfig` consumed by `pto_us`. By the time we
     /// reach here, `tlp_pto_min_floor_us` has already been substituted

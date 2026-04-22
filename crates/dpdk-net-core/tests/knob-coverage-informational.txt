@@ -1,0 +1,14 @@
+# Knob-coverage informational whitelist.
+#
+# A11 (the full cross-phase knob-coverage audit) enumerates every
+# behavioral field on `dpdk_net_engine_config_t` / `dpdk_net_connect_opts_t`
+# and requires a test scenario per field. Some "knobs" are purely
+# informational (build-system flags, sizing values with no branching
+# logic, identity fields) and do not admit a behavioral test of the
+# shape "non-default value changes observable wire behavior" — they are
+# listed here with a short justification so A11's coverage checker
+# doesn't flag them as orphaned.
+#
+# Format: one entry per line, `<name>  # <reason>`.
+
+test-server  # A7: cargo build-system flag, no runtime behavioral effect; covered by tests/corpus_ligurio.rs and tests/shim_*.

@@ -1,3 +1,9 @@
 [submodule "third_party/mtcp"]
 	path = third_party/mtcp
 	url = https://github.com/mtcp-stack/mtcp
+[submodule "third_party/packetdrill"]
+	path = third_party/packetdrill
+	url = https://github.com/google/packetdrill
+[submodule "third_party/packetdrill-testcases"]
+	path = third_party/packetdrill-testcases
+	url = https://github.com/ligurio/packetdrill-testcases

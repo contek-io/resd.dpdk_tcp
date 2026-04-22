@@ -19,6 +19,9 @@ test-inject = ["dpdk-net-core/test-inject"]
 # A9 fault-injector pass-through: re-exports the dpdk-net-core feature gate.
 # Default OFF; cbindgen runs without it, so nothing leaks into dpdk_net.h.
 fault-injector = ["dpdk-net-core/fault-injector"]
+# A7: enables the test-only FFI surface (src/test_ffi.rs) and pass-through
+# to dpdk-net-core's test-server feature.
+test-server = ["dpdk-net-core/test-server"]
 
 [dependencies]
 dpdk-net-core = { path = "../dpdk-net-core" }

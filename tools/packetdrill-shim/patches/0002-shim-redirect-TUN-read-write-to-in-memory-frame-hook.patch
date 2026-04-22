@@ -1,0 +1,107 @@
+From 5bd3e831dfffed62bed09a6ffd4893c7434a0352 Mon Sep 17 00:00:00 2001
+From: A7 Shim <a7-shim@local>
+Date: Tue, 21 Apr 2026 16:27:27 +0000
+Subject: [PATCH 2/5] shim: redirect TUN read/write to in-memory frame hook
+
+When the shim is active, local_netdev_new skips cleanup_old_device,
+check_remote_address, create_device, set_device_offload_flags,
+bring_up_device, route_traffic_to_device, and packet_socket_new --
+all of which require CAP_NET_ADMIN and a real /dev/net/tun. The
+wrapper allocates a named shim0 placeholder so state_new() still
+gets a valid struct netdev*.
+
+local_netdev_send and local_netdev_receive detect the shim and
+delegate to dpdk_net_shim_inject_packet / dpdk_net_shim_drain_next
+respectively. The L2 header is synthesized / stripped by the shim;
+the caller only ever sees L3+ bytes.
+---
+ gtests/net/packetdrill/netdev.c | 52 +++++++++++++++++++++++++++++++++
+ 1 file changed, 52 insertions(+)
+
+diff --git a/gtests/net/packetdrill/netdev.c b/gtests/net/packetdrill/netdev.c
+index 1a61e11..1d8c1b9 100644
+--- a/gtests/net/packetdrill/netdev.c
++++ b/gtests/net/packetdrill/netdev.c
+@@ -45,6 +45,7 @@
+ #endif /* defined(__FreeBSD__) || defined(__OpenBSD__) || defined(__NetBSD__) */
+ 
+ #include "assert.h"
++#include "dpdk_net_shim.h"
+ #include "ip.h"
+ #include "ipv6.h"
+ #include "logging.h"
+@@ -299,6 +300,19 @@ struct netdev *local_netdev_new(struct config *config)
+ 
+ 	netdev->netdev.ops = &local_netdev_ops;
+ 
++	/* A7 shim: when dpdk_net_shim is active, skip every TUN/ifconfig
++	 * action. We still allocate the wrapper so run.c/state_new get a
++	 * valid struct netdev *, but all send/receive flows through the
++	 * shim via the ops vtable below. */
++	if (dpdk_net_shim_is_active()) {
++		netdev->tun_fd = -1;
++		netdev->control_fd = -1;
++		netdev->name = strdup("shim0");
++		netdev->index = 0;
++		netdev->psock = NULL;
++		return (struct netdev *)netdev;
++	}
++
+ 	cleanup_old_device(config, netdev);
+ 
+ 	check_remote_address(config, netdev);
+@@ -395,6 +409,16 @@ static int local_netdev_send(struct netdev *a_netdev,
+ 
+ 	DEBUGP("local_netdev_send\n");
+ 
++	/* A7 shim: route the packet bytes straight into the DPDK-net engine
++	 * RX pipeline, skipping every TUN/writev call. The shim prepends
++	 * its own L2 header. */
++	if (dpdk_net_shim_is_active()) {
++		(void)netdev;
++		int rc = dpdk_net_shim_inject_packet(
++			packet_start(packet), (size_t)packet->ip_bytes);
++		return rc == 0 ? STATUS_OK : STATUS_ERR;
++	}
++
+ #if defined(__FreeBSD__) || defined(__OpenBSD__) || defined(__NetBSD__)
+ 	bsd_tun_write(netdev, packet);
+ #endif /* defined(__FreeBSD__) || defined(__OpenBSD__) || defined(__NetBSD__) */
+@@ -448,6 +472,34 @@ static int local_netdev_receive(struct netdev *a_netdev, s32 timeout_secs,
+ 
+ 	DEBUGP("local_netdev_receive\n");
+ 
++	/* A7 shim: read one queued TX frame out of the engine. We emit a
++	 * struct packet * styled the way packet_socket_linux would. */
++	if (dpdk_net_shim_is_active()) {
++		assert(*packet == NULL);
++		*packet = packet_new(PACKET_READ_BYTES);
++		size_t in_bytes = (*packet)->buffer_bytes;
++		long long tv_us = 0;
++		int rc = dpdk_net_shim_drain_next(
++			(*packet)->buffer, &in_bytes, &tv_us);
++		if (rc != 0 || in_bytes == 0) {
++			packet_free(*packet);
++			*packet = NULL;
++			if (error)
++				asprintf(error,
++					 "Timed out waiting for packet");
++			return STATUS_TIMEOUT;
++		}
++		(*packet)->time_usecs = tv_us;
++		enum packet_parse_result_t result =
++			parse_packet(*packet, in_bytes, PACKET_LAYER_3_IP,
++				     error);
++		if (result == PACKET_OK)
++			return STATUS_OK;
++		packet_free(*packet);
++		*packet = NULL;
++		return STATUS_ERR;
++	}
++
+ 	status = netdev_receive_loop(netdev->psock, PACKET_LAYER_3_IP,
+ 				     DIRECTION_OUTBOUND, timeout_secs, packet,
+ 				     &num_packets, error);
+-- 
+2.34.1
+
