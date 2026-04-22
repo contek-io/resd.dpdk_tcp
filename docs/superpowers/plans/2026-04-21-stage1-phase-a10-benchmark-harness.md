@@ -2740,6 +2740,77 @@ git commit -m "a10 task 15: scripts/bench-nightly.sh — end-to-end orchestrator
 
 ---
 
+## Task 15-B: post-MVP follow-ups (deferred from T15)
+
+T15-A landed the bash orchestrator + runbook. The T9 / T12 follow-ups
+originally listed against T15 are deferred to T15-B, because they are
+code-crate refactors (not orchestration) and Plan A (AMI bake) must
+land before the end-to-end script can exercise them against a real
+fleet anyway. Running T15-B earlier would block on a shipped AMI.
+
+**Scope:**
+
+- **T9-I1** — Extract shared L2/L3/L4 parser from
+  `tools/bench-vs-linux/src/normalize.rs`. `discover_pins` (pass 1) and
+  `rewrite_frame` (pass 2) currently duplicate Ethernet + IPv4 + TCP
+  header bounds checks; factor into `parse_l2l3l4(data) ->
+  Option<FrameOffsets>` so IPv6/VLAN chain extensions are
+  single-edited. Target file: `tools/bench-vs-linux/src/normalize.rs`.
+- **T9-I2** — Port-reuse discrimination in canonicalisation.
+  `FlowState.iss` is keyed by sorted 4-tuple with no connection-
+  instance discrimination; live multi-connection pcaps silently
+  miscanonicalise. Fix: either add SYN-timestamp to the pin key,
+  bump a per-SYN instance counter, or at minimum add a scope-note +
+  `CanonError::PortReuseDetected` so T15-A's mode-B run surfaces the
+  collision. Preferred: per-SYN instance counter — deterministic, no
+  clock dependency.
+- **T9-I5** — Integration test under
+  `tools/bench-vs-linux/tests/` asserting that differing local/peer
+  pcap packet counts produce non-zero `diff_bytes` plus accurate
+  `local_packets` / `peer_packets` CSV cells. Today the canonicaliser
+  short-circuits on missing pins; T15-A's live-capture path exposes
+  this surface for the first time.
+- **T9 minor** — Add `CanonError::MalformedSackOption`; fold the two
+  option walkers in `src/normalize.rs` into a single
+  `walk_options<F>(slice, visitor: F)`; extract the synth-pcap builder
+  out of `tests/normalize_roundtrip.rs` (857 lines) into
+  `tests/common/synth.rs` so later pcap fixtures can reuse it.
+- **T12-I4 (peer rwnd tautology)** —
+  `tools/bench-vs-mtcp/src/main.rs:run_burst_grid_dpdk` plugs
+  `peer_rwnd = bucket.burst_bytes` into `check_peer_window(peer_rwnd,
+  K)`, which makes the spec §11.1 check (1) a `K >= K` tautology. Fix
+  in T15-B — now that T15-A has SSH access to the peer, option (b) is
+  tractable: shell out during preflight with `ssh ubuntu@$PEER_SSH "ss
+  -ti | grep -A1 <dut_ip>:<port>"`, scrape the scaled rwnd, and plumb
+  into `check_peer_window`. Option (a) — `Engine::last_peer_rwnd(conn)`
+  on the engine's public API — is cleaner but requires a TCB-read
+  surface that spec §11 hasn't motivated elsewhere; defer until
+  another consumer lands.
+- **Mode B live capture** — Today
+  `scripts/bench-nightly.sh` runs `bench-vs-linux --mode wire-diff`
+  only if the operator pre-stages pcaps under
+  `$OUT_DIR/pcaps/{local,peer}.pcap`. T15-B adds live `tcpdump` orchestration
+  (start on DUT + peer → run workload → stop captures → SCP back)
+  inside the script so mode B runs unconditionally.
+
+**Files:**
+- Modify: `tools/bench-vs-linux/src/normalize.rs` (T9-I1 + T9 minor)
+- Modify: `tools/bench-vs-linux/src/canon/mod.rs` or similar (T9-I2)
+- Add: `tools/bench-vs-linux/tests/common/synth.rs` (T9 minor)
+- Add: `tools/bench-vs-linux/tests/differing_counts.rs` (T9-I5)
+- Modify: `tools/bench-vs-mtcp/src/main.rs` + `src/burst.rs` (T12-I4)
+- Modify: `scripts/bench-nightly.sh` (live-capture wiring)
+
+**Acceptance:**
+- `cargo test -p bench-vs-linux` passes (differing-counts test green)
+- `cargo test -p bench-vs-mtcp` passes; `check_peer_window` no longer
+  tautological
+- `shellcheck -S warning -o all scripts/bench-nightly.sh` still clean
+- Mode B run emits a non-empty `bench-vs-linux-wire-diff.csv` without
+  operator pre-staging
+
+---
+
 ## Task 16: Run benches + commit 3 report artefacts
 
 Requires sister-plan T6 (first AMI bake) + T7 (validated bring-up) to have landed.
