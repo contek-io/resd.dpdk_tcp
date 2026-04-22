@@ -1,0 +1,16 @@
+[package]
+name = "tcpreq-runner"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+dpdk-net-core = { path = "../../crates/dpdk-net-core", features = ["test-server"] }
+dpdk-net      = { path = "../../crates/dpdk-net", features = ["test-server"] }
+# Add other deps as needed when T19-T21 land probe bodies.
+
+[dev-dependencies]
+# Nothing for T18 — T19-T21 may add.
