@@ -37,3 +37,9 @@ csv = "1.3"
 serde_json = "1"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 uuid = { version = "1", features = ["v4"] }
+# wait-timeout is a tiny zero-dep crate (<200 LOC) that gives us a
+# portable `Child::wait_timeout(Duration)`. Without it, `Child::wait()`
+# blocks indefinitely if bench-ab-runner hangs (DPDK stall, missing NIC,
+# runaway workload) and the sweep driver becomes unkillable short of
+# operator SIGTERM. See I3 in the T10 code-quality review.
+wait-timeout = "0.2"

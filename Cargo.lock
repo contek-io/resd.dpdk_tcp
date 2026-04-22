@@ -178,6 +178,7 @@ dependencies = [
  "csv",
  "serde_json",
  "uuid",
+ "wait-timeout",
 ]
 
 [[package]]

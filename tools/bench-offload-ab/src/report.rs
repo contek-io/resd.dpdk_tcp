@@ -69,7 +69,18 @@ pub struct RunReport {
     pub run_id: String,
     pub date_iso8601: String,
     pub commit_sha: String,
+    /// The clamped noise floor fed into the decision rule. See
+    /// [`noise_floor_raw_ns`] for the pre-clamp value — when the raw
+    /// value is below [`crate::decision::DecisionRule`]'s lower bound
+    /// the two differ and the report surfaces both to the operator.
     pub noise_floor_ns: f64,
+    /// Pre-clamp noise floor (`|p99(baseline-noise-1) - p99(baseline-noise-2)|`)
+    /// — the empirically observed p99 spread of two back-to-back baseline runs.
+    /// On a quiet machine this can collapse to near zero, which would make
+    /// `3 * noise_floor ~= 0` and every positive `delta_p99` read as Signal;
+    /// the driver clamps to `MIN_NOISE_FLOOR_NS` before building the rule.
+    /// Reporting both is how the reviewer sees that a clamp fired.
+    pub noise_floor_raw_ns: f64,
     pub rule: DecisionRule,
     /// One entry per config in matrix order.
     pub rows: Vec<ReportRow>,
@@ -370,12 +381,12 @@ pub fn render<W: Write>(w: &mut W, report: &RunReport) -> std::io::Result<()> {
     writeln!(w)?;
     writeln!(
         w,
-        "Noise floor (2 back-to-back baselines, delta_p99): {:.2} ns",
-        report.noise_floor_ns
+        "Noise floor (2 back-to-back baselines, |p99 delta|): {:.2} ns (raw); {:.2} ns (clamped)",
+        report.noise_floor_raw_ns, report.noise_floor_ns
     )?;
     writeln!(
         w,
-        "Decision threshold (3 × noise_floor): {:.2} ns",
+        "Decision threshold (3 × clamped noise floor): {:.2} ns",
         3.0 * report.noise_floor_ns
     )?;
     writeln!(w)?;
@@ -680,6 +691,7 @@ mod tests {
             date_iso8601: "2026-04-22T03:14:07Z".into(),
             commit_sha: "abc".into(),
             noise_floor_ns: rule.noise_floor_ns,
+            noise_floor_raw_ns: rule.noise_floor_ns,
             rule,
             rows,
             sanity_invariant: Ok(()),
@@ -699,7 +711,9 @@ mod tests {
         assert!(md.contains("| tx-cksum-only | hw-offload-tx-cksum |"));
         assert!(md.contains("**Signal**"));
         assert!(md.contains("Noise floor"));
-        assert!(md.contains("Decision threshold (3 × noise_floor): 14.40 ns"));
+        assert!(md.contains("raw"));
+        assert!(md.contains("clamped"));
+        assert!(md.contains("Decision threshold (3 × clamped noise floor): 14.40 ns"));
         assert!(md.contains("## Sanity Invariant"));
         assert!(md.contains("full p99: 82.00 ns"));
         assert!(md.contains("Best individual p99: 80.00 ns (tx-cksum-only)"));
@@ -717,6 +731,7 @@ mod tests {
             date_iso8601: "d".into(),
             commit_sha: "c".into(),
             noise_floor_ns: 5.0,
+            noise_floor_raw_ns: 5.0,
             rule,
             rows: Vec::new(),
             sanity_invariant: Err("full p99 94 > best individual p99 92".into()),

@@ -2443,6 +2443,21 @@ Mirrors T10 for `obs-*` feature matrix.
 **Files:**
 - Create: `tools/bench-obs-overhead/{Cargo.toml, src/main.rs, src/matrix.rs, src/report.rs}`
 
+### Design hint: sanity invariant shape (from T10 fixup review)
+
+T10's `check_full_sanity` locks the `hw-*`-specific invariant "full p99 ≤ best individual p99" directly into the function body. That invariant does NOT apply to `obs-*`: the reference point there is `obs-none` (all observability OFF), not a "full" row, and the failure predicate is different — we want to flag any `obs-*` config whose `delta_p99 > 3 × noise_floor` when its corresponding feature has `default=ON` (i.e. the observability site is costing a measurable amount on the hot path).
+
+When T11 lands, refactor `bench_offload_ab::report::check_full_sanity` into a callback-shaped API before reusing:
+
+```rust
+pub fn check_sanity<F>(matrix: &[Config], agg: &BTreeMap<String, Aggregated>, invariant: F) -> SanityReport
+where
+    F: Fn(&[Config], &BTreeMap<String, Aggregated>) -> Result<(), String>,
+{ /* calls invariant, wraps its verdict + diagnostic fields */ }
+```
+
+Then T10 supplies the "full ≤ best individual" closure and T11 supplies the "no default-ON obs-* config has delta_p99 > 3×noise_floor" closure. Until that refactor lands, T11 should duplicate the top-level scaffolding in its own `report.rs` rather than trying to reshape T10's signature from the outside. The callback refactor is its own small PR, not a T11 blocker.
+
 ### Steps
 
 - [ ] **Step 11.1: Copy the T10 skeleton, swap the matrix**
