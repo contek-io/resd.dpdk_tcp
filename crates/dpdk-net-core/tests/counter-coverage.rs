@@ -1952,3 +1952,52 @@ fn scen_time_wait_to_closed(h: &mut CovHarness) {
     h.inject_peer_fin_ack_combined(); // → TimeWait
     h.advance_virt_past_2msl_and_reap(); // → Closed
 }
+
+// ---------------------------------------------------------------------
+// T9: feature-gated counter-coverage scenarios.
+//
+// These scenarios exercise counters whose increment site is compiled
+// out of the default-features build. They run only under
+// `--features obs-byte-counters,test-server` (or `--all-features` once
+// the A9 `fault-injector` feature lands). Static audit (T3) reaches
+// them via the `feature-gated-counters.txt` whitelist in
+// `tests/feature-gated-counters.txt`.
+//
+// Only `obs-byte-counters` entries here; A9's `fault-injector` group
+// does NOT have its `FaultInjectorCounters` struct on `Counters` yet
+// on the phase-a8 tip, so there is no counter-path to audit.
+// ---------------------------------------------------------------------
+
+/// Covers: `tcp.tx_payload_bytes` (hot-path, per-burst-batched).
+/// Feature-gate: `obs-byte-counters` (default OFF). Increment site:
+/// `send_bytes` per-segment accumulator flushed as a single `fetch_add`
+/// after the segmentation loop (engine.rs:4739). See spec §9.1.1
+/// hot-path counter policy.
+#[cfg(feature = "obs-byte-counters")]
+#[test]
+fn cover_tcp_tx_payload_bytes() {
+    let mut h = CovHarness::new();
+    let conn = h.do_passive_open();
+    // Send bytes peer-ward; `send_bytes` internally accumulates the
+    // per-segment byte count and flushes a single fetch_add at method
+    // exit, so the counter bumps whether or not we subsequently drain.
+    h.send_bytes_and_flush(conn, b"abcdefghij"); // 10 bytes
+    h.assert_counter_gt_zero("tcp.tx_payload_bytes");
+}
+
+/// Covers: `tcp.rx_payload_bytes` (hot-path, per-burst-batched).
+/// Feature-gate: `obs-byte-counters` (default OFF). Increment site:
+/// `poll_once` rx-burst accumulator (engine.rs:2106). The
+/// `inject_rx_frame` test-server path mirrors the bump (same feature
+/// gate) because the test-server bypass cannot drive `poll_once`
+/// directly — see the T9 mirror comment in `inject_rx_frame`.
+#[cfg(feature = "obs-byte-counters")]
+#[test]
+fn cover_tcp_rx_payload_bytes() {
+    let mut h = CovHarness::new();
+    let _conn = h.do_passive_open();
+    // Peer sends data; `rx_frame` returns the accepted-payload bytes
+    // and `inject_rx_frame`'s T9 mirror adds them to the counter.
+    h.inject_peer_data(b"hijklmnop"); // 9 bytes
+    h.assert_counter_gt_zero("tcp.rx_payload_bytes");
+}

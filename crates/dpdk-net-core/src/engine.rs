@@ -5467,7 +5467,22 @@ impl Engine {
         // The bytes slice borrows the mbuf's data; the rx_frame chain
         // holds it for the duration of the call.
         let rx_mbuf = std::ptr::NonNull::new(m);
-        let _ = self.rx_frame(bytes, 0, 0, 0, rx_mbuf);
+        let _accepted = self.rx_frame(bytes, 0, 0, 0, rx_mbuf);
+        // A8 T9: mirror poll_once's obs-byte-counters per-burst accumulator.
+        // `rx_frame` returns accepted-payload-byte count; the real bump in
+        // poll_once (~engine.rs:2106) is a single fetch_add per burst after
+        // the loop. For the single-frame inject path the "per-burst" sum is
+        // just `_accepted`. Without this mirror, `cover_tcp_rx_payload_bytes`
+        // would have no drive path under the test-server bypass.
+        #[cfg(feature = "obs-byte-counters")]
+        {
+            if _accepted > 0 {
+                crate::counters::add(
+                    &self.counters.tcp.rx_payload_bytes,
+                    _accepted as u64,
+                );
+            }
+        }
         // Free the RX mbuf ref; if OOO-insert up-bumped the refcount
         // (parallel to poll_once's behavior), the reorder queue still
         // holds a live ref and the mbuf survives until drained.

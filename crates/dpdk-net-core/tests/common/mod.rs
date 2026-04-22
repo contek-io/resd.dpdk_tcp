@@ -1560,5 +1560,23 @@ impl CovHarness {
         set_virt_ns(5_000_000_000);
         self.eng.test_reap_time_wait();
     }
+
+    /// A8 T9: send `buf` on `conn` and drain the pending-data ring. The
+    /// `tcp.tx_payload_bytes` accumulator bump lives inside `send_bytes`
+    /// itself (engine.rs:4739, flushed as a single `fetch_add` per
+    /// `send_bytes` invocation), so the flush is not strictly required
+    /// for the counter — but we drain the ring so any follow-on
+    /// `drain_tx_frames()` in the scenario sees only subsequent frames.
+    /// Gated on `obs-byte-counters` because the only scenario using it
+    /// lives under the same gate.
+    #[cfg(feature = "obs-byte-counters")]
+    pub fn send_bytes_and_flush(
+        &mut self,
+        conn: dpdk_net_core::flow_table::ConnHandle,
+        buf: &[u8],
+    ) {
+        let _ = self.eng.send_bytes(conn, buf);
+        self.eng.flush_tx_pending_data();
+    }
 }
 
