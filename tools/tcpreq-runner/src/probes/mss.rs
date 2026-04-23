@@ -297,6 +297,7 @@ pub fn late_option() -> ProbeResult {
 ///        - kind 1 (NOP) → skip 1 byte.
 ///        - kind 2 (MSS) → verify `len == 4`; record as found.
 ///        - other → read length byte, skip `len` bytes.
+///
 ///      Truncated options are detected and reported as failures rather
 ///      than silently ignored.
 ///   5. PASS iff an MSS option (kind=2, len=4) was found.
