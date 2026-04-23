@@ -324,8 +324,46 @@ scp "${SCP_OPTS[@]}" \
 #        </dev/null redirect guards against the OpenSSH-client-hang
 #        gotcha where a backgrounded remote child keeps ssh's stdin
 #        open.
+#
+#        The bench-host AMI binds the data NIC to vfio-pci at first
+#        boot (sister component 07-systemd-units). That's correct for
+#        the DUT — DPDK owns the NIC — but the peer runs plain Linux
+#        echo-server / linux-tcp-sink on the data ENI IP, so here we
+#        unbind it on the peer and bring the kernel interface up with
+#        the data-plane IP. Idempotent.
 # ---------------------------------------------------------------------------
-log "[6/12] starting peer services on $PEER_SSH"
+log "[6/12] preparing peer data NIC and starting peer services on $PEER_SSH"
+refresh_ec2_ic_grants
+ssh "${SSH_OPTS[@]}" "ubuntu@$PEER_SSH" \
+    "sudo bash -s -- $PEER_IP" <<'REMOTE_EOF'
+set -euo pipefail
+PEER_IP="$1"
+PCI="$(/usr/local/bin/dpdk-devbind.py --status-dev net | awk '/drv=vfio-pci/ {print $1; exit}')"
+if [ -n "$PCI" ]; then
+  echo "peer-prep: unbinding $PCI from vfio-pci, rebinding to ena"
+  /usr/local/bin/dpdk-devbind.py --bind ena "$PCI"
+  sleep 2
+fi
+# First non-mgmt, non-lo, non-docker interface is the peer data NIC.
+MGMT_IF="$(ip route show default | awk '/default/ {print $5; exit}')"
+IFACE="$(ip -o link show | awk -F': ' '{print $2}' | grep -vE "^(lo|docker|${MGMT_IF})$" | head -1)"
+if [ -z "$IFACE" ]; then
+  echo "peer-prep: no data NIC found after rebind" >&2
+  exit 1
+fi
+echo "peer-prep: bringing up $IFACE with $PEER_IP/24"
+ip link set "$IFACE" up
+# --no-check-duplicate-addr is unreliable on ip-addr replace; simpler to
+# tolerate EEXIST from a re-run by stripping-then-adding.
+ip addr flush dev "$IFACE" || true
+ip addr add "$PEER_IP"/24 dev "$IFACE"
+# Drop firewall on the interface so echo-server accepts from the DUT.
+# Already running as root via `sudo bash -s --`, no extra sudo needed.
+iptables -I INPUT -i "$IFACE" -j ACCEPT 2>/dev/null || true
+echo "peer-prep: $IFACE ready"
+REMOTE_EOF
+
+refresh_ec2_ic_grants
 ssh "${SSH_OPTS[@]}" "ubuntu@$PEER_SSH" \
     "nohup /tmp/echo-server 10001 >/tmp/echo-server.log 2>&1 </dev/null &"
 refresh_ec2_ic_grants
