@@ -232,6 +232,34 @@ refresh_ec2_ic_grants() {
 log "  pushing operator pubkey via EC2 Instance Connect (60 s grant)"
 refresh_ec2_ic_grants
 
+# wait_for_ssh <host> — retry a BatchMode ssh probe until sshd accepts
+# the connection. CloudFormation reports CREATE_COMPLETE when the
+# instance starts running, but sshd may still be initialising (kex +
+# host-key generation + auth stack). We refresh the EC2IC grant on
+# every retry so the 60 s auth window never closes during a slow boot.
+wait_for_ssh() {
+  local host="$1"
+  local instance_id="$2"
+  local attempt=0
+  local max_attempts=30  # 30 * 5 s = 150 s ceiling
+  while (( attempt < max_attempts )); do
+    push_operator_pubkey "$instance_id"
+    if ssh "${SSH_OPTS[@]}" -o BatchMode=yes -o ConnectTimeout=5 \
+         "ubuntu@${host}" exit 2>/dev/null; then
+      log "  sshd ready on $host (attempt $((attempt+1)))"
+      return 0
+    fi
+    attempt=$((attempt + 1))
+    sleep 5
+  done
+  log "  sshd NEVER came up on $host after ${max_attempts} probes"
+  return 1
+}
+
+log "  waiting for sshd on both hosts"
+wait_for_ssh "$DUT_SSH" "$DUT_INSTANCE_ID"
+wait_for_ssh "$PEER_SSH" "$PEER_INSTANCE_ID"
+
 # EAL args — ENA hot-path flags per spec §11 (large_llq_hdr=1,
 # miss_txc_to=3) on PCI slot 0000:00:06.0 (c6in.metal default). The
 # script takes EAL_ARGS from env if the operator wants to override for
