@@ -254,25 +254,42 @@ reflect the real blocker observed after the reorder.
 
 ## google upstream
 
-### Runnable-but-broken (A8 T16 pragmatic floor)
+### Runnable-but-broken (A8.5 T6 pragmatic floor)
 
 The Google upstream packetdrill tests under
-`third_party/packetdrill/gtests/` (167 `.pkt` total) all fail on the A8
-shim binary. Pinned at `GOOGLE_RUNNABLE_COUNT = 0`.
+`third_party/packetdrill/gtests/` (167 `.pkt` total) all fail on the
+A8.5 T6 shim binary. Pinned at `GOOGLE_RUNNABLE_COUNT = 0`.
 
-Dry-run evidence that drove this floor:
-- 0/167 scripts exit 0 under the A8 T15 S2 shim.
-- 163/167 scripts source `scripts/defaults.sh` + `set_sysctls.py` via
-  the packetdrill `\`...\`` init-script mechanism. Our CI environment
-  does not provide these helpers (shell init returns 127, the shim
-  surfaces this as exit 1 before any TCP packet flows).
-- The remaining 4 (packet-timeout meta test + 2 socket_err shape
-  tests + 1 fast_retransmit variant under
-  `gtests/net/packetdrill/tests/`) fail on engine behavior gaps that
-  Google uses to exercise packetdrill itself.
+Dry-run evidence that drove this floor (post-T6):
+- 0/167 scripts exit 0 under the A8.5 T6 shim.
+- The init-script blocker is gone: patch 0007 stubs
+  `gtests/net/common/defaults.sh` (plus the symlinked TCP variant)
+  and `gtests/net/tcp/common/set_sysctls.py` to no-ops, and the
+  corpus invoker now chdirs into the script's directory before
+  spawning the shim so relative paths resolve. Previously all 163
+  env-init-dependent scripts exited 127 at the init step; they now
+  all progress into the TCP path.
+- Post-T6 failure mix over the 167:
+  - 93 fail on SYN-ACK wire-shape mismatch (the engine emits
+    `<MSS, NOP+WScale, SACKP, TS>` unconditionally; many scripts
+    expect options mirrored to the client or no TS when the client
+    didn't offer it, so `ipv4_total_length` or the TCP options block
+    diverges).
+  - ~25 fail on `fcntl(F_GETFL)` / `fcntl(F_SETFL, O_NONBLOCK)`
+    flag-shape drift (expected 2 vs actual 2050 — the shim reports
+    a richer flag word than the scripts expect).
+  - ~20 fail on fastopen `sendto()` returning `EBADF` where
+    scripts expect `EINPROGRESS` (TCP Fast Open not implemented).
+  - The remaining ~29 fail on a long tail of engine gaps
+    (server-side accept timing, TCP_MAXSEG setsockopt not plumbed,
+    fast_retransmit / cubic / sack / ts_recent / etc.).
+- 4 packetdrill-meta scripts (fast_retransmit, socket_err shapes,
+  packet-timeout) fail on errno-shape or timing gaps that Google
+  uses to exercise packetdrill itself.
 
-A8+ work: stub `scripts/defaults.sh` at the shim level (or make the
-engine tolerate init-script failures), then reclassify.
+A8+ work: close the SYN-ACK TCP-option mirroring gap +
+fcntl(O_NONBLOCK) flag-shape parity to unlock ~118 scripts, then
+triage the long-tail engine gaps.
 
 ### Syscalls returning EOPNOTSUPP in the A8 shim
 
@@ -421,30 +438,34 @@ engine tolerate init-script failures), then reclassify.
 
 ### MSS / TCP_MAXSEG socket-option + client-mode plumbing
 
-Note: A8.5 Task 5 aligned TX TCP option emission to Linux canonical order
-(`<MSS, NOP+WScale, SACKP, TS>`). Post-reorder, each of these scripts still
-fails for a *different*, deeper reason than option-order drift; reasons below
-reflect the real blocker observed after the reorder.
+Note: A8.5 T5 aligned TX TCP option emission to Linux canonical order
+(`<MSS, NOP+WScale, SACKP, TS>`) and A8.5 T6 removed the defaults.sh
+init blocker. Post-T6 reasons below reflect the actual TCP-path
+failure each script hits.
 
-  - gtests/net/tcp/mss/mss-getsockopt-tcp_maxseg-server.pkt — requires ../common/defaults.sh host-env (init command exits 127)
-  - gtests/net/tcp/mss/mss-setsockopt-tcp_maxseg-client.pkt — requires ../common/defaults.sh host-env (init command exits 127)
-  - gtests/net/tcp/mss/mss-setsockopt-tcp_maxseg-server.pkt — requires ../common/defaults.sh host-env (init command exits 127)
+  - gtests/net/tcp/mss/mss-getsockopt-tcp_maxseg-server.pkt — SYN-ACK emits TS/SACKP unconditionally vs no-option client (post-T6; option-mirroring gap)
+  - gtests/net/tcp/mss/mss-setsockopt-tcp_maxseg-client.pkt — TCP_MAXSEG setsockopt not plumbed: getsockopt returns 0 instead of user-configured value
+  - gtests/net/tcp/mss/mss-setsockopt-tcp_maxseg-server.pkt — TCP_MAXSEG setsockopt not plumbed: getsockopt returns 0 instead of user-configured value
 
-### Server-side lifecycle — requires scripts/defaults.sh host-env (A8+)
+### Server-side lifecycle — engine/shim gaps after T6 init-stub (A8+)
 
-  - gtests/net/tcp/blocking/blocking-accept.pkt — requires scripts/defaults.sh host-env (blocking tests, A8+)
-  - gtests/net/tcp/blocking/blocking-connect.pkt — requires scripts/defaults.sh host-env (blocking tests, A8+)
-  - gtests/net/tcp/blocking/blocking-read.pkt — requires scripts/defaults.sh host-env (blocking tests, A8+)
-  - gtests/net/tcp/blocking/blocking-write.pkt — requires scripts/defaults.sh host-env (blocking tests, A8+)
-  - gtests/net/tcp/close/close-local-close-then-remote-fin.pkt — requires scripts/defaults.sh host-env + server-side accept path (A8+)
-  - gtests/net/tcp/close/close-on-syn-sent.pkt — requires scripts/defaults.sh host-env + server-side accept path (A8+)
-  - gtests/net/tcp/close/close-remote-fin-then-close.pkt — requires scripts/defaults.sh host-env + server-side accept path (A8+)
-  - gtests/net/tcp/shutdown/shutdown-rd-close.pkt — requires scripts/defaults.sh host-env + server-side accept path (A8+)
-  - gtests/net/tcp/shutdown/shutdown-rd-wr-close.pkt — requires scripts/defaults.sh host-env + server-side accept path (A8+)
-  - gtests/net/tcp/shutdown/shutdown-rdwr-close.pkt — requires scripts/defaults.sh host-env + server-side accept path (A8+)
-  - gtests/net/tcp/shutdown/shutdown-rdwr-send-queue-ack-close.pkt — requires scripts/defaults.sh host-env + server-side accept path (A8+)
-  - gtests/net/tcp/shutdown/shutdown-rdwr-write-queue-close.pkt — requires scripts/defaults.sh host-env + server-side accept path (A8+)
-  - gtests/net/tcp/shutdown/shutdown-wr-close.pkt — requires scripts/defaults.sh host-env + server-side accept path (A8+)
+Init blocker was removed in A8.5 T6 (patch 0007 stubs
+`common/defaults.sh` + `common/set_sysctls.py`). These scripts now
+progress into the TCP path and fail on the deeper blockers noted.
+
+  - gtests/net/tcp/blocking/blocking-accept.pkt — accept() returns -1 EAGAIN before scripted SYN arrives (scheduler/accept timing; post-T6; A8+)
+  - gtests/net/tcp/blocking/blocking-connect.pkt — connect() timing delta vs scripted expectation (post-T6; A8+)
+  - gtests/net/tcp/blocking/blocking-read.pkt — read() blocking timing delta vs scripted expectation (post-T6; A8+)
+  - gtests/net/tcp/blocking/blocking-write.pkt — SYN-ACK TCP options shape mismatch (ipv4_total_length drift; option-mirroring gap)
+  - gtests/net/tcp/close/close-local-close-then-remote-fin.pkt — close() syscall return-time delta vs scripted tolerance (post-T6; A8+)
+  - gtests/net/tcp/close/close-on-syn-sent.pkt — connect() returns 0 where script expects -1 ECONNRESET (RST-during-SYN-SENT path; A8+)
+  - gtests/net/tcp/close/close-remote-fin-then-close.pkt — server-side accept path needed for close-after-FIN test (post-T6; A8+)
+  - gtests/net/tcp/shutdown/shutdown-rd-close.pkt — shutdown() tests require server-side accept path (post-T6; A8+)
+  - gtests/net/tcp/shutdown/shutdown-rd-wr-close.pkt — shutdown() tests require server-side accept path (post-T6; A8+)
+  - gtests/net/tcp/shutdown/shutdown-rdwr-close.pkt — shutdown() tests require server-side accept path (post-T6; A8+)
+  - gtests/net/tcp/shutdown/shutdown-rdwr-send-queue-ack-close.pkt — shutdown() tests require server-side accept path (post-T6; A8+)
+  - gtests/net/tcp/shutdown/shutdown-rdwr-write-queue-close.pkt — shutdown() tests require server-side accept path (post-T6; A8+)
+  - gtests/net/tcp/shutdown/shutdown-wr-close.pkt — shutdown() tests require server-side accept path (post-T6; A8+)
 
 ### Other (wire shape / middleware-layer behavior)
 
@@ -468,4 +489,4 @@ reflect the real blocker observed after the reorder.
   - gtests/net/packetdrill/tests/linux/fast_retransmit/fr-4pkt-sack-linux.pkt — Fast-retransmit dupACK heuristic not in engine
   - gtests/net/packetdrill/tests/linux/packetdrill/socket_err.pkt — socket() errno-shape test: engine always returns success where script expects EAFNOSUPPORT (A8+)
   - gtests/net/packetdrill/tests/linux/packetdrill/socket_wrong_err.pkt — socket() errno-shape test: engine returns OK where script expects -EADDRINUSE (A8+)
-  - gtests/net/packetdrill/tests/packet-timeout.pkt — packet-timeout meta test: requires scripts/defaults.sh + set_sysctls.py host env
+  - gtests/net/packetdrill/tests/packet-timeout.pkt — packet-timeout meta test: engine tolerance/timing gap vs scripted budget (post-T6 stubs)

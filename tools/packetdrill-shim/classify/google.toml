@@ -7,23 +7,39 @@
 #   - reason: short string; appears in SKIPPED.md when skipped.
 #
 # ------------------------------------------------------------------
-# A8 T16 CLASSIFICATION NOTES
+# A8 T16 / A8.5 T6 CLASSIFICATION NOTES
 # ------------------------------------------------------------------
 # Google's upstream packetdrill tests under
-# third_party/packetdrill/gtests/ (167 .pkt total) have a blanket
-# dependency on Linux-kernel `scripts/defaults.sh` + `set_sysctls.py`
-# host-env shell init that our shim can't resolve in CI
-# (`../common/defaults.sh: not found`, init exit 127, all run-time
-# fails). 163/167 source those helpers. The remaining 4 fail on engine
-# behavior gaps (fast-retransmit, socket_err edge cases).
+# third_party/packetdrill/gtests/ (167 .pkt total).
 #
-# Empirically verified on the A8 T15 S2 shim binary:
-#   0/167 exit 0 end-to-end (pinned as runnable)
-#   167/167 skipped against bucket reasons below
+# Initial A8 T16 state: every script failed at shell-init because
+# 163/167 source `../common/defaults.sh` / `set_sysctls.py`, and the
+# upstream versions of those helpers call `sysctl -q` / write to
+# /proc/sys/net/... (root-only, not available in CI).
 #
-# A8+ work: wire `scripts/defaults.sh` as a shim-stub (or set the engine
-# to gracefully ignore init-script failures), pin the engine gaps that
-# drive the remaining four, then reclassify.
+# A8.5 T6 progress:
+#   - Patch 0007 overlays no-op stubs on top of the two existing
+#     common/defaults.sh + common/set_sysctls.py files (one is a
+#     symlink, so two real stub files cover both TCP and non-TCP).
+#   - The invoker now chdirs into the script's directory before
+#     spawning the shim so relative paths in backtick init blocks
+#     resolve correctly.
+#
+# Empirical state on the A8.5 T6 shim binary:
+#   0/167 exit 0 end-to-end (pinned floor held)
+#   167/167 skipped with the bucket reasons below.
+#   The dominant post-init blockers are:
+#     - 93 fail on SYN-ACK TCP options shape
+#       (ipv4_total_length mismatch; engine emits TS+SACKP
+#       unconditionally, scripts expect options mirrored to client).
+#     - ~25 fail on fcntl(O_NONBLOCK) flag-shape drift
+#       (expected 2 vs actual 2050).
+#     - The rest fail on deeper engine gaps already documented in
+#       SKIPPED.md (fastopen, sack, cubic, tcp_info, etc.).
+#
+# A8+ work: close the TCP-option mirroring gap + fcntl drift to
+# unlock the ~118 scripts gated on those, then triage the remaining
+# engine gaps. Patch 0007 is a prerequisite for any of that work.
 # ------------------------------------------------------------------
 
 # --- (1) Pre-existing scaffolding rules (mirror ligurio) ---
@@ -67,7 +83,9 @@ reason = "TCP_CORK not implemented"
 # These packetdrill/tests/ scripts exercise packetdrill itself
 # (socket_err shapes, packet timeout), not TCP semantics. They fail on
 # the A8 shim because the engine returns cleanly where the scripts
-# expect errno shapes, and packet-timeout depends on defaults.sh.
+# expect errno shapes. packet-timeout.pkt previously depended on
+# defaults.sh; A8.5 T6 stubs that dependency, but the meta-test is
+# still blocked on engine errno-shape gaps.
 
 [[rule]]
 matches_regex = "gtests/net/packetdrill/tests/.*/socket_err\\.pkt"
@@ -82,7 +100,7 @@ reason = "socket() errno-shape test: engine returns OK where script expects -EAD
 [[rule]]
 matches_regex = "gtests/net/packetdrill/tests/packet-timeout\\.pkt"
 verdict = "skipped-untranslatable"
-reason = "packet-timeout meta test: requires scripts/defaults.sh + set_sysctls.py host env"
+reason = "packet-timeout meta test: engine tolerance/timing gap vs scripted budget (post-T6 stubs)"
 
 [[rule]]
 matches_regex = "gtests/net/packetdrill/tests/.*/fast_retransmit/.*\\.pkt"
@@ -272,51 +290,54 @@ verdict = "skipped-untranslatable"
 reason = "TIME_WAIT reuse / 2*MSL semantics not exercised via shim yet"
 
 # --- (4) Server-side lifecycle groups ---
-# All of these fail on init `../common/defaults.sh: not found` before
-# any TCP state machinery runs.
+# Post-A8.5 T6 the init blocker is gone (defaults.sh stubbed). These
+# scripts still fail on server-side accept-path / timing deltas and
+# SYN-ACK TCP options drift that the engine doesn't yet mirror.
 
 [[rule]]
 matches_regex = ".*/listen/.*\\.pkt"
 verdict = "skipped-untranslatable"
-reason = "requires scripts/defaults.sh host-env (listen tests, A8+)"
+reason = "server-side listen edge behaviors or TCP options drift (post-T6; A8+)"
 
 [[rule]]
 matches_regex = ".*/blocking/.*\\.pkt"
 verdict = "skipped-untranslatable"
-reason = "requires scripts/defaults.sh host-env (blocking tests, A8+)"
+reason = "blocking accept/connect timing deltas vs shim scheduling (post-T6; A8+)"
 
 [[rule]]
 matches_regex = ".*/close/.*\\.pkt"
 verdict = "skipped-untranslatable"
-reason = "requires scripts/defaults.sh host-env + server-side accept path (A8+)"
+reason = "close() tests require server-side accept path + timing parity (post-T6; A8+)"
 
 [[rule]]
 matches_regex = ".*/shutdown/.*\\.pkt"
 verdict = "skipped-untranslatable"
-reason = "requires scripts/defaults.sh host-env + server-side accept path (A8+)"
+reason = "shutdown() tests require server-side accept path (post-T6; A8+)"
 
 [[rule]]
 matches_regex = ".*/reset/.*\\.pkt"
 verdict = "skipped-untranslatable"
-reason = "requires scripts/defaults.sh host-env + server-side accept path (A8+)"
+reason = "RST tests depend on server-side accept path or wire-option parity (post-T6; A8+)"
 
 # --- (5) MSS / TCP_MAXSEG socket-option + client-mode plumbing ---
 #
 # A8.5 Task 5 aligned TX TCP option emission to Linux canonical order.
-# Google's mss scripts still fail post-reorder because they all depend
-# on ../common/defaults.sh (init command exits 127). The /connect
-# scripts fail on fcntl(O_NONBLOCK) flag-shape drift. SKIPPED.md
-# carries the per-script breakdown.
+# A8.5 T6 removed the defaults.sh init blocker. Remaining failures
+# for /mss scripts are: SYN-ACK emits TS/SACKP unconditionally when
+# client didn't offer them, TCP_MAXSEG setsockopt not plumbed, and
+# client-mode connect() not driving SYN. /connect scripts fail on
+# fcntl(O_NONBLOCK) flag-shape drift. SKIPPED.md carries the
+# per-script breakdown.
 
 [[rule]]
 matches_regex = ".*/mss/.*\\.pkt"
 verdict = "skipped-untranslatable"
-reason = "../common/defaults.sh host-env dependency (post-reorder; see SKIPPED.md)"
+reason = "SYN-ACK TCP option mirroring + TCP_MAXSEG setsockopt gaps (post-T6; see SKIPPED.md)"
 
 [[rule]]
 matches_regex = ".*/connect/.*\\.pkt"
 verdict = "skipped-untranslatable"
-reason = "fcntl(O_NONBLOCK) flag-shape drift (post-reorder; see SKIPPED.md)"
+reason = "fcntl(O_NONBLOCK) flag-shape drift (post-T6; see SKIPPED.md)"
 
 # --- Default fall-through ---
 # Anything new gets skipped under "awaiting further triage" so the gate

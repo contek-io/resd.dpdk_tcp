@@ -32,12 +32,25 @@ pub const SHIVANSH_SKIP_OUT_OF_SCOPE: usize = 0;
 
 // --- Google upstream packetdrill tests (third_party/packetdrill/gtests/) ---
 //
-// A8 T16: 167 .pkt under gtests/. 163/167 source scripts/defaults.sh
-// + set_sysctls.py host-env helpers that do not resolve in our CI
-// environment (shell init returns 127, the shim surfaces this as
-// exit 1 before any TCP packet flows). The remaining 4 (packet-timeout
-// meta test + 2 socket_err shape tests + 1 fast_retransmit variant)
-// fail on engine gaps. 0 runnable is the pragmatic floor for A8.
+// A8 T16 (initial): 167 .pkt under gtests/. All 167 were blocked at
+// the shell-init step because 163/167 source `../common/defaults.sh`
+// / `set_sysctls.py`, and those upstream scripts call `sysctl -q` /
+// write to /proc/sys/net/... -- unavailable inside the shim.
+//
+// A8.5 T6: patch 0007 + A8.5 T6 invoker-cwd fix removed the shell-
+// init blocker. The invoker now chdirs into the script's directory
+// before spawning the shim so relative paths resolve, and stub
+// defaults.sh / set_sysctls.py in the submodule reduce the init
+// block to a no-op. Empirically, all 167 scripts now progress past
+// init; 0 still exit 0 end-to-end because every script hits a deeper
+// engine or shim gap (93 fail on the SYN-ACK TCP options shape, the
+// rest on fcntl(O_NONBLOCK) flag-shape drift, accept()/connect()
+// plumbing, sysctl-dependent behaviors, or unimplemented options).
+// The 4 packetdrill-meta scripts (fast_retransmit, socket_err, etc.)
+// still fail on the same gaps as before.
+//
+// GOOGLE_RUNNABLE_COUNT stays at 0 -- the engine gaps behind the 167
+// skips are out of T6 scope. See SKIPPED.md for per-script blockers.
 pub const GOOGLE_RUNNABLE_COUNT: usize = 0;
 pub const GOOGLE_SKIP_UNTRANSLATABLE: usize = 167;
 pub const GOOGLE_SKIP_OUT_OF_SCOPE: usize = 0;
