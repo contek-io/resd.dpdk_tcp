@@ -159,11 +159,13 @@ trap teardown_fleet EXIT
 
 DUT_SSH="$(jq -r .DutSshEndpoint <<<"$STACK_JSON")"
 PEER_SSH="$(jq -r .PeerSshEndpoint <<<"$STACK_JSON")"
+DUT_INSTANCE_ID="$(jq -r .DutInstanceId <<<"$STACK_JSON")"
+PEER_INSTANCE_ID="$(jq -r .PeerInstanceId <<<"$STACK_JSON")"
 DUT_IP="$(jq -r .DutDataEniIp <<<"$STACK_JSON")"
 PEER_IP="$(jq -r .PeerDataEniIp <<<"$STACK_JSON")"
 AMI_ID="$(jq -r .AmiId <<<"$STACK_JSON")"
 
-for var in DUT_SSH PEER_SSH DUT_IP PEER_IP AMI_ID; do
+for var in DUT_SSH PEER_SSH DUT_INSTANCE_ID PEER_INSTANCE_ID DUT_IP PEER_IP AMI_ID; do
   val="${!var}"
   if [ -z "$val" ] || [ "$val" = "null" ]; then
     log "resd-aws-infra setup bench-pair --json missing $var"
@@ -188,6 +190,39 @@ log "  nic-max-bps=$NIC_MAX_BPS"
 
 SSH_OPTS=(-o StrictHostKeyChecking=accept-new -o ServerAliveInterval=30)
 SCP_OPTS=(-o StrictHostKeyChecking=accept-new)
+
+# Operator's SSH pubkey — pushed to each target via EC2 Instance Connect
+# before the first SSH session to that host. The push grants a 60-second
+# authorisation window; we re-push at the head of each bench stage so
+# long-running SSH commands stay within the 60 s renewal horizon.
+OPERATOR_PUBKEY="${OPERATOR_PUBKEY:-$HOME/.ssh/id_ed25519.pub}"
+if [ ! -f "$OPERATOR_PUBKEY" ]; then
+  log "OPERATOR_PUBKEY=$OPERATOR_PUBKEY not found; generate with 'ssh-keygen -t ed25519 -f ~/.ssh/id_ed25519'"
+  exit 5
+fi
+
+# push_operator_pubkey <instance-id> — grant this session's pubkey a
+# 60-second authorization window on <instance-id> via EC2 Instance
+# Connect. Safe to call repeatedly; each push resets the 60 s timer.
+# Requires IAM: ec2-instance-connect:SendSSHPublicKey on the instance.
+push_operator_pubkey() {
+  local instance_id="$1"
+  aws ec2-instance-connect send-ssh-public-key \
+    --instance-id "$instance_id" \
+    --instance-os-user ubuntu \
+    --ssh-public-key "file://$OPERATOR_PUBKEY" \
+    --output text --query 'Success' >/dev/null
+}
+
+# Refresh both hosts' EC2 Instance Connect windows. Call at the head of
+# each bench stage so every SSH/SCP has a fresh 60-second grant.
+refresh_ec2_ic_grants() {
+  push_operator_pubkey "$DUT_INSTANCE_ID"
+  push_operator_pubkey "$PEER_INSTANCE_ID"
+}
+
+log "  pushing operator pubkey via EC2 Instance Connect (60 s grant)"
+refresh_ec2_ic_grants
 
 # EAL args — ENA hot-path flags per spec §11 (large_llq_hdr=1,
 # miss_txc_to=3) on PCI slot 0000:00:06.0 (c6in.metal default). The
@@ -222,11 +257,13 @@ for bin in "${DUT_BINS[@]}" "${PEER_BINS[@]}" "${SHARED_SCRIPTS[@]}"; do
   fi
 done
 
+refresh_ec2_ic_grants
 log "  -> DUT ($DUT_SSH)"
 scp "${SCP_OPTS[@]}" \
     "${DUT_BINS[@]}" "${SHARED_SCRIPTS[@]}" \
     "ubuntu@${DUT_SSH}:/tmp/"
 
+refresh_ec2_ic_grants
 log "  -> peer ($PEER_SSH)"
 scp "${SCP_OPTS[@]}" \
     "${PEER_BINS[@]}" "${SHARED_SCRIPTS[@]}" \
@@ -243,6 +280,7 @@ scp "${SCP_OPTS[@]}" \
 log "[6/12] starting peer services on $PEER_SSH"
 ssh "${SSH_OPTS[@]}" "ubuntu@$PEER_SSH" \
     "nohup /tmp/echo-server 10001 >/tmp/echo-server.log 2>&1 </dev/null &"
+refresh_ec2_ic_grants
 ssh "${SSH_OPTS[@]}" "ubuntu@$PEER_SSH" \
     "nohup /tmp/linux-tcp-sink 10002 >/tmp/linux-tcp-sink.log 2>&1 </dev/null &"
 
@@ -267,8 +305,14 @@ run_dut_bench() {
   done
   cmd+=" --output-csv /tmp/${csv_name}.csv"
 
+  # Refresh the EC2 Instance Connect grant (60 s auth window) before the
+  # ssh invocation. Once ssh authenticates the session persists for the
+  # full bench duration — we only need a fresh grant at connect time.
+  refresh_ec2_ic_grants
+
   log "  DUT> $bench"
   ssh "${SSH_OPTS[@]}" "ubuntu@$DUT_SSH" "$cmd"
+  refresh_ec2_ic_grants
   scp "${SCP_OPTS[@]}" "ubuntu@$DUT_SSH:/tmp/${csv_name}.csv" "$OUT_DIR/"
 }
 
@@ -435,6 +479,7 @@ fi
 # Markdown report; we pull both into $OUT_DIR.
 # ---------------------------------------------------------------------------
 log "[10/12] bench-offload-ab"
+refresh_ec2_ic_grants
 ssh "${SSH_OPTS[@]}" "ubuntu@$DUT_SSH" \
     "sudo /tmp/bench-offload-ab \
         --peer-ip $PEER_IP \
@@ -448,10 +493,12 @@ ssh "${SSH_OPTS[@]}" "ubuntu@$DUT_SSH" \
         --report-path /tmp/bench-offload-ab/offload-ab.md \
         --runner-bin /tmp/bench-ab-runner \
         --skip-rebuild"
+refresh_ec2_ic_grants
 scp -r "${SCP_OPTS[@]}" \
     "ubuntu@$DUT_SSH:/tmp/bench-offload-ab" "$OUT_DIR/"
 
 log "[10b/12] bench-obs-overhead"
+refresh_ec2_ic_grants
 ssh "${SSH_OPTS[@]}" "ubuntu@$DUT_SSH" \
     "sudo /tmp/bench-obs-overhead \
         --peer-ip $PEER_IP \
@@ -465,6 +512,7 @@ ssh "${SSH_OPTS[@]}" "ubuntu@$DUT_SSH" \
         --report-path /tmp/bench-obs-overhead/obs-overhead.md \
         --runner-bin /tmp/bench-ab-runner \
         --skip-rebuild"
+refresh_ec2_ic_grants
 scp -r "${SCP_OPTS[@]}" \
     "ubuntu@$DUT_SSH:/tmp/bench-obs-overhead" "$OUT_DIR/"
 
