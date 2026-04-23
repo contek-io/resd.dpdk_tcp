@@ -38,6 +38,7 @@ pub fn run_all_probes() -> Vec<ProbeResult> {
         probes::mss::late_option(),
         probes::reserved::reserved_rx(),
         probes::urgent::urgent_dropped(),
+        probes::checksum::zero_checksum(), // A8.5 T1
     ]
 }
 

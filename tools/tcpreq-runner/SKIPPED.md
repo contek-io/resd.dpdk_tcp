@@ -13,10 +13,10 @@ Format: `<tcpreq module> — <reason> — <covering-test citation>`
   - tcpreq/tests/mss.py:LateOptionTest → probes::mss::late_option (MUST-5)
   - tcpreq/tests/reserved.py:ReservedBitsTest → probes::reserved::reserved_rx (Reserved-RX)
   - tcpreq/tests/urgent.py:UrgentTest → probes::urgent::urgent_dropped (MUST-30/31 documented deviation AD-A8-urg-dropped)
+  - tcpreq/tests/checksum.py:ZeroChecksumTest → probes::checksum::zero_checksum (MUST-2/3)
 
 ## Skipped — duplicate Layer A/B coverage
 
-  - tcpreq/tests/checksum.py:ZeroChecksumTest — covered by eth/ip/tcp checksum decode in crates/dpdk-net-core/src/l3_ip.rs + tests/checksum_streaming_equiv.rs + `rx_bad_csum` counter-coverage scenario. (MUST-2/3)
   - tcpreq/tests/mss.py:MSSSupportTest — covered by active-open SYN emission in tcp_output + MSS encode/decode in tcp_options.rs + proptest_tcp_options.rs (MUST-14)
   - tcpreq/tests/options.py:OptionSupportTest — covered by tests/proptest_tcp_options.rs (EOL/NOP/MSS/WS/TS/SACK roundtrip) (MUST-4)
   - tcpreq/tests/options.py:UnknownOptionTest — covered by tests/proptest_tcp_options.rs (unknown-kind kept-then-dropped) (MUST-6)
