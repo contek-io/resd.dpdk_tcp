@@ -243,6 +243,19 @@ pub struct dpdk_net_event_t {
 /// Close flags — bitmask for dpdk_net_close.
 pub const DPDK_NET_CLOSE_FORCE_TW_SKIP: u32 = 1 << 0;
 
+/// POSIX `shutdown(2)` `how` constants. Values match `<sys/socket.h>`
+/// exactly so a C caller can pass `SHUT_RD` / `SHUT_WR` / `SHUT_RDWR`
+/// from the system header without remapping. Only `DPDK_NET_SHUT_RDWR`
+/// is functionally supported — half-close returns `-EOPNOTSUPP`. See
+/// spec §4 + §6.4 row `AD-A8.5-shutdown-no-half-close` for the
+/// rationale (Stage 1 byte-stream API has no half-close consumer; the
+/// untested RX-drop-after-SHUT_RD / TX-retransmit-after-SHUT_WR edge
+/// cases are net regression risk without a scenario that exercises
+/// them).
+pub const DPDK_NET_SHUT_RD: i32 = 0;
+pub const DPDK_NET_SHUT_WR: i32 = 1;
+pub const DPDK_NET_SHUT_RDWR: i32 = 2;
+
 /// A5.5 per-connection observable state snapshot (spec §5.3, §7.2.3–7.2.6).
 /// Slow-path projection mirroring `dpdk_net_core::tcp_conn::ConnStats`; all
 /// values are in application-useful units — bytes for the send-buffer

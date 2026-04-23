@@ -1,0 +1,66 @@
+From b46a98e7b0a424062e39de1c36f5bcaa47d84924 Mon Sep 17 00:00:00 2001
+From: dpdk-net shim <shim@dpdk-net.local>
+Date: Thu, 23 Apr 2026 17:41:26 +0000
+Subject: [PATCH] shim: route shutdown(fd, how) to dpdk_net_test_shutdown
+
+A8.5 T8: packetdrill scripts that invoke shutdown(fd, SHUT_RDWR)
+now drive the A8.5 T7 dpdk_net_shutdown path (full close + pump)
+instead of collapsing to shim_close and ignoring `how`. SHUT_RD /
+SHUT_WR surface as EOPNOTSUPP per AD-A8.5-shutdown-no-half-close.
+
+Pre-connect sockets and listener fds now correctly return ENOTCONN
+from shutdown() -- the engine has no conn_handle to act on there.
+---
+ gtests/net/packetdrill/dpdk_net_shim.c | 36 ++++++++++++++++++++++++--
+ 1 file changed, 34 insertions(+), 2 deletions(-)
+
+diff --git a/gtests/net/packetdrill/dpdk_net_shim.c b/gtests/net/packetdrill/dpdk_net_shim.c
+index d77c4ab..69dabf3 100644
+--- a/gtests/net/packetdrill/dpdk_net_shim.c
++++ b/gtests/net/packetdrill/dpdk_net_shim.c
+@@ -415,8 +415,40 @@ static int shim_close(void *ud, int fd) {
+ }
+ 
+ static int shim_shutdown(void *ud, int fd, int how) {
+-    (void)how;
+-    return shim_close(ud, fd);
++    (void)ud;
++    /* A8.5 T8: route through dpdk_net_test_shutdown (pumped wrapper
++     * around dpdk_net_shutdown, public API added in T7) rather than
++     * collapsing to close(). Preserves the packetdrill script's
++     * half-close expectation -- SHUT_RD/SHUT_WR surface as EOPNOTSUPP
++     * per AD-A8.5-shutdown-no-half-close in spec §6.4, and SHUT_RDWR
++     * dispatches to dpdk_net_close(engine, conn, 0) with a pump so the
++     * FIN lands in the TX intercept ring before the next expectation
++     * is matched.
++     *
++     * Mirrors shim_close's fd-slot lookup + negative-errno -> errno/-1
++     * convention so scripts can compare against the POSIX rc shape
++     * (rc = 0 on success, rc = -1 + errno on failure). */
++    struct shim_fd *s = fd_slot(fd);
++    if (!s || s->kind == SHIM_FD_FREE) { errno = EBADF; return -1; }
++    if (s->kind != SHIM_FD_CONN) {
++        /* Pre-connect sockets and listener fds aren't legal shutdown
++         * targets -- the engine has no conn_handle to act on. POSIX
++         * returns ENOTCONN here. */
++        errno = ENOTCONN;
++        return -1;
++    }
++    int32_t rc = dpdk_net_test_shutdown(g_engine, s->conn_handle, how);
++    if (rc < 0) { errno = -rc; return -1; }
++    /* For SHUT_RDWR dpdk_net_shutdown invokes the full close path
++     * on the engine side (FIN emit, conn handle is invalidated). Mark
++     * the slot FREE so subsequent shim_read / shim_write / shim_close
++     * return EBADF instead of trying to poll the invalidated handle.
++     * Scripts that probe post-shutdown read=0/write=EPIPE are half-
++     * close tests (AD-A8.5-shutdown-no-half-close) and remain skipped;
++     * the FD_FREE transition here prevents them from segfaulting via a
++     * stale-handle poll path. */
++    s->kind = SHIM_FD_FREE;
++    return 0;
+ }
+ 
+ static int shim_getsockopt(void *ud, int fd, int level, int optname,
+-- 
+2.34.1
+

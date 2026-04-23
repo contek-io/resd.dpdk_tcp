@@ -25,7 +25,10 @@ git submodule update --init --recursive \
 
 # 2. Apply the patch stack idempotently. We probe for a patch-applied
 #    file that only exists after 0001 lands (dpdk_net_shim.c), so the
-#    marker survives `git submodule update` wiping the worktree.
+#    marker survives `git submodule update` wiping the worktree. The
+#    glob loop picks up all patches/*.patch in order, including 0007
+#    (A8.5 T6 env-stubs); the submodule pin in the outer repo already
+#    has them baked in as commits, so normal rebuilds skip this block.
 cd third_party/packetdrill
 if ! [ -f gtests/net/packetdrill/dpdk_net_shim.c ]; then
   shopt -s nullglob

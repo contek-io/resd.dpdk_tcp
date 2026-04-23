@@ -22,7 +22,8 @@
 #
 # A8+ work will move scripts out of skip buckets as the underlying gap
 # closes (same gaps as ligurio: shutdown wiring, scripts/defaults.sh
-# host-env needs, option-order drift, engine CC/recovery plumbing).
+# host-env needs, client-mode connect plumbing, TCP_MAXSEG setsockopt
+# plumbing, engine CC/recovery plumbing).
 # ------------------------------------------------------------------
 
 # --- (1) Runnable allow-list — empirically verified on A8 T15 S2 shim.
@@ -77,12 +78,12 @@ reason = "close() tests all require server-side accept path (A8+)"
 [[rule]]
 matches_regex = "socket-api/shutdown/.*\\.pkt"
 verdict = "skipped-untranslatable"
-reason = "shutdown() tests all require server-side accept path (A8+)"
+reason = "half-close semantics not implemented; spec §6.4 AD-A8.5-shutdown-no-half-close (SHUT_RD/SHUT_WR return EOPNOTSUPP; SHUT_RDWR probes post-shutdown read=0/write=EPIPE which is half-close behavior)"
 
 [[rule]]
 matches_regex = "socket-api/connect/.*\\.pkt"
 verdict = "skipped-untranslatable"
-reason = "fcntl(O_NONBLOCK) flag-shape drift; also option-order drift"
+reason = "fcntl(O_NONBLOCK) flag-shape drift (post-reorder; see SKIPPED.md)"
 
 [[rule]]
 matches_regex = "socket-api/init_rto/.*\\.pkt"
@@ -94,12 +95,19 @@ matches_regex = "tcp-fsm/reset/.*\\.pkt"
 verdict = "skipped-untranslatable"
 reason = "RST tests depend on server-side accept path or wire-option parity"
 
-# --- (3) MSS / option-order drift (client-side) ---
+# --- (3) MSS / TCP_MAXSEG socket-option + client-mode plumbing ---
+#
+# A8.5 Task 5 aligned TX TCP option emission to Linux canonical order.
+# Post-reorder, shivansh mss scripts still fail because of deeper
+# blockers (client-mode `connect()` not driven, SYN-ACK emits TS/SACKP
+# unconditionally, engine WScale not mirrored from peer, TCP_MAXSEG
+# setsockopt not plumbed, TS ecr clock sync gap). SKIPPED.md carries
+# the per-script breakdown.
 
 [[rule]]
 matches_regex = "tcp-fsm/mss/.*\\.pkt"
 verdict = "skipped-untranslatable"
-reason = "SYN option-order drift vs script expectation; engine/shim fix is A8+"
+reason = "MSS/TCP_MAXSEG + client-mode plumbing gap (post-reorder; see SKIPPED.md)"
 
 # --- (4) Unimplemented engine behavior ---
 

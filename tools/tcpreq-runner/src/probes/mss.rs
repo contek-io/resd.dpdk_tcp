@@ -7,7 +7,7 @@
 //! and inspect internal state (`peer_mss`, counters, TX shape) to
 //! validate the MUST-clause.
 
-use crate::{ProbeResult, ProbeStatus, TcpreqHarness, OUR_IP, PEER_IP};
+use crate::{ProbeResult, ProbeStatus, TcpreqHarness, OUR_IP, PEER_IP, TCP_HDR_OFFSET};
 
 use dpdk_net_core::clock::set_virt_ns;
 use dpdk_net_core::tcp_options::TcpOpts;
@@ -274,6 +274,207 @@ pub fn late_option() -> ProbeResult {
         probe_name: "LateOption",
         status: ProbeStatus::Pass,
         message: "late-option TS accepted on ESTABLISHED conn; no rx_bad_option bump; no RST emitted".into(),
+    }
+}
+
+// ----------------------------- MUST-14 -----------------------------------
+
+/// MSSSupport (RFC 9293 §3.7.1, MUST-14).
+///
+/// TCP endpoints MUST implement both sending and receiving the MSS option.
+/// The parser side (peer→us) is already covered by `missing_mss`; this
+/// probe validates the emission side (us→peer): when the peer's SYN
+/// carries a valid MSS option, our SYN-ACK response MUST also carry an
+/// MSS option.
+///
+/// Steps:
+///   1. LISTEN on `(OUR_IP, LOCAL_PORT)`.
+///   2. Inject a SYN with MSS=1460 (standard case).
+///   3. Drain the SYN-ACK.
+///   4. Walk the TCP option region TLVs from `TCP + 20` to
+///      `TCP + 4 * DataOffset`:
+///        - kind 0 (EOL) → stop.
+///        - kind 1 (NOP) → skip 1 byte.
+///        - kind 2 (MSS) → verify `len == 4`; record as found.
+///        - other → read length byte, skip `len` bytes.
+///
+///      Truncated options are detected and reported as failures rather
+///      than silently ignored.
+///   5. PASS iff an MSS option (kind=2, len=4) was found.
+pub fn mss_support() -> ProbeResult {
+    let h = TcpreqHarness::new();
+
+    if let Err(e) = h.eng.listen(OUR_IP, LOCAL_PORT) {
+        return fail("MUST-14", "MSSSupport", format!("listen: {e:?}"));
+    }
+
+    // Inject a well-formed SYN with MSS=1460 (the universal default).
+    set_virt_ns(1_000_000);
+    let syn = build_tcp_syn(PEER_IP, PEER_PORT, OUR_IP, LOCAL_PORT, PEER_ISS, 1460);
+    if let Err(e) = h.eng.inject_rx_frame(&syn) {
+        return fail("MUST-14", "MSSSupport", format!("inject SYN: {e:?}"));
+    }
+
+    // Drain our SYN-ACK.
+    let frames = drain_tx_frames();
+    let synack = match frames.first() {
+        Some(f) => f,
+        None => {
+            return fail(
+                "MUST-14",
+                "MSSSupport",
+                "no SYN-ACK emitted after MSS-bearing SYN".into(),
+            );
+        }
+    };
+    // parse_syn_ack gates on SYN|ACK bits, so a Some here doubles as a
+    // predicate that the drained TX frame is indeed a SYN-ACK.
+    if parse_syn_ack(synack).is_none() {
+        return fail(
+            "MUST-14",
+            "MSSSupport",
+            "first TX frame post-SYN is not a SYN-ACK".into(),
+        );
+    }
+
+    // Locate the TCP header and its option region. SYN-ACKs from the
+    // test-server always use the 14+20 fixed L2+IP layout (no IP options).
+    if synack.len() < TCP_HDR_OFFSET + 20 {
+        return fail(
+            "MUST-14",
+            "MSSSupport",
+            format!("SYN-ACK too short for TCP header: {} bytes", synack.len()),
+        );
+    }
+    // DataOffset nibble lives in the high 4 bits of TCP byte 12.
+    let data_offset_words = (synack[TCP_HDR_OFFSET + 12] >> 4) as usize;
+    let tcp_hdr_len = data_offset_words * 4;
+    if tcp_hdr_len < 20 {
+        return fail(
+            "MUST-14",
+            "MSSSupport",
+            format!("SYN-ACK TCP DataOffset < 5 words ({data_offset_words})"),
+        );
+    }
+    if synack.len() < TCP_HDR_OFFSET + tcp_hdr_len {
+        return fail(
+            "MUST-14",
+            "MSSSupport",
+            format!(
+                "SYN-ACK truncated: DataOffset claims {tcp_hdr_len} TCP bytes but frame has {}",
+                synack.len() - TCP_HDR_OFFSET
+            ),
+        );
+    }
+    // Options region: bytes [TCP_HDR_OFFSET + 20 .. TCP_HDR_OFFSET + tcp_hdr_len).
+    let opts_start = TCP_HDR_OFFSET + 20;
+    let opts_end = TCP_HDR_OFFSET + tcp_hdr_len;
+    let opts = &synack[opts_start..opts_end];
+
+    // TLV walk. 0=EOL (stop), 1=NOP (1-byte), 2=MSS (len=4, mark found),
+    // other=read length byte & skip `len` bytes (defends against
+    // truncation by checking cursor+len <= opts.len() on every iteration).
+    let mut i = 0usize;
+    let mut found_mss = false;
+    while i < opts.len() {
+        let kind = opts[i];
+        match kind {
+            0 => break, // EOL
+            1 => {
+                i += 1;
+            }
+            2 => {
+                // MSS: TLV kind=2, len=4, 2-byte value. Bounds check the
+                // length byte AND the declared length fits in the region.
+                if i + 1 >= opts.len() {
+                    return fail(
+                        "MUST-14",
+                        "MSSSupport",
+                        format!(
+                            "truncated MSS option: no length byte at offset {i}; opts={opts:?}"
+                        ),
+                    );
+                }
+                let len = opts[i + 1] as usize;
+                if len != 4 {
+                    return fail(
+                        "MUST-14",
+                        "MSSSupport",
+                        format!(
+                            "MSS option has illegal length: expected 4, got {len}; opts={opts:?}"
+                        ),
+                    );
+                }
+                if i + len > opts.len() {
+                    return fail(
+                        "MUST-14",
+                        "MSSSupport",
+                        format!(
+                            "MSS option truncated: declares {len} bytes at offset {i} \
+                             but only {} bytes remain; opts={opts:?}",
+                            opts.len() - i
+                        ),
+                    );
+                }
+                found_mss = true;
+                i += len;
+            }
+            _ => {
+                // Unknown multi-byte option: read length byte and skip.
+                if i + 1 >= opts.len() {
+                    return fail(
+                        "MUST-14",
+                        "MSSSupport",
+                        format!(
+                            "truncated option kind={kind}: no length byte at offset {i}; \
+                             opts={opts:?}"
+                        ),
+                    );
+                }
+                let len = opts[i + 1] as usize;
+                // RFC 9293 §3.1: every non-NOP/EOL option has len>=2 (kind byte + len byte).
+                if len < 2 {
+                    return fail(
+                        "MUST-14",
+                        "MSSSupport",
+                        format!(
+                            "option kind={kind} declares illegal length {len}<2 at offset {i}; \
+                             opts={opts:?}"
+                        ),
+                    );
+                }
+                if i + len > opts.len() {
+                    return fail(
+                        "MUST-14",
+                        "MSSSupport",
+                        format!(
+                            "option kind={kind} truncated: declares {len} bytes at offset {i} \
+                             but only {} bytes remain; opts={opts:?}",
+                            opts.len() - i
+                        ),
+                    );
+                }
+                i += len;
+            }
+        }
+    }
+
+    if !found_mss {
+        return fail(
+            "MUST-14",
+            "MSSSupport",
+            format!(
+                "our SYN-ACK carries NO MSS option — MUST-14 violation (emission side). \
+                 Options region bytes: {opts:?}"
+            ),
+        );
+    }
+
+    ProbeResult {
+        clause_id: "MUST-14",
+        probe_name: "MSSSupport",
+        status: ProbeStatus::Pass,
+        message: "peer SYN MSS accepted; our SYN-ACK carries MSS option".into(),
     }
 }
 

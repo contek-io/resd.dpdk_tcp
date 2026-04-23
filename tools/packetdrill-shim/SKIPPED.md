@@ -8,6 +8,25 @@ Format: `<path relative to third_party/packetdrill-testcases> — <reason>`
 
 ## ligurio corpus
 
+### Runnable-no-crash (A8.5 T9 — spec §1.1 G crash-safety corpus)
+
+The "runnable-no-crash" verdict pins scripts whose pass criterion is
+*engine-crash-safety* under unexpected peer behavior (bad ICMP,
+malformed syscall arguments, PMTU events). Each script has been
+soak-tested 100× on the T9 shim without triggering any SIGSEGV /
+SIGABRT / signal kill. Exit code 1 is acceptable because the engine
+does not model the behaviors under test (ICMP ingress / PMTU state /
+EFAULT for NULL buffers) and therefore reliably assertion-fails on
+wire-shape or syscall-return mismatch; the gate catches only signal
+kills (exit > 128), which are the true crash-safety regressions.
+
+  - testcases/tcp/ICMP/icmp-all-types.pkt — A8.5 T9: ICMP ingress not modeled (exit 1 on wire-shape mismatch), soak-tested 100x with 0 crashes
+  - testcases/tcp/mtu_probe/basic-v4.pkt — A8.5 T9: PMTU probe machinery not modeled (exit 1 on init/wire-shape), soak-tested 100x with 0 crashes
+  - testcases/tcp/pmtu_discovery/pmtu-10pkt.pkt — A8.5 T9: PMTU discovery semantics not modeled (exit 1 on wire-shape mismatch), soak-tested 100x with 0 crashes
+  - testcases/tcp/syscall_bad_arg/fastopen-invalid-buf-ptr.pkt — A8.5 T9: negative-syscall-argument error shapes not modeled (exit 1 on init/syscall-return mismatch), soak-tested 100x with 0 crashes
+  - testcases/tcp/syscall_bad_arg/sendmsg-empty-iov.pkt — A8.5 T9: negative-syscall-argument error shapes not modeled (exit 1 on init/syscall-return mismatch), soak-tested 100x with 0 crashes
+  - testcases/tcp/syscall_bad_arg/syscall-invalid-buf-ptr.pkt — A8.5 T9: negative-syscall-argument error shapes not modeled (exit 1 on init/syscall-return mismatch), soak-tested 100x with 0 crashes
+
 ### Runnable-but-broken (T15 pragmatic floor; revisit in A8+)
 
 Per T15 reality-check: the A7 shim binary cannot currently pass any of
@@ -61,17 +80,17 @@ Dry-run evidence that drove this floor:
   - testcases/tcp/reset/rst-sync-est-time-wait.pkt — RST tests depend on server-side accept path or wire-option parity
   - testcases/tcp/reset/rst-synchronized-established.pkt — RST tests depend on server-side accept path or wire-option parity
   - testcases/tcp/reset/rst_sync_close_wait.pkt — RST tests depend on server-side accept path or wire-option parity
-  - testcases/tcp/shutdown/shutdown-double-shut-wr.pkt — shutdown() tests all require server-side accept path (A8+)
-  - testcases/tcp/shutdown/shutdown-rd-close.pkt — shutdown() tests all require server-side accept path (A8+)
-  - testcases/tcp/shutdown/shutdown-rd-wr-close.pkt — shutdown() tests all require server-side accept path (A8+)
-  - testcases/tcp/shutdown/shutdown-rd.pkt — shutdown() tests all require server-side accept path (A8+)
-  - testcases/tcp/shutdown/shutdown-rdwr-close.pkt — shutdown() tests all require server-side accept path (A8+)
-  - testcases/tcp/shutdown/shutdown-rdwr-send-queue-ack-close.pkt — shutdown() tests all require server-side accept path (A8+)
-  - testcases/tcp/shutdown/shutdown-rdwr-write-queue-close.pkt — shutdown() tests all require server-side accept path (A8+)
-  - testcases/tcp/shutdown/shutdown-rdwr.pkt — shutdown() tests all require server-side accept path (A8+)
-  - testcases/tcp/shutdown/shutdown-recv-after-shut-rd.pkt — shutdown() tests all require server-side accept path (A8+)
-  - testcases/tcp/shutdown/shutdown-wr-close.pkt — shutdown() tests all require server-side accept path (A8+)
-  - testcases/tcp/shutdown/shutdown-wr.pkt — shutdown() tests all require server-side accept path (A8+)
+  - testcases/tcp/shutdown/shutdown-double-shut-wr.pkt — half-close semantics (SHUT_WR) not implemented; spec §6.4 AD-A8.5-shutdown-no-half-close
+  - testcases/tcp/shutdown/shutdown-rd-close.pkt — half-close semantics (SHUT_RD) not implemented; spec §6.4 AD-A8.5-shutdown-no-half-close
+  - testcases/tcp/shutdown/shutdown-rd-wr-close.pkt — half-close semantics (SHUT_RD/SHUT_WR) not implemented; spec §6.4 AD-A8.5-shutdown-no-half-close
+  - testcases/tcp/shutdown/shutdown-rd.pkt — half-close semantics (SHUT_RD) not implemented; spec §6.4 AD-A8.5-shutdown-no-half-close
+  - testcases/tcp/shutdown/shutdown-rdwr-close.pkt — SHUT_RDWR probes post-shutdown read=0/write=EPIPE (half-close); spec §6.4 AD-A8.5-shutdown-no-half-close
+  - testcases/tcp/shutdown/shutdown-rdwr-send-queue-ack-close.pkt — SHUT_RDWR probes post-shutdown read=0/write=EPIPE (half-close); spec §6.4 AD-A8.5-shutdown-no-half-close
+  - testcases/tcp/shutdown/shutdown-rdwr-write-queue-close.pkt — SHUT_RDWR probes post-shutdown read=0/write=EPIPE (half-close); spec §6.4 AD-A8.5-shutdown-no-half-close
+  - testcases/tcp/shutdown/shutdown-rdwr.pkt — SHUT_RDWR probes post-shutdown read=0/write=EPIPE (half-close); spec §6.4 AD-A8.5-shutdown-no-half-close
+  - testcases/tcp/shutdown/shutdown-recv-after-shut-rd.pkt — half-close semantics (SHUT_RD) not implemented; spec §6.4 AD-A8.5-shutdown-no-half-close
+  - testcases/tcp/shutdown/shutdown-wr-close.pkt — half-close semantics (SHUT_WR) not implemented; spec §6.4 AD-A8.5-shutdown-no-half-close
+  - testcases/tcp/shutdown/shutdown-wr.pkt — half-close semantics (SHUT_WR) not implemented; spec §6.4 AD-A8.5-shutdown-no-half-close
 
 #### Syscalls returning EOPNOTSUPP in the A7 shim
 
@@ -139,28 +158,37 @@ Dry-run evidence that drove this floor:
   - testcases/tcp/time_wait/time-wait.pkt — TIME_WAIT reuse / 2*MSL semantics not exercised via shim yet
   - testcases/tcp/ecn/ecn-uses-ect0.pkt — ECN (ECT/CE bits) behavior not modeled
 
-#### MSS / option-order drift (client-side)
+#### MSS / TCP_MAXSEG socket-option + client-mode plumbing
 
-  - testcases/tcp/connect/http-get-nonblocking-ts.pkt — fcntl(O_NONBLOCK) flag-shape drift; also option-order drift
-  - testcases/tcp/mss/mss-getsockopt-tcp_maxseg-client-ts.pkt — SYN option-order drift vs script expectation; engine/shim fix is A8+
-  - testcases/tcp/mss/mss-getsockopt-tcp_maxseg-client.pkt — SYN option-order drift vs script expectation; engine/shim fix is A8+
-  - testcases/tcp/mss/mss-getsockopt-tcp_maxseg-server-advmss-ipv4.pkt — SYN option-order drift vs script expectation; engine/shim fix is A8+
-  - testcases/tcp/mss/mss-getsockopt-tcp_maxseg-server-advmss-ts-ipv4.pkt — SYN option-order drift vs script expectation; engine/shim fix is A8+
-  - testcases/tcp/mss/mss-getsockopt-tcp_maxseg-server-ts.pkt — SYN option-order drift vs script expectation; engine/shim fix is A8+
-  - testcases/tcp/mss/mss-getsockopt-tcp_maxseg-server.pkt — SYN option-order drift vs script expectation; engine/shim fix is A8+
-  - testcases/tcp/mss/mss-getsockopt-tcp_maxseg-server_freebsd.pkt — SYN option-order drift vs script expectation; engine/shim fix is A8+
-  - testcases/tcp/mss/mss-setsockopt-tcp_maxseg-client.pkt — SYN option-order drift vs script expectation; engine/shim fix is A8+
-  - testcases/tcp/mss/mss-setsockopt-tcp_maxseg-client_freebsd.pkt — SYN option-order drift vs script expectation; engine/shim fix is A8+
-  - testcases/tcp/mss/mss-setsockopt-tcp_maxseg-server.pkt — SYN option-order drift vs script expectation; engine/shim fix is A8+
-  - testcases/tcp/mss/mss-setsockopt-tcp_maxseg-server_freebsd.pkt — SYN option-order drift vs script expectation; engine/shim fix is A8+
+Note: A8.5 Task 5 aligned TX TCP option emission to Linux canonical order
+(`<MSS, NOP+WScale, SACKP, TS>`). Post-reorder, each of these scripts still
+fails for a *different*, deeper reason than option-order drift; reasons below
+reflect the real blocker observed after the reorder.
+
+  - testcases/tcp/connect/http-get-nonblocking-ts.pkt — fcntl(O_NONBLOCK) flag-shape drift (expected 2 vs actual 2050); pre-connect fcntl plumbing
+  - testcases/tcp/mss/mss-getsockopt-tcp_maxseg-client-ts.pkt — client-mode `connect()` not driven by shim: SYN never emitted, scripted packet times out
+  - testcases/tcp/mss/mss-getsockopt-tcp_maxseg-client.pkt — client-mode `connect()` not driven by shim: SYN never emitted, scripted packet times out
+  - testcases/tcp/mss/mss-getsockopt-tcp_maxseg-server-advmss-ipv4.pkt — SYN-ACK emits TS unconditionally (script expects no TS when client did not offer it); needs negotiation mirroring
+  - testcases/tcp/mss/mss-getsockopt-tcp_maxseg-server-advmss-ts-ipv4.pkt — engine-side WScale mirrors buffer-derived shift, not peer-offered shift (script expects ws=6 to mirror peer, engine emits ws=3)
+  - testcases/tcp/mss/mss-getsockopt-tcp_maxseg-server-ts.pkt — TS-clock sync gap: live outbound TS val never aligns with scripted ecr, so RX matcher can't infer echo
+  - testcases/tcp/mss/mss-getsockopt-tcp_maxseg-server.pkt — requires scripts/defaults.sh host-env (init command exits 127)
+  - testcases/tcp/mss/mss-getsockopt-tcp_maxseg-server_freebsd.pkt — SYN-ACK emits TS/SACKP unconditionally (script expects neither when client did not offer); needs negotiation mirroring
+  - testcases/tcp/mss/mss-setsockopt-tcp_maxseg-client.pkt — requires scripts/defaults.sh host-env (init command exits 127)
+  - testcases/tcp/mss/mss-setsockopt-tcp_maxseg-client_freebsd.pkt — TCP_MAXSEG setsockopt not plumbed: getsockopt returns 0 instead of user-configured value
+  - testcases/tcp/mss/mss-setsockopt-tcp_maxseg-server.pkt — requires scripts/defaults.sh host-env (init command exits 127)
+  - testcases/tcp/mss/mss-setsockopt-tcp_maxseg-server_freebsd.pkt — TCP_MAXSEG setsockopt not plumbed: getsockopt returns 0 instead of user-configured value
 
 #### Other (wire shape / middleware-layer behavior)
 
-  - testcases/tcp/ICMP/icmp-all-types.pkt — ICMP ingress/error delivery not modeled
+Note: the ligurio scripts under `ICMP/`, `mtu_probe/basic-v4.pkt`,
+`pmtu_discovery/`, and `syscall_bad_arg/` were migrated to the
+"runnable-no-crash" verdict in A8.5 T9 (G crash-safety corpus). They
+no longer appear here — the pass criterion is "no SIGSEGV / SIGABRT /
+signal kill", not exit-0 end-to-end. See the "## Runnable-no-crash"
+section below for details.
+
   - testcases/tcp/gro/gro-mss-option.pkt — GRO-specific wire-shape expectations not modeled
-  - testcases/tcp/mtu_probe/basic-v4.pkt — PMTU probe machinery not modeled (also needs raw-socket/route hooks)
   - testcases/tcp/mtu_probe/basic-v6.pkt — PMTU probe machinery not modeled (also needs raw-socket/route hooks)
-  - testcases/tcp/pmtu_discovery/pmtu-10pkt.pkt — PMTU discovery semantics not modeled
   - testcases/tcp/nagle/https_client.pkt — Nagle/TCP_NODELAY fine-grained segmentation not modeled
   - testcases/tcp/nagle/sendmsg_msg_more.pkt — Nagle/TCP_NODELAY fine-grained segmentation not modeled
   - testcases/tcp/nagle/sockopt_cork_nodelay.pkt — Nagle/TCP_NODELAY fine-grained segmentation not modeled
@@ -168,9 +196,6 @@ Dry-run evidence that drove this floor:
   - testcases/tcp/eor/no-coalesce-retrans.pkt — MSG_EOR / no-coalesce boundary semantics not modeled
   - testcases/tcp/eor/no-coalesce-small.pkt — MSG_EOR / no-coalesce boundary semantics not modeled
   - testcases/tcp/eor/no-coalesce-subsequent.pkt — MSG_EOR / no-coalesce boundary semantics not modeled
-  - testcases/tcp/syscall_bad_arg/fastopen-invalid-buf-ptr.pkt — Negative-syscall-argument error shapes not modeled in test-FFI
-  - testcases/tcp/syscall_bad_arg/sendmsg-empty-iov.pkt — Negative-syscall-argument error shapes not modeled in test-FFI
-  - testcases/tcp/syscall_bad_arg/syscall-invalid-buf-ptr.pkt — Negative-syscall-argument error shapes not modeled in test-FFI
 
 ## shivansh corpus
 
@@ -197,9 +222,9 @@ runnable set). Pinned at `SHIVANSH_RUNNABLE_COUNT = 5`.
   - socket-api/close/close-unread-data-rst.pkt — close() tests all require server-side accept path (A8+)
   - socket-api/close/close-write-data-rst.pkt — close() tests all require server-side accept path (A8+)
   - socket-api/listen/listen-incoming-no-tcp-flags.pkt — server-side edge behavior (FreeBSD silent-drop on no-flags) needs engine parity (A8+)
-  - socket-api/shutdown/shutdown-rd.pkt — shutdown() tests all require server-side accept path (A8+)
-  - socket-api/shutdown/shutdown-rdwr.pkt — shutdown() tests all require server-side accept path (A8+)
-  - socket-api/shutdown/shutdown-wr.pkt — shutdown() tests all require server-side accept path (A8+)
+  - socket-api/shutdown/shutdown-rd.pkt — half-close semantics (SHUT_RD) not implemented; spec §6.4 AD-A8.5-shutdown-no-half-close
+  - socket-api/shutdown/shutdown-rdwr.pkt — SHUT_RDWR probes post-shutdown read=0/write=EPIPE (half-close); spec §6.4 AD-A8.5-shutdown-no-half-close
+  - socket-api/shutdown/shutdown-wr.pkt — half-close semantics (SHUT_WR) not implemented; spec §6.4 AD-A8.5-shutdown-no-half-close
   - tcp-fsm/reset/rst-non-synchronized.pkt — RST tests depend on server-side accept path or wire-option parity
   - tcp-fsm/reset/rst-syn-sent.pkt — RST tests depend on server-side accept path or wire-option parity
   - tcp-fsm/reset/rst-sync-est-fin-wait-1.pkt — RST tests depend on server-side accept path or wire-option parity
@@ -226,17 +251,22 @@ runnable set). Pinned at `SHIVANSH_RUNNABLE_COUNT = 5`.
   - tcp-mechanisms/slow_read_attack/slow-read.pkt — Slow-read-attack scenario needs receive-window-squeeze engine plumbing (A8+)
   - tcp-mechanisms/slow_start/slow-start.pkt — Slow-start exponential growth observability not modeled
 
-### MSS / option-order drift (client-side)
+### MSS / TCP_MAXSEG socket-option + client-mode plumbing
 
-  - socket-api/connect/http-get-nonblocking-ts.pkt — fcntl(O_NONBLOCK) flag-shape drift; also option-order drift
-  - tcp-fsm/mss/mss-getsockopt-tcp_maxseg-client-ts.pkt — SYN option-order drift vs script expectation; engine/shim fix is A8+
-  - tcp-fsm/mss/mss-getsockopt-tcp_maxseg-client.pkt — SYN option-order drift vs script expectation; engine/shim fix is A8+
-  - tcp-fsm/mss/mss-getsockopt-tcp_maxseg-server-advmss-ipv4.pkt — SYN option-order drift vs script expectation; engine/shim fix is A8+
-  - tcp-fsm/mss/mss-getsockopt-tcp_maxseg-server-advmss-ts-ipv4.pkt — SYN option-order drift vs script expectation; engine/shim fix is A8+
-  - tcp-fsm/mss/mss-getsockopt-tcp_maxseg-server-ts.pkt — SYN option-order drift vs script expectation; engine/shim fix is A8+
-  - tcp-fsm/mss/mss-getsockopt-tcp_maxseg-server.pkt — SYN option-order drift vs script expectation; engine/shim fix is A8+
-  - tcp-fsm/mss/mss-setsockopt-tcp_maxseg-client.pkt — SYN option-order drift vs script expectation; engine/shim fix is A8+
-  - tcp-fsm/mss/mss-setsockopt-tcp_maxseg-server.pkt — SYN option-order drift vs script expectation; engine/shim fix is A8+
+Note: A8.5 Task 5 aligned TX TCP option emission to Linux canonical order
+(`<MSS, NOP+WScale, SACKP, TS>`). Post-reorder, each of these scripts still
+fails for a *different*, deeper reason than option-order drift; reasons below
+reflect the real blocker observed after the reorder.
+
+  - socket-api/connect/http-get-nonblocking-ts.pkt — fcntl(O_NONBLOCK) flag-shape drift (expected 2 vs actual 2050); pre-connect fcntl plumbing
+  - tcp-fsm/mss/mss-getsockopt-tcp_maxseg-client-ts.pkt — client-mode `connect()` not driven by shim: SYN never emitted, scripted packet times out
+  - tcp-fsm/mss/mss-getsockopt-tcp_maxseg-client.pkt — client-mode `connect()` not driven by shim: SYN never emitted, scripted packet times out
+  - tcp-fsm/mss/mss-getsockopt-tcp_maxseg-server-advmss-ipv4.pkt — SYN-ACK emits TS unconditionally (script expects no TS when client did not offer it); needs negotiation mirroring
+  - tcp-fsm/mss/mss-getsockopt-tcp_maxseg-server-advmss-ts-ipv4.pkt — engine-side WScale mirrors buffer-derived shift, not peer-offered shift (script expects ws=6 to mirror peer, engine emits ws=3)
+  - tcp-fsm/mss/mss-getsockopt-tcp_maxseg-server-ts.pkt — TS-clock sync gap: live outbound TS val never aligns with scripted ecr, so RX matcher can't infer echo
+  - tcp-fsm/mss/mss-getsockopt-tcp_maxseg-server.pkt — SYN-ACK emits TS/SACKP unconditionally (script expects neither when client did not offer); needs negotiation mirroring
+  - tcp-fsm/mss/mss-setsockopt-tcp_maxseg-client.pkt — TCP_MAXSEG setsockopt not plumbed: getsockopt returns 0 instead of user-configured value
+  - tcp-fsm/mss/mss-setsockopt-tcp_maxseg-server.pkt — TCP_MAXSEG setsockopt not plumbed: getsockopt returns 0 instead of user-configured value
 
 ### Other (wire shape / middleware-layer behavior)
 
@@ -244,25 +274,42 @@ runnable set). Pinned at `SHIVANSH_RUNNABLE_COUNT = 5`.
 
 ## google upstream
 
-### Runnable-but-broken (A8 T16 pragmatic floor)
+### Runnable-but-broken (A8.5 T6 pragmatic floor)
 
 The Google upstream packetdrill tests under
-`third_party/packetdrill/gtests/` (167 `.pkt` total) all fail on the A8
-shim binary. Pinned at `GOOGLE_RUNNABLE_COUNT = 0`.
+`third_party/packetdrill/gtests/` (167 `.pkt` total) all fail on the
+A8.5 T6 shim binary. Pinned at `GOOGLE_RUNNABLE_COUNT = 0`.
 
-Dry-run evidence that drove this floor:
-- 0/167 scripts exit 0 under the A8 T15 S2 shim.
-- 163/167 scripts source `scripts/defaults.sh` + `set_sysctls.py` via
-  the packetdrill `\`...\`` init-script mechanism. Our CI environment
-  does not provide these helpers (shell init returns 127, the shim
-  surfaces this as exit 1 before any TCP packet flows).
-- The remaining 4 (packet-timeout meta test + 2 socket_err shape
-  tests + 1 fast_retransmit variant under
-  `gtests/net/packetdrill/tests/`) fail on engine behavior gaps that
-  Google uses to exercise packetdrill itself.
+Dry-run evidence that drove this floor (post-T6):
+- 0/167 scripts exit 0 under the A8.5 T6 shim.
+- The init-script blocker is gone: patch 0007 stubs
+  `gtests/net/common/defaults.sh` (plus the symlinked TCP variant)
+  and `gtests/net/tcp/common/set_sysctls.py` to no-ops, and the
+  corpus invoker now chdirs into the script's directory before
+  spawning the shim so relative paths resolve. Previously all 163
+  env-init-dependent scripts exited 127 at the init step; they now
+  all progress into the TCP path.
+- Post-T6 failure mix over the 167:
+  - 93 fail on SYN-ACK wire-shape mismatch (the engine emits
+    `<MSS, NOP+WScale, SACKP, TS>` unconditionally; many scripts
+    expect options mirrored to the client or no TS when the client
+    didn't offer it, so `ipv4_total_length` or the TCP options block
+    diverges).
+  - ~25 fail on `fcntl(F_GETFL)` / `fcntl(F_SETFL, O_NONBLOCK)`
+    flag-shape drift (expected 2 vs actual 2050 — the shim reports
+    a richer flag word than the scripts expect).
+  - ~20 fail on fastopen `sendto()` returning `EBADF` where
+    scripts expect `EINPROGRESS` (TCP Fast Open not implemented).
+  - The remaining ~29 fail on a long tail of engine gaps
+    (server-side accept timing, TCP_MAXSEG setsockopt not plumbed,
+    fast_retransmit / cubic / sack / ts_recent / etc.).
+- 4 packetdrill-meta scripts (fast_retransmit, socket_err shapes,
+  packet-timeout) fail on errno-shape or timing gaps that Google
+  uses to exercise packetdrill itself.
 
-A8+ work: stub `scripts/defaults.sh` at the shim level (or make the
-engine tolerate init-script failures), then reclassify.
+A8+ work: close the SYN-ACK TCP-option mirroring gap +
+fcntl(O_NONBLOCK) flag-shape parity to unlock ~118 scripts, then
+triage the long-tail engine gaps.
 
 ### Syscalls returning EOPNOTSUPP in the A8 shim
 
@@ -409,27 +456,36 @@ engine tolerate init-script failures), then reclassify.
   - gtests/net/tcp/fastopen/server/sockopt-fastopen-key.pkt — TCP Fast Open (RFC 7413) not implemented in engine
   - gtests/net/tcp/fastopen/server/unread-data-closed-trigger-rst.pkt — TCP Fast Open (RFC 7413) not implemented in engine
 
-### MSS / option-order drift (client-side)
+### MSS / TCP_MAXSEG socket-option + client-mode plumbing
 
-  - gtests/net/tcp/mss/mss-getsockopt-tcp_maxseg-server.pkt — SYN option-order drift vs script expectation; engine/shim fix is A8+
-  - gtests/net/tcp/mss/mss-setsockopt-tcp_maxseg-client.pkt — SYN option-order drift vs script expectation; engine/shim fix is A8+
-  - gtests/net/tcp/mss/mss-setsockopt-tcp_maxseg-server.pkt — SYN option-order drift vs script expectation; engine/shim fix is A8+
+Note: A8.5 T5 aligned TX TCP option emission to Linux canonical order
+(`<MSS, NOP+WScale, SACKP, TS>`) and A8.5 T6 removed the defaults.sh
+init blocker. Post-T6 reasons below reflect the actual TCP-path
+failure each script hits.
 
-### Server-side lifecycle — requires scripts/defaults.sh host-env (A8+)
+  - gtests/net/tcp/mss/mss-getsockopt-tcp_maxseg-server.pkt — SYN-ACK emits TS/SACKP unconditionally vs no-option client (post-T6; option-mirroring gap)
+  - gtests/net/tcp/mss/mss-setsockopt-tcp_maxseg-client.pkt — TCP_MAXSEG setsockopt not plumbed: getsockopt returns 0 instead of user-configured value
+  - gtests/net/tcp/mss/mss-setsockopt-tcp_maxseg-server.pkt — TCP_MAXSEG setsockopt not plumbed: getsockopt returns 0 instead of user-configured value
 
-  - gtests/net/tcp/blocking/blocking-accept.pkt — requires scripts/defaults.sh host-env (blocking tests, A8+)
-  - gtests/net/tcp/blocking/blocking-connect.pkt — requires scripts/defaults.sh host-env (blocking tests, A8+)
-  - gtests/net/tcp/blocking/blocking-read.pkt — requires scripts/defaults.sh host-env (blocking tests, A8+)
-  - gtests/net/tcp/blocking/blocking-write.pkt — requires scripts/defaults.sh host-env (blocking tests, A8+)
-  - gtests/net/tcp/close/close-local-close-then-remote-fin.pkt — requires scripts/defaults.sh host-env + server-side accept path (A8+)
-  - gtests/net/tcp/close/close-on-syn-sent.pkt — requires scripts/defaults.sh host-env + server-side accept path (A8+)
-  - gtests/net/tcp/close/close-remote-fin-then-close.pkt — requires scripts/defaults.sh host-env + server-side accept path (A8+)
-  - gtests/net/tcp/shutdown/shutdown-rd-close.pkt — requires scripts/defaults.sh host-env + server-side accept path (A8+)
-  - gtests/net/tcp/shutdown/shutdown-rd-wr-close.pkt — requires scripts/defaults.sh host-env + server-side accept path (A8+)
-  - gtests/net/tcp/shutdown/shutdown-rdwr-close.pkt — requires scripts/defaults.sh host-env + server-side accept path (A8+)
-  - gtests/net/tcp/shutdown/shutdown-rdwr-send-queue-ack-close.pkt — requires scripts/defaults.sh host-env + server-side accept path (A8+)
-  - gtests/net/tcp/shutdown/shutdown-rdwr-write-queue-close.pkt — requires scripts/defaults.sh host-env + server-side accept path (A8+)
-  - gtests/net/tcp/shutdown/shutdown-wr-close.pkt — requires scripts/defaults.sh host-env + server-side accept path (A8+)
+### Server-side lifecycle — engine/shim gaps after T6 init-stub (A8+)
+
+Init blocker was removed in A8.5 T6 (patch 0007 stubs
+`common/defaults.sh` + `common/set_sysctls.py`). These scripts now
+progress into the TCP path and fail on the deeper blockers noted.
+
+  - gtests/net/tcp/blocking/blocking-accept.pkt — accept() returns -1 EAGAIN before scripted SYN arrives (scheduler/accept timing; post-T6; A8+)
+  - gtests/net/tcp/blocking/blocking-connect.pkt — connect() timing delta vs scripted expectation (post-T6; A8+)
+  - gtests/net/tcp/blocking/blocking-read.pkt — read() blocking timing delta vs scripted expectation (post-T6; A8+)
+  - gtests/net/tcp/blocking/blocking-write.pkt — SYN-ACK TCP options shape mismatch (ipv4_total_length drift; option-mirroring gap)
+  - gtests/net/tcp/close/close-local-close-then-remote-fin.pkt — close() syscall return-time delta vs scripted tolerance (post-T6; A8+)
+  - gtests/net/tcp/close/close-on-syn-sent.pkt — connect() returns 0 where script expects -1 ECONNRESET (RST-during-SYN-SENT path; A8+)
+  - gtests/net/tcp/close/close-remote-fin-then-close.pkt — server-side accept path needed for close-after-FIN test (post-T6; A8+)
+  - gtests/net/tcp/shutdown/shutdown-rd-close.pkt — half-close semantics (SHUT_RD) not implemented; spec §6.4 AD-A8.5-shutdown-no-half-close
+  - gtests/net/tcp/shutdown/shutdown-rd-wr-close.pkt — half-close semantics (SHUT_RD/SHUT_WR) not implemented; spec §6.4 AD-A8.5-shutdown-no-half-close
+  - gtests/net/tcp/shutdown/shutdown-rdwr-close.pkt — SHUT_RDWR probes post-shutdown read=0/write=EPIPE (half-close); spec §6.4 AD-A8.5-shutdown-no-half-close
+  - gtests/net/tcp/shutdown/shutdown-rdwr-send-queue-ack-close.pkt — SHUT_RDWR probes post-shutdown read=0/write=EPIPE (half-close); spec §6.4 AD-A8.5-shutdown-no-half-close
+  - gtests/net/tcp/shutdown/shutdown-rdwr-write-queue-close.pkt — SHUT_RDWR probes post-shutdown read=0/write=EPIPE (half-close); spec §6.4 AD-A8.5-shutdown-no-half-close
+  - gtests/net/tcp/shutdown/shutdown-wr-close.pkt — half-close semantics (SHUT_WR) not implemented; spec §6.4 AD-A8.5-shutdown-no-half-close
 
 ### Other (wire shape / middleware-layer behavior)
 
@@ -453,4 +509,4 @@ engine tolerate init-script failures), then reclassify.
   - gtests/net/packetdrill/tests/linux/fast_retransmit/fr-4pkt-sack-linux.pkt — Fast-retransmit dupACK heuristic not in engine
   - gtests/net/packetdrill/tests/linux/packetdrill/socket_err.pkt — socket() errno-shape test: engine always returns success where script expects EAFNOSUPPORT (A8+)
   - gtests/net/packetdrill/tests/linux/packetdrill/socket_wrong_err.pkt — socket() errno-shape test: engine returns OK where script expects -EADDRINUSE (A8+)
-  - gtests/net/packetdrill/tests/packet-timeout.pkt — packet-timeout meta test: requires scripts/defaults.sh + set_sysctls.py host env
+  - gtests/net/packetdrill/tests/packet-timeout.pkt — packet-timeout meta test: engine tolerance/timing gap vs scripted budget (post-T6 stubs)

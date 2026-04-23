@@ -31,6 +31,7 @@ fn test_header_present_when_feature_on() {
         "dpdk_net_test_send",
         "dpdk_net_test_recv",
         "dpdk_net_test_close",
+        "dpdk_net_test_shutdown",
         "dpdk_net_test_conn_peer",
     ] {
         assert!(h.contains(expected),

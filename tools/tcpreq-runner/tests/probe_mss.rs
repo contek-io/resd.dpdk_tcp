@@ -7,7 +7,7 @@
 //! funnels parallel cargo-test workers so the two probes cannot race on
 //! DPDK mempool-name collisions during `Engine::new`.
 
-use tcpreq_runner::probes::mss::{late_option, missing_mss};
+use tcpreq_runner::probes::mss::{late_option, missing_mss, mss_support};
 use tcpreq_runner::ProbeStatus;
 
 #[test]
@@ -32,4 +32,14 @@ fn late_option_passes_on_a8_engine() {
         "LateOption must pass on A8 engine; got {:?}",
         r
     );
+}
+
+#[test]
+fn mss_support_bidirectional() {
+    let r = mss_support();
+    assert!(
+        matches!(r.status, ProbeStatus::Pass),
+        "MSSSupportTest must PASS; got {r:?}"
+    );
+    assert_eq!(r.clause_id, "MUST-14");
 }

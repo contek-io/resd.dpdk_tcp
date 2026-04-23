@@ -28,10 +28,20 @@ pub fn run_script_with_timeout(
     wall_timeout: Duration,
 ) -> RunOutcome {
     let _ = wall_timeout;  // T11+ wires a real timeout via wait_timeout / kill.
-    let o = Command::new(shim_binary)
-        .arg(script)
-        .output()
-        .expect("spawn shim binary");
+    // A8.5 T6: chdir into the script's directory before spawning the
+    // shim. packetdrill's backtick init blocks use relative paths
+    // (e.g. `../common/defaults.sh` in the google corpus, `scripts/
+    // defaults.sh` in ligurio/shivansh) that real invocations resolve
+    // against the script dir. Passing the script path through as
+    // absolute keeps the binary's file-open working regardless of cwd.
+    let script_abs = std::fs::canonicalize(script)
+        .unwrap_or_else(|_| script.to_path_buf());
+    let mut cmd = Command::new(shim_binary);
+    cmd.arg(&script_abs);
+    if let Some(parent) = script_abs.parent() {
+        cmd.current_dir(parent);
+    }
+    let o = cmd.output().expect("spawn shim binary");
     RunOutcome {
         exit: o.status.code().unwrap_or(-1),
         stdout: String::from_utf8_lossy(&o.stdout).into(),

@@ -33,8 +33,9 @@ Source RFCs: `docs/rfcs/rfc9293.txt` (TCP 793bis),
 | MUST-30/31 | URG mechanism | RFC 9293 §3.8.2 | `tools/tcpreq-runner/src/probes/urgent.rs::urgent_dropped` + counter-coverage `cover_tcp_rx_urgent_dropped` (tests/counter-coverage.rs:1425) | **DEVIATION** — `AD-A8-urg-dropped` (master spec §6.4) |
 | MUST-58/59 | Delayed-ACK SHOULD aggregate but MUST send | RFC 9293 §3.8.6.3 | Per-segment ACK in A3 baseline; burst-scope coalescing lands at A6 alongside `preset=rfc_compliance` switch (master spec §6.4 row "Delayed ACK") — behavior never withholds a valid ACK | **DEVIATION** — master spec §6.4 "Delayed ACK" (trading-latency default: over-ACK relative to MUST-58 is the chosen direction, MUST-59 "MUST send" is preserved) |
 | Reserved | Reserved bits ignored on RX + zero on TX | RFC 9293 §3.1 | `tools/tcpreq-runner/src/probes/reserved.rs::reserved_rx` (Layer C) | **PASS** (tcpreq) |
-| Reset-Processing | RST processed independently of other flags; RST responses to invalid segments | RFC 9293 §3.10.7 | A3 RST-path unit tests in `tcp_input.rs` (`#[cfg(test)]` mod) + A8 S1 AD-A7 fixes `tests/ad_a7_rst_relisten.rs` + `tests/ad_a7_dup_syn_retrans_synack.rs` + counter-coverage `cover_tcp_rx_rst` (:848), `cover_tcp_tx_rst` (:931), `cover_tcp_conn_rst` (:717) | **PASS** |
+| Reset-Processing | RST processed independently of other flags; RST responses to invalid segments | RFC 9293 §3.10.7 | A3 RST-path unit tests in `tcp_input.rs` (`#[cfg(test)]` mod) + A8 S1 AD-A7 fixes `tests/ad_a7_rst_relisten.rs` + `tests/ad_a7_dup_syn_retrans_synack.rs` + counter-coverage `cover_tcp_rx_rst` (:848), `cover_tcp_tx_rst` (:931), `cover_tcp_conn_rst` (:717); A8.5 adds `tools/tcpreq-runner/src/probes/rst_ack.rs` which pins both plain RST (closes conn) AND `RST\|URG` (URG-drop fires first per `AD-A8.5-rst-urg-precedence`) | **PASS-WITH-DEVIATION** — plain RST is RFC-default exact; `RST\|URG` is `AD-A8.5-rst-urg-precedence` (master spec §6.4) as a consequence of the pre-existing `AD-A8-urg-dropped` ordering |
 | Blind-data-mitigation | Challenge-ACK on out-of-window sequence numbers | RFC 9293 §3.10.7 / RFC 5961 | A3 challenge-ACK path in `tcp_input.rs` (off-window seq → challenge-ACK emission); obs_smoke + counter-coverage dynamically exercise the edge | **PASS** |
+| Shutdown-API | POSIX `shutdown(2)` subset (full-close only) — SHUT_RDWR dispatches to the normal active-close FIN handshake; SHUT_RD / SHUT_WR return `-EOPNOTSUPP`; invalid `how` returns `-EINVAL` | RFC 9293 §3.10.7.3 close processing + POSIX `shutdown(2)` | `crates/dpdk-net/tests/api_shutdown.rs::shutdown_rdwr_full_closes_conn` (SHUT_RDWR = `dpdk_net_close(h, 0)` dispatch) + `shutdown_rd_returns_eopnotsupp` + `shutdown_wr_returns_eopnotsupp` + `shutdown_invalid_how_returns_einval`; SHUT_RDWR FIN-emission / TIME_WAIT path covered end-to-end by `crates/dpdk-net-core/tests/test_server_active_close.rs` (the same core-crate `close_conn` path SHUT_RDWR dispatches to) | **DEVIATION** — `AD-A8.5-shutdown-no-half-close` (master spec §6.4): half-close (SHUT_RD / SHUT_WR) intentionally returns `-EOPNOTSUPP`; full-close (SHUT_RDWR) is RFC-default exact |
 
 ## DEFERRED / not-in-Stage-1-scope clauses
 
@@ -78,3 +79,18 @@ MUST-relevant code path.
   `phase-a8`. Every DEVIATION row cites the master-spec §6.4 AD-* row
   that documents the rationale. Every DEFERRED row cites master spec
   §1 non-goals, §6.3 compliance matrix row, or Stage 2+ scope.
+- **2026-04-23 (A8.5 T7)**: added `Shutdown-API` row (DEVIATION:
+  `AD-A8.5-shutdown-no-half-close`). Matrix now 16 in-scope rows
+  (13 PASS, 3 DEVIATION). Cites `crates/dpdk-net/tests/api_shutdown.rs`
+  (4 tests covering SHUT_RDWR dispatch + SHUT_RD / SHUT_WR / invalid-how
+  errno returns) + the existing `test_server_active_close.rs` for the
+  FIN-emission / TIME_WAIT end-to-end coverage that SHUT_RDWR rides.
+- **2026-04-23 (A8.5 T10 — post-phase-review)**: `Reset-Processing` row
+  promoted PASS → PASS-WITH-DEVIATION to pin `AD-A8.5-rst-urg-precedence`
+  (master spec §6.4). Plain RST is RFC-default exact; `RST\|URG` is
+  URG-dropped as a direct consequence of the pre-existing
+  `AD-A8-urg-dropped` ordering (URG check at `tcp_input.rs:730` fires
+  before RST check at `:744`). New Layer-C probe `rst_ack.rs` asserts
+  both behaviors (+1 tcp.rx_rst on both scenarios; +1 tcp.rx_urgent_dropped
+  on scenario B). Matrix tally: 16 in-scope rows, 12 PASS, 1
+  PASS-WITH-DEVIATION, 3 DEVIATION.

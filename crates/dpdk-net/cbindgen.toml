@@ -44,6 +44,7 @@ exclude = [
     "dpdk_net_test_send",
     "dpdk_net_test_recv",
     "dpdk_net_test_close",
+    "dpdk_net_test_shutdown",
     "dpdk_net_test_conn_peer",
     "dpdk_net_listen_handle_t",
     "dpdk_net_test_frame_t",
