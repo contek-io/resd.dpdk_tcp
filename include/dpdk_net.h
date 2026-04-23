@@ -289,7 +289,6 @@ struct DPDK_NET_ALIGNED(64) dpdk_net_tcp_counters_t {
   uint64_t rx_data;
   uint64_t rx_ack;
   uint64_t rx_rst;
-  uint64_t rx_out_of_order;
   uint64_t tx_retrans;
   uint64_t tx_rto;
   uint64_t tx_tlp;
@@ -371,6 +370,24 @@ struct DPDK_NET_ALIGNED(64) dpdk_net_poll_counters_t {
   uint64_t _pad[11];
 };
 
+/**
+ * A9 fault-injector counter group (slow-path). Mirror of
+ * `dpdk_net_core::counters::FaultInjectorCounters`; field docs live on
+ * the core struct (see counters.rs). Struct is ALWAYS emitted into the
+ * C ABI (same pattern as A5 deferred tx_retrans / tx_rto / tx_tlp —
+ * cbindgen doesn't honour `#[cfg(feature=...)]`, so feature-gating
+ * here would leak the type into the default-build header). The
+ * `fault-injector` cargo feature only gates whether the FaultInjector
+ * middleware runs and populates these counters; release builds with
+ * the feature off carry zero-valued counters.
+ */
+struct DPDK_NET_ALIGNED(64) dpdk_net_fault_injector_counters_t {
+  uint64_t drops;
+  uint64_t dups;
+  uint64_t reorders;
+  uint64_t corrupts;
+};
+
 struct dpdk_net_counters_t {
   struct dpdk_net_eth_counters_t eth;
   struct dpdk_net_ip_counters_t ip;
@@ -378,6 +395,7 @@ struct dpdk_net_counters_t {
   struct dpdk_net_poll_counters_t poll;
   uint64_t obs_events_dropped;
   uint64_t obs_events_queue_high_water;
+  struct dpdk_net_fault_injector_counters_t fault_injector;
 };
 
 /**
@@ -414,6 +432,12 @@ struct dpdk_net_tcp_rtt_histogram_t {
 struct dpdk_net_connect_opts_t {
   uint32_t peer_addr;
   uint16_t peer_port;
+  /**
+   * Local source IP in network byte order. Zero = engine default.
+   * Non-zero must match one of the engine's configured local IPs;
+   * otherwise connect returns -EINVAL. Used for per-connection
+   * source-IP binding in multi-homed / dual-NIC setups.
+   */
   uint32_t local_addr;
   uint16_t local_port;
   uint32_t connect_timeout_ms;
@@ -476,6 +500,39 @@ struct dpdk_net_engine *dpdk_net_engine_create(uint16_t lcore_id,
                                                const struct dpdk_net_engine_config_t *cfg);
 
 void dpdk_net_engine_destroy(struct dpdk_net_engine *p);
+
+/**
+ * bug_010 → feature: register a secondary local source IP on this
+ * engine. `local_addr_nbo` is network byte order (matches the rest of
+ * the C ABI — `dpdk_net_connect_opts_t.local_addr` is also NBO).
+ *
+ * After this call, `dpdk_net_connect` accepts connect requests whose
+ * `local_addr` equals `local_addr_nbo` (or any previously-registered
+ * secondary, or the engine's primary `local_ip`). `local_addr == 0`
+ * in a connect request always selects the primary — the value 0 is
+ * reserved and rejected here as well.
+ *
+ * Idempotent for secondaries: re-registering an already-known
+ * secondary IP is not an error. The engine's primary `local_ip` is
+ * rejected with `-EINVAL` as a caller-mistake flag (it is already
+ * accepted by `dpdk_net_connect` without registration).
+ *
+ * Returns:
+ *   0        success (secondary IP is registered; may or may not have been new)
+ *   -EINVAL  `p` is null, or `local_addr_nbo == 0`, or the value
+ *            equals the engine's primary `local_ip`.
+ *
+ * Scope note: this only extends the source-IP selection whitelist.
+ * It does NOT configure the address on the host interface, does NOT
+ * install a route for it, and does NOT program per-source ARP. The
+ * application is responsible for those in the dual-NIC / multi-homed
+ * setup this is designed to support.
+ *
+ * # Safety
+ * `p` must be a valid Engine pointer obtained from
+ * `dpdk_net_engine_create`, or null.
+ */
+int32_t dpdk_net_engine_add_local_ip(struct dpdk_net_engine *p, uint32_t local_addr_nbo);
 
 int32_t dpdk_net_poll(struct dpdk_net_engine *p,
                       struct dpdk_net_event_t *events_out,
@@ -613,6 +670,26 @@ int32_t dpdk_net_conn_rtt_histogram(struct dpdk_net_engine *engine,
  * -EINVAL on null out_mac.
  */
 int32_t dpdk_net_resolve_gateway_mac(uint32_t gateway_ip_host_order, uint8_t *out_mac);
+
+/**
+ * Read `/proc/net/route` and return the default-gateway IPv4 address
+ * in *host* byte order via `*out_ip`.
+ *
+ * `iface` may be NULL (accept any default route) or a NUL-terminated
+ * interface name (restrict to that iface). `out_ip` must be non-NULL.
+ *
+ * MUST be called before `dpdk_net_engine_create`: `/proc/net/route`
+ * reflects the kernel's view of the route table, which goes away once
+ * DPDK binds the NIC. Pair with `dpdk_net_resolve_gateway_mac` to seed
+ * both `EngineConfig.gateway_ip` and `.gateway_mac`.
+ *
+ * Returns:
+ *   0 — success, `*out_ip` populated.
+ *  -EINVAL — `out_ip` is NULL, or `iface` is not valid UTF-8.
+ *  -ENOENT — no default route matched (including unknown iface).
+ *  -EIO   — `/proc/net/route` could not be read.
+ */
+int32_t dpdk_net_read_default_gateway_ip(const char *iface, uint32_t *out_ip);
 
 int32_t dpdk_net_connect(struct dpdk_net_engine *p,
                          const struct dpdk_net_connect_opts_t *opts,

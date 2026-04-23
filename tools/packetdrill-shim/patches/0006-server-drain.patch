@@ -1,0 +1,290 @@
+From dc139f3c7a86b1dd97cffdbe32aea4e201219fef Mon Sep 17 00:00:00 2001
+From: dpdk-net shim <shim@dpdk-net.local>
+Date: Wed, 22 Apr 2026 15:58:48 +0000
+Subject: [PATCH] shim: server-mode drain (S2): IP rewrite + accept peer tuple
+
+A8 T15 S2: server-side corpus scripts were timing out at the first
+expected outbound segment because packetdrill injects frames with its
+per-script live_local_ip / live_remote_ip (192.0.2.1 / 192.168.x.x)
+while the engine's configured tuple is fixed at 10.99.2.x. The engine
+silently drops frames whose dst-IP doesn't match cfg.local_ip, so no
+handshake ever completed.
+
+S2 bridges the two address spaces in the shim:
+- dpdk_net_shim_set_packetdrill_ips() captures live_local_ip /
+  live_remote_ip / live_gateway_ip at the start of each run_script.
+- shim_rewrite_for_inject() (called from inject_packet) rewrites the
+  destination IP from packetdrill-local to engine-local (and src from
+  packetdrill-remote to engine-gateway) with RFC 1624 incremental
+  checksum updates on both IP and TCP header.
+- shim_rewrite_for_drain() (called from drain_next) does the reverse
+  for outbound frames so packetdrill sees its own IP space.
+- shim_accept() now pulls the peer ephemeral port from the engine via
+  the new dpdk_net_test_conn_peer FFI so run_syscall_accept's
+  is_equal_port assertion passes.
+
+With S2 landed, 6 ligurio server-side scripts (listen-incoming-*,
+blocking-simple-server, simultaneous-close) now run end-to-end.
+---
+ gtests/net/packetdrill/dpdk_net_shim.c | 149 ++++++++++++++++++++++++-
+ gtests/net/packetdrill/dpdk_net_shim.h |  14 +++
+ gtests/net/packetdrill/run.c           |  14 +++
+ 3 files changed, 173 insertions(+), 4 deletions(-)
+
+diff --git a/gtests/net/packetdrill/dpdk_net_shim.c b/gtests/net/packetdrill/dpdk_net_shim.c
+index 2ef1a2d..d77c4ab 100644
+--- a/gtests/net/packetdrill/dpdk_net_shim.c
++++ b/gtests/net/packetdrill/dpdk_net_shim.c
+@@ -71,6 +71,19 @@ struct shim_fd {
+ 
+ static struct shim_fd g_fdtab[SHIM_FD_MAX - SHIM_FD_BASE + 1];
+ 
++/* A8 T15 (S2): per-script IP rewrite table. Maps packetdrill's live
++ * addresses (populated at run_script start from config->live_*_ip) to
++ * the engine's fixed test-server addresses (10.99.2.2 / 10.99.2.1). All
++ * values are in network byte order. Zero means "disabled" and the shim
++ * passes frames through unmodified. */
++static uint32_t g_pkt_local_be = 0;      /* packetdrill live_local_ip (be) */
++static uint32_t g_pkt_remote_be = 0;     /* packetdrill live_remote_ip (be) */
++static uint32_t g_pkt_gateway_be = 0;    /* packetdrill live_gateway_ip (be) */
++/* Engine-side constants, kept in sync with build_eal_argv cfg below.
++ * NOTE: host-order values, converted to BE at rewrite time. */
++#define SHIM_ENG_LOCAL_IP_HOST    0x0a630202u  /* 10.99.2.2 */
++#define SHIM_ENG_GATEWAY_IP_HOST  0x0a630201u  /* 10.99.2.1 */
++
+ static struct shim_fd *fd_slot(int fd) {
+     if (fd < SHIM_FD_BASE || fd > SHIM_FD_MAX) return NULL;
+     return &g_fdtab[fd - SHIM_FD_BASE];
+@@ -221,14 +234,27 @@ static int shim_accept(void *ud, int sockfd, struct sockaddr *addr,
+     c->kind = SHIM_FD_CONN;
+     c->conn_handle = ch;
+ 
+-    /* Fill caller's sockaddr with the gateway (peer) IP. Engine doesn't
+-     * expose per-conn peer addr at this API level; scripts that care
+-     * can inspect socket.live.remote in the regular packetdrill path.
+-     * We lie minimally: addr=0, port=0. Scripts typically ignore it. */
++    /* Fill caller's sockaddr with the peer IP + port. A8 T15 (S2):
++     * returning zeros here trips two back-to-back assertions in
++     * run_syscall_accept:
++     *   (a) is_equal_ip(&socket->live.remote.ip, &ip)   [line 1502]
++     *   (b) is_equal_port(socket->live.remote.port,     [line 1503]
++     *                     htons(port))
++     * Address: report the packetdrill-space remote IP (live_remote_ip)
++     * when the rewrite table is populated; fall back to zeros for the
++     * A7 raw-IP path.
++     * Port: pull the real peer ephemeral port from the engine via the
++     * test FFI (host order) and encode it network order. */
+     if (addr && addrlen && *addrlen >= (socklen_t)sizeof(struct sockaddr_in)) {
++        uint32_t peer_ip_host = 0;
++        uint16_t peer_port_host = 0;
++        (void)dpdk_net_test_conn_peer(g_engine, ch,
++                                      &peer_ip_host, &peer_port_host);
+         struct sockaddr_in sin;
+         memset(&sin, 0, sizeof(sin));
+         sin.sin_family = AF_INET;
++        sin.sin_addr.s_addr = g_pkt_remote_be; /* 0 when S2 disabled */
++        sin.sin_port = htons(peer_port_host);
+         memcpy(addr, &sin, sizeof(sin));
+         *addrlen = sizeof(sin);
+     }
+@@ -478,6 +504,98 @@ static int shim_netdev_receive(void *ud, void *buf, size_t *count,
+     return dpdk_net_shim_drain_next(buf, count, time_usecs);
+ }
+ 
++/* A8 T15 (S2) IP-rewrite helpers. Packetdrill generates frames using
++ * `config->live_local_ip` / `config->live_remote_ip`, but the engine is
++ * configured with its own fixed test IPs (10.99.2.x). Without rewriting
++ * at the shim boundary the engine silently drops the inbound frames
++ * (dst-IP mismatch vs. cfg.local_ip) and never emits a reply, so every
++ * `listen()`-based script times out at the first expected outbound
++ * segment. Here we translate addresses at the inject/drain boundary and
++ * fix up the IPv4 header checksum + TCP checksum via the RFC 1624
++ * incremental-update formula. */
++
++/* Apply one 16-bit word delta to a 16-bit ones-complement checksum.
++ * Inputs/outputs are in BE wire order; `csum_be` is the existing field
++ * value from the packet, `old_be` / `new_be` are the old/new values of
++ * the replaced 16-bit word. RFC 1624 eqn 3 (with the pitfall avoidance
++ * for +/-0). */
++static uint16_t shim_csum_update_word_be(uint16_t csum_be,
++                                         uint16_t old_be, uint16_t new_be) {
++    uint32_t sum = (uint16_t)~ntohs(csum_be);
++    sum += (uint16_t)~ntohs(old_be);
++    sum += ntohs(new_be);
++    while (sum >> 16) sum = (sum & 0xFFFF) + (sum >> 16);
++    uint16_t out = (uint16_t)~sum;
++    /* Avoid +0 vs -0 pitfall: pd's RFC 1624 eqn [3] says if the updated
++     * checksum is 0xFFFF, leave it; our wrap loop already does. */
++    return htons(out);
++}
++
++/* Rewrite one 32-bit IP address in-place, updating IP header checksum
++ * and TCP checksum incrementally. `buf` points to the IPv4 header;
++ * `offset` is 12 (src) or 16 (dst). */
++static void shim_rewrite_ip_addr(uint8_t *buf, size_t len,
++                                 size_t offset, uint32_t new_be) {
++    if (len < 20) return;
++    uint8_t ihl = (buf[0] & 0x0f) * 4;
++    if (len < ihl) return;
++
++    uint32_t old_be;
++    memcpy(&old_be, buf + offset, 4);
++    if (old_be == new_be) return;
++
++    uint16_t old_hi = (uint16_t)(old_be & 0xFFFF);
++    uint16_t old_lo = (uint16_t)((old_be >> 16) & 0xFFFF);
++    uint16_t new_hi = (uint16_t)(new_be & 0xFFFF);
++    uint16_t new_lo = (uint16_t)((new_be >> 16) & 0xFFFF);
++
++    /* IP header checksum at offset 10-11. */
++    uint16_t ip_csum;
++    memcpy(&ip_csum, buf + 10, 2);
++    ip_csum = shim_csum_update_word_be(ip_csum, old_hi, new_hi);
++    ip_csum = shim_csum_update_word_be(ip_csum, old_lo, new_lo);
++    memcpy(buf + 10, &ip_csum, 2);
++
++    /* TCP checksum. The TCP pseudo-header includes the src+dst IP, so a
++     * rewrite must propagate into TCP csum at TCP offset 16-17. We only
++     * adjust TCP (proto == 6); UDP (proto == 17) would be proto byte + 0
++     * for zero checksum — out of scope for these scripts. */
++    uint8_t proto = buf[9];
++    if (proto == 6 && len >= (size_t)ihl + 20) {
++        uint16_t tcp_csum;
++        memcpy(&tcp_csum, buf + ihl + 16, 2);
++        tcp_csum = shim_csum_update_word_be(tcp_csum, old_hi, new_hi);
++        tcp_csum = shim_csum_update_word_be(tcp_csum, old_lo, new_lo);
++        memcpy(buf + ihl + 16, &tcp_csum, 2);
++    }
++
++    memcpy(buf + offset, &new_be, 4);
++}
++
++/* Inject-path rewrite: packetdrill->engine.
++ * src: live_remote_ip -> engine_gateway_ip
++ * dst: live_local_ip  -> engine_local_ip
++ * No-op if the rewrite table hasn't been initialized (all zero). */
++static void shim_rewrite_for_inject(uint8_t *ip_buf, size_t len) {
++    if (g_pkt_local_be == 0 && g_pkt_remote_be == 0) return;
++    /* Only IPv4. */
++    if (len < 1 || (ip_buf[0] >> 4) != 4) return;
++    uint32_t eng_local_be = htonl(SHIM_ENG_LOCAL_IP_HOST);
++    uint32_t eng_gw_be    = htonl(SHIM_ENG_GATEWAY_IP_HOST);
++    shim_rewrite_ip_addr(ip_buf, len, 12, eng_gw_be);     /* src */
++    shim_rewrite_ip_addr(ip_buf, len, 16, eng_local_be);  /* dst */
++}
++
++/* Drain-path rewrite: engine->packetdrill.
++ * src: engine_local_ip -> live_local_ip
++ * dst: engine_gateway_ip -> live_remote_ip */
++static void shim_rewrite_for_drain(uint8_t *ip_buf, size_t len) {
++    if (g_pkt_local_be == 0 && g_pkt_remote_be == 0) return;
++    if (len < 1 || (ip_buf[0] >> 4) != 4) return;
++    shim_rewrite_ip_addr(ip_buf, len, 12, g_pkt_local_be);   /* src */
++    shim_rewrite_ip_addr(ip_buf, len, 16, g_pkt_remote_be);  /* dst */
++}
++
+ int dpdk_net_shim_inject_packet(const void *ip_bytes, size_t count) {
+     if (!g_active || !g_engine) return -1;
+     if (count > 65535) return -1;
+@@ -487,6 +605,11 @@ int dpdk_net_shim_inject_packet(const void *ip_bytes, size_t count) {
+                    "\x08\x00",                  /* EtherType IPv4 */
+            14);
+     memcpy(l2_buf + 14, ip_bytes, count);
++    /* A8 T15 (S2): rewrite IP addresses from packetdrill-space to
++     * engine-space before handing the frame to the engine's RX pipeline.
++     * No-op when the rewrite table is zero (A7 compat / manual
++     * engine-space scripts). */
++    shim_rewrite_for_inject(l2_buf + 14, count);
+     int rc = dpdk_net_test_inject_frame(g_engine, l2_buf, 14 + count);
+     return rc == 0 ? 0 : -1;
+ }
+@@ -511,6 +634,10 @@ int dpdk_net_shim_drain_next(void *out, size_t *count,
+     if (copy_len > *count) copy_len = *count;
+     memcpy(out, src + skip, copy_len);
+     *count = copy_len;
++    /* A8 T15 (S2): rewrite engine-space addresses back to packetdrill's
++     * live addresses so the packetdrill packet matcher sees frames in the
++     * script's IP space. No-op when the rewrite table is zero. */
++    shim_rewrite_for_drain((uint8_t *)out, copy_len);
+     if (time_usecs_out) *time_usecs_out = (long long)(g_virt_ns / 1000);
+     free(g_txq[g_txq_head].buf);
+     g_txq[g_txq_head].buf = NULL;
+@@ -518,6 +645,14 @@ int dpdk_net_shim_drain_next(void *out, size_t *count,
+     return 0;
+ }
+ 
++void dpdk_net_shim_set_packetdrill_ips(uint32_t live_local_be,
++                                       uint32_t live_remote_be,
++                                       uint32_t live_gateway_be) {
++    g_pkt_local_be = live_local_be;
++    g_pkt_remote_be = live_remote_be;
++    g_pkt_gateway_be = live_gateway_be;
++}
++
+ static int shim_usleep(void *ud, useconds_t usec) {
+     (void)ud;
+     /* Advance virtual clock; run engine timers via a zero-length
+@@ -611,6 +746,12 @@ void dpdk_net_shim_reset_per_script(void) {
+     g_virt_ns = 0;
+     g_next_fd = SHIM_FD_BASE;
+     memset(g_fdtab, 0, sizeof(g_fdtab));
++    /* A8 T15 (S2): clear the IP-rewrite table between scripts so a
++     * script that doesn't call dpdk_net_shim_set_packetdrill_ips
++     * inherits the A7 passthrough behavior, not stale per-script IPs. */
++    g_pkt_local_be = 0;
++    g_pkt_remote_be = 0;
++    g_pkt_gateway_be = 0;
+     if (g_active) dpdk_net_test_set_time_ns(0);
+ }
+ 
+diff --git a/gtests/net/packetdrill/dpdk_net_shim.h b/gtests/net/packetdrill/dpdk_net_shim.h
+index 422217b..2affc54 100644
+--- a/gtests/net/packetdrill/dpdk_net_shim.h
++++ b/gtests/net/packetdrill/dpdk_net_shim.h
+@@ -71,4 +71,18 @@ int dpdk_net_shim_gettimeofday_helper(struct timeval *tv);
+  * shim so scripted time delays are deterministic. */
+ int dpdk_net_shim_advance_usecs(long long usecs);
+ 
++/* A8 T15 (S2): register packetdrill's per-script live IPs so the shim
++ * can rewrite IP headers on inject/drain between packetdrill's address
++ * space (live_local_ip / live_remote_ip / live_gateway_ip) and the
++ * engine's configured address space (10.99.2.2 / 10.99.2.1). Without
++ * this rewrite every `listen()`-based script fails because the engine
++ * silently drops frames whose dst-IP doesn't match cfg.local_ip.
++ *
++ * All three IPs are in network byte order. Pass 0 to disable rewriting
++ * (the original A7 behavior). Call once per script before run_script's
++ * main event loop — reset_per_script clears it back to "disabled". */
++void dpdk_net_shim_set_packetdrill_ips(uint32_t live_local_be,
++                                       uint32_t live_remote_be,
++                                       uint32_t live_gateway_be);
++
+ #endif /* __DPDK_NET_SHIM_H__ */
+diff --git a/gtests/net/packetdrill/run.c b/gtests/net/packetdrill/run.c
+index 6c86d04..587a8d0 100644
+--- a/gtests/net/packetdrill/run.c
++++ b/gtests/net/packetdrill/run.c
+@@ -633,6 +633,20 @@ void run_script(struct config *config, struct script *script)
+ 		state->so_instance = so_instance_new();
+ 		dpdk_net_shim_fill_interface(&state->so_instance->ifc);
+ 		dpdk_net_shim_reset_per_script();
++		/* A8 T15 (S2): register packetdrill's per-script live IPs
++		 * with the shim so the inject/drain boundary can rewrite
++		 * between packetdrill's address space and the engine's
++		 * fixed test-server IPs (10.99.2.2 / 10.99.2.1). Without
++		 * this, any script that doesn't explicitly set
++		 * --local_ip=10.99.2.2 (i.e. every ligurio listen/close/
++		 * reset/shutdown script) sends frames with default IPs that
++		 * the engine silently drops. */
++		if (config->live_local_ip.address_family == AF_INET) {
++			dpdk_net_shim_set_packetdrill_ips(
++				(uint32_t)config->live_local_ip.ip.v4.s_addr,
++				(uint32_t)config->live_remote_ip.ip.v4.s_addr,
++				(uint32_t)config->live_gateway_ip.ip.v4.s_addr);
++		}
+ 	}
+ 
+ 	init_cmd_exed = false;
+-- 
+2.34.1
+

@@ -81,6 +81,10 @@ pub struct dpdk_net_engine_config_t {
 pub struct dpdk_net_connect_opts_t {
     pub peer_addr: u32, // network byte order IPv4
     pub peer_port: u16,
+    /// Local source IP in network byte order. Zero = engine default.
+    /// Non-zero must match one of the engine's configured local IPs;
+    /// otherwise connect returns -EINVAL. Used for per-connection
+    /// source-IP binding in multi-homed / dual-NIC setups.
     pub local_addr: u32,
     pub local_port: u16,
     pub connect_timeout_ms: u32,
@@ -120,6 +124,7 @@ pub struct dpdk_net_connect_opts_t {
 }
 
 #[repr(u32)]
+#[derive(Copy, Clone)]
 pub enum dpdk_net_event_kind_t {
     DPDK_NET_EVT_CONNECTED = 1,
     DPDK_NET_EVT_READABLE = 2,
@@ -363,7 +368,6 @@ pub struct dpdk_net_tcp_counters_t {
     pub rx_data: u64,
     pub rx_ack: u64,
     pub rx_rst: u64,
-    pub rx_out_of_order: u64,
     pub tx_retrans: u64,
     pub tx_rto: u64,
     pub tx_tlp: u64,
@@ -446,6 +450,22 @@ pub struct dpdk_net_poll_counters_t {
     pub iters_with_rx_burst_max: u64,
     pub _pad: [u64; 11],
 }
+/// A9 fault-injector counter group (slow-path). Mirror of
+/// `dpdk_net_core::counters::FaultInjectorCounters`; field docs live on
+/// the core struct (see counters.rs). Struct is ALWAYS emitted into the
+/// C ABI (same pattern as A5 deferred tx_retrans / tx_rto / tx_tlp —
+/// cbindgen doesn't honour `#[cfg(feature=...)]`, so feature-gating
+/// here would leak the type into the default-build header). The
+/// `fault-injector` cargo feature only gates whether the FaultInjector
+/// middleware runs and populates these counters; release builds with
+/// the feature off carry zero-valued counters.
+#[repr(C, align(64))]
+pub struct dpdk_net_fault_injector_counters_t {
+    pub drops: u64,
+    pub dups: u64,
+    pub reorders: u64,
+    pub corrupts: u64,
+}
 #[repr(C)]
 pub struct dpdk_net_counters_t {
     pub eth: dpdk_net_eth_counters_t,
@@ -457,6 +477,10 @@ pub struct dpdk_net_counters_t {
     // the core struct (see counters.rs).
     pub obs_events_dropped: u64,
     pub obs_events_queue_high_water: u64,
+    // A9 fault-injector group (slow-path). Always present on the C ABI
+    // (cbindgen doesn't honour feature gates). Population is gated by the
+    // `fault-injector` cargo feature on the core side.
+    pub fault_injector: dpdk_net_fault_injector_counters_t,
 }
 
 // Compile-time checks: the public counters struct must have the same
@@ -478,6 +502,15 @@ const _: () = {
     assert!(size_of::<dpdk_net_ip_counters_t>() == size_of::<CoreIp>());
     assert!(size_of::<dpdk_net_tcp_counters_t>() == size_of::<CoreTcp>());
     assert!(size_of::<dpdk_net_poll_counters_t>() == size_of::<CorePoll>());
+};
+
+// A9 Task 5: per-group size+align parity for the fault-injector mirror.
+// Unconditional — struct is always present on both sides.
+const _: () = {
+    use dpdk_net_core::counters::FaultInjectorCounters as CoreFI;
+    use std::mem::{align_of, size_of};
+    assert!(size_of::<dpdk_net_fault_injector_counters_t>() == size_of::<CoreFI>());
+    assert!(align_of::<dpdk_net_fault_injector_counters_t>() == align_of::<CoreFI>());
 };
 
 // A5.5 Task 7: `dpdk_net_conn_stats_t` is a field-for-field ABI mirror of

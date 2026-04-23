@@ -5,6 +5,9 @@ pub mod api;
 #[cfg(feature = "test-panic-entry")]
 pub mod test_only;
 
+#[cfg(feature = "test-server")]
+pub mod test_ffi;
+
 use api::*;
 use dpdk_net_core::clock;
 use dpdk_net_core::counters::Counters;
@@ -57,6 +60,54 @@ unsafe fn engine_from_raw<'a>(p: *mut dpdk_net_engine) -> Option<&'a Engine> {
         return None;
     }
     Some(&(&*(p as *const OpaqueEngine)).0)
+}
+
+/// A7 Task 8: `&mut Engine` accessor for the test-FFI helpers (which
+/// need to hand through `engine.inject_rx_frame`, `engine.listen`,
+/// `engine.accept_next`, etc.). Lives under `test-server` only; the
+/// production build keeps the immutable `engine_from_raw` as the sole
+/// accessor.
+#[cfg(feature = "test-server")]
+unsafe fn engine_from_raw_mut<'a>(p: *mut dpdk_net_engine) -> Option<&'a mut Engine> {
+    if p.is_null() {
+        return None;
+    }
+    Some(&mut (&mut *(p as *mut OpaqueEngine)).0)
+}
+
+/// A7 Task 8: run the engine's per-conn TX flush + timer wheel advance
+/// in a loop until neither makes progress. Every test-FFI entry except
+/// `set_time_ns` and `accept_next` invokes this before returning so
+/// packetdrill script steps observe a quiescent stack at each boundary.
+///
+/// The 10 000-iteration cap guards against a pathological loop where
+/// the TX-intercept queue never drains (would require a bug in the
+/// test rig). At production-realistic tick rates we expect ≤ a handful
+/// of iterations per call.
+#[cfg(feature = "test-server")]
+fn pump_until_quiescent(eng: &mut Engine) {
+    const MAX: u32 = 10_000;
+    let mut i: u32 = 0;
+    loop {
+        let tx_progress = eng.pump_tx_drain();
+        let fired = eng.pump_timers(clock::now_ns());
+        if !tx_progress && fired == 0 {
+            return;
+        }
+        i += 1;
+        assert!(i < MAX, "pump_until_quiescent exceeded {MAX} iterations");
+    }
+}
+
+/// A7 Task 8: raw-pointer-shaped wrapper around `pump_until_quiescent`,
+/// used by the test-FFI shims that already have a `*mut dpdk_net_engine`
+/// (e.g. the wrappers that re-enter `dpdk_net_connect`/`_send`/`_close`
+/// which take the pointer, not the `&mut Engine`).
+#[cfg(feature = "test-server")]
+unsafe fn pump_until_quiescent_raw(p: *mut dpdk_net_engine) {
+    if let Some(eng) = engine_from_raw_mut(p) {
+        pump_until_quiescent(eng);
+    }
 }
 
 /// Initialize DPDK EAL. Must be called before dpdk_net_engine_create.
@@ -159,6 +210,11 @@ pub unsafe extern "C" fn dpdk_net_engine_create(
         // `Engine::new` so the two stay co-located.
         rx_mempool_size: cfg.rx_mempool_size,
         local_ip: cfg.local_ip,
+        // bug_010 → feature: start empty. C callers register secondary
+        // local IPs post-create via `dpdk_net_engine_add_local_ip`; the
+        // struct-layout of `dpdk_net_engine_config_t` is frozen (ABI
+        // stability) so a new field here is out of scope.
+        secondary_local_ips: Vec::new(),
         gateway_ip: cfg.gateway_ip,
         gateway_mac: cfg.gateway_mac,
         garp_interval_sec: cfg.garp_interval_sec,
@@ -212,6 +268,65 @@ pub unsafe extern "C" fn dpdk_net_engine_destroy(p: *mut dpdk_net_engine) {
     }
     let _boxed = Box::from_raw(p as *mut OpaqueEngine);
     // Drop runs Engine's Drop impl.
+}
+
+/// bug_010 → feature: register a secondary local source IP on this
+/// engine. `local_addr_nbo` is network byte order (matches the rest of
+/// the C ABI — `dpdk_net_connect_opts_t.local_addr` is also NBO).
+///
+/// After this call, `dpdk_net_connect` accepts connect requests whose
+/// `local_addr` equals `local_addr_nbo` (or any previously-registered
+/// secondary, or the engine's primary `local_ip`). `local_addr == 0`
+/// in a connect request always selects the primary — the value 0 is
+/// reserved and rejected here as well.
+///
+/// Idempotent for secondaries: re-registering an already-known
+/// secondary IP is not an error. The engine's primary `local_ip` is
+/// rejected with `-EINVAL` as a caller-mistake flag (it is already
+/// accepted by `dpdk_net_connect` without registration).
+///
+/// Returns:
+///   0        success (secondary IP is registered; may or may not have been new)
+///   -EINVAL  `p` is null, or `local_addr_nbo == 0`, or the value
+///            equals the engine's primary `local_ip`.
+///
+/// Scope note: this only extends the source-IP selection whitelist.
+/// It does NOT configure the address on the host interface, does NOT
+/// install a route for it, and does NOT program per-source ARP. The
+/// application is responsible for those in the dual-NIC / multi-homed
+/// setup this is designed to support.
+///
+/// # Safety
+/// `p` must be a valid Engine pointer obtained from
+/// `dpdk_net_engine_create`, or null.
+#[no_mangle]
+pub unsafe extern "C" fn dpdk_net_engine_add_local_ip(
+    p: *mut dpdk_net_engine,
+    local_addr_nbo: u32,
+) -> i32 {
+    if p.is_null() {
+        return -libc::EINVAL;
+    }
+    let Some(e) = engine_from_raw(p) else {
+        return -libc::EINVAL;
+    };
+    // NBO → host for the engine's internal representation.
+    let ip = u32::from_be(local_addr_nbo);
+    if ip == 0 {
+        return -libc::EINVAL;
+    }
+    if ip == e.our_ip() {
+        // Primary is already accepted; treat "re-register primary" as a
+        // caller mistake to flag rather than silent no-op (matches the
+        // design's strict validation posture — silent accept would
+        // mask a bug in the caller's IP-mapping code).
+        return -libc::EINVAL;
+    }
+    // `add_local_ip` is idempotent — returns false if already registered,
+    // true if newly added. Either way the post-condition "`ip` is in the
+    // whitelist" holds, so both return 0.
+    e.add_local_ip(ip);
+    0
 }
 
 /// Pure translation: `InternalEvent` → `dpdk_net_event_t`. The caller
@@ -702,6 +817,51 @@ pub unsafe extern "C" fn dpdk_net_resolve_gateway_mac(
     }
 }
 
+/// Read `/proc/net/route` and return the default-gateway IPv4 address
+/// in *host* byte order via `*out_ip`.
+///
+/// `iface` may be NULL (accept any default route) or a NUL-terminated
+/// interface name (restrict to that iface). `out_ip` must be non-NULL.
+///
+/// MUST be called before `dpdk_net_engine_create`: `/proc/net/route`
+/// reflects the kernel's view of the route table, which goes away once
+/// DPDK binds the NIC. Pair with `dpdk_net_resolve_gateway_mac` to seed
+/// both `EngineConfig.gateway_ip` and `.gateway_mac`.
+///
+/// Returns:
+///   0 — success, `*out_ip` populated.
+///  -EINVAL — `out_ip` is NULL, or `iface` is not valid UTF-8.
+///  -ENOENT — no default route matched (including unknown iface).
+///  -EIO   — `/proc/net/route` could not be read.
+#[no_mangle]
+pub unsafe extern "C" fn dpdk_net_read_default_gateway_ip(
+    iface: *const libc::c_char,
+    out_ip: *mut u32,
+) -> i32 {
+    if out_ip.is_null() {
+        return -libc::EINVAL;
+    }
+    let iface_str = if iface.is_null() {
+        None
+    } else {
+        match CStr::from_ptr(iface).to_str() {
+            Ok(s) => Some(s),
+            // Malformed caller input, not a /proc read failure — keep
+            // this distinct from -EIO so the C caller can tell the two
+            // cases apart.
+            Err(_) => return -libc::EINVAL,
+        }
+    };
+    match dpdk_net_core::arp::read_default_gateway_ip(iface_str) {
+        Ok(ip) => {
+            *out_ip = ip;
+            0
+        }
+        Err(dpdk_net_core::Error::GatewayIpNotFound(_)) => -libc::ENOENT,
+        Err(_) => -libc::EIO,
+    }
+}
+
 /// A5.5 Task 10: pure default-substitution + range validation for the
 /// five TLP tuning knobs on `dpdk_net_connect_opts_t`. Factored out so
 /// rejection paths are unit-testable without standing up a live engine.
@@ -768,6 +928,12 @@ pub unsafe extern "C" fn dpdk_net_connect(
     let peer_ip = u32::from_be(o_opts.peer_addr);
     let peer_port = u16::from_be(o_opts.peer_port);
     let local_port = u16::from_be(o_opts.local_port);
+    // bug_010 → feature: `local_addr` (NBO on the wire) → host order for
+    // the engine. `0` stays `0` either way; non-zero engine rejects with
+    // `InvalidLocalAddr` → `-EINVAL` below when the value doesn't match
+    // any configured local IP. Validation lives in the engine (DRY) so
+    // Rust-direct callers hit the same rejection path.
+    let local_addr = u32::from_be(o_opts.local_addr);
     // A5 Task 19 / A5.5 Task 10: plumb per-connect opt-ins into
     // engine::ConnectOpts (post-substitution values).
     let connect_opts = dpdk_net_core::engine::ConnectOpts {
@@ -778,6 +944,7 @@ pub unsafe extern "C" fn dpdk_net_connect(
         tlp_skip_flight_size_gate: o_opts.tlp_skip_flight_size_gate,
         tlp_max_consecutive_probes: o_opts.tlp_max_consecutive_probes,
         tlp_skip_rtt_sample_gate: o_opts.tlp_skip_rtt_sample_gate,
+        local_addr,
     };
     match e.connect_with_opts(peer_ip, peer_port, local_port, connect_opts) {
         Ok(h) => {
@@ -786,6 +953,7 @@ pub unsafe extern "C" fn dpdk_net_connect(
         }
         Err(dpdk_net_core::Error::TooManyConns) => -libc::EMFILE,
         Err(dpdk_net_core::Error::PeerUnreachable(_)) => -libc::EHOSTUNREACH,
+        Err(dpdk_net_core::Error::InvalidLocalAddr(_)) => -libc::EINVAL,
         Err(_) => -libc::EIO,
     }
 }
@@ -1039,6 +1207,26 @@ mod tests {
     }
 
     #[test]
+    fn read_gateway_ip_null_out_returns_einval() {
+        // Null out_ip must be rejected before any /proc read.
+        let rc = unsafe {
+            dpdk_net_read_default_gateway_ip(std::ptr::null(), std::ptr::null_mut())
+        };
+        assert_eq!(rc, -libc::EINVAL);
+    }
+
+    #[test]
+    fn read_gateway_ip_unknown_iface_returns_enoent() {
+        // Filter on an iface that cannot exist on any host.
+        let iface = std::ffi::CString::new("nope_xxxxx").unwrap();
+        let mut out: u32 = 0;
+        let rc = unsafe { dpdk_net_read_default_gateway_ip(iface.as_ptr(), &mut out) };
+        assert_eq!(rc, -libc::ENOENT);
+        // out_ip must be left untouched on the error path.
+        assert_eq!(out, 0);
+    }
+
+    #[test]
     fn connect_null_engine_returns_einval() {
         let opts = dpdk_net_connect_opts_t {
             peer_addr: 0x0100_0a0a, // 10.0.0.1 in NBO (doesn't matter)
@@ -1058,6 +1246,22 @@ mod tests {
         let mut out: u64 = 0;
         let rc = unsafe { dpdk_net_connect(std::ptr::null_mut(), &opts, &mut out) };
         assert_eq!(rc, -libc::EINVAL);
+    }
+
+    // bug_010 → feature: FFI-layer null-pointer guard for
+    // `dpdk_net_engine_add_local_ip`. Happy-path (engine construction
+    // success + new-IP-accepted) + the zero-value rejection path +
+    // primary-collision rejection path all require a live Engine
+    // (DPDK/EAL) and are covered by the dpdk-net-core integration
+    // test on `Engine::add_local_ip`.
+    #[test]
+    fn add_local_ip_null_engine_returns_einval() {
+        let rc = unsafe { dpdk_net_engine_add_local_ip(std::ptr::null_mut(), 0x0100_0a0a) };
+        assert_eq!(rc, -libc::EINVAL);
+        // Value-0 on a null engine must also reject (null-check fires
+        // first; we just pin the combined behavior here).
+        let rc2 = unsafe { dpdk_net_engine_add_local_ip(std::ptr::null_mut(), 0) };
+        assert_eq!(rc2, -libc::EINVAL);
     }
 
     #[test]

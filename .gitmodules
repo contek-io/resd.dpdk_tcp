@@ -1,3 +1,12 @@
 [submodule "third_party/mtcp"]
 	path = third_party/mtcp
 	url = https://github.com/mtcp-stack/mtcp
+[submodule "third_party/packetdrill"]
+	path = third_party/packetdrill
+	url = https://github.com/google/packetdrill
+[submodule "third_party/packetdrill-testcases"]
+	path = third_party/packetdrill-testcases
+	url = https://github.com/ligurio/packetdrill-testcases
+[submodule "third_party/shivansh-tcp-ip-regression"]
+	path = third_party/shivansh-tcp-ip-regression
+	url = https://github.com/shivansh/TCP-IP-Regression-TestSuite

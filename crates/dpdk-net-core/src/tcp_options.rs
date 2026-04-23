@@ -51,7 +51,7 @@ pub struct SackBlock {
 /// we can receive the peer's 4-block ACKs without dropping the tail; the
 /// encode path (`push_sack_block`) still caps at `MAX_SACK_BLOCKS_EMIT`
 /// (3) since our outbound ACKs always include Timestamps.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct TcpOpts {
     pub mss: Option<u16>,
     pub wscale: Option<u8>,

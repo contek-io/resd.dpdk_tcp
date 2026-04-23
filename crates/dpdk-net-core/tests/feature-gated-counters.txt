@@ -1,0 +1,11 @@
+# Feature-gated counters — declared fields whose increment site is
+# compiled away in the default-features build. Each must be reachable
+# in the --all-features build.
+# Format: <name>  <feature>  # <rationale>
+
+tcp.tx_payload_bytes       obs-byte-counters   # §9.1.1 hot-path; per-burst batched; default OFF
+tcp.rx_payload_bytes       obs-byte-counters   # §9.1.1 hot-path; per-burst batched; default OFF
+fault_injector.drops       fault-injector      # A9 middleware; struct always present on C ABI; increment site compiled out in default build
+fault_injector.dups        fault-injector      # A9 middleware; struct always present on C ABI; increment site compiled out in default build
+fault_injector.reorders    fault-injector      # A9 middleware; struct always present on C ABI; increment site compiled out in default build
+fault_injector.corrupts    fault-injector      # A9 middleware; struct always present on C ABI; increment site compiled out in default build

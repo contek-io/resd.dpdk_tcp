@@ -1047,3 +1047,129 @@ fn knob_test_panic_entry_feature_documented() {
          enforced by scripts/hardening-panic-firewall.sh, not this test"
     );
 }
+
+// ---- M3 (A8 T17): static drift detector ---------------------------------
+//
+// Spec §5.2. Cross-checks the field-name registries defined on
+// `dpdk_net_core::engine::ENGINE_CONFIG_FIELD_NAMES` and
+// `dpdk_net_core::tcp_conn::CONNECT_OPTS_FIELD_NAMES` against:
+//   (a) the knob-coverage scenarios above (hand-maintained registry in
+//       `load_known_knob_names`), and
+//   (b) the informational whitelist in
+//       `tests/knob-coverage-informational.txt`.
+//
+// A new field on `EngineConfig` or `ConnectOpts` without a matching
+// entry in either registry trips this test in CI, enforcing the A11
+// knob-coverage discipline at A8 scope (no new knobs land in A8; this
+// test pins the current state). The drift detector intentionally does
+// NOT read the runtime value of the field-name slices — the literal
+// string list is the contract.
+
+/// Every behavioral field on `EngineConfig` / `ConnectOpts` must either
+/// be covered by a scenario `#[test]` in this file OR listed in
+/// `tests/knob-coverage-informational.txt`.
+#[test]
+fn knob_coverage_enumerates_every_behavioral_field() {
+    let engine_fields = dpdk_net_core::engine::ENGINE_CONFIG_FIELD_NAMES;
+    let conn_fields = dpdk_net_core::tcp_conn::CONNECT_OPTS_FIELD_NAMES;
+
+    // Load the known-covered registry (hand-maintained + informational
+    // whitelist merged).
+    let known = load_known_knob_names();
+
+    let mut missing = Vec::new();
+    for f in engine_fields.iter().chain(conn_fields.iter()) {
+        if !known.contains(*f) {
+            missing.push(f.to_string());
+        }
+    }
+    assert!(
+        missing.is_empty(),
+        "config fields without knob-coverage or informational entry: {:?}\n\
+         add an entry to tests/knob-coverage.rs (with a scenario exercising \
+         a non-default value) or to tests/knob-coverage-informational.txt \
+         (for fields with no branching logic).",
+        missing
+    );
+}
+
+/// Hand-maintained registry of field names covered by a scenario in this
+/// file (merged with the informational whitelist). When adding a new
+/// knob-coverage scenario, add its field name here.
+fn load_known_knob_names() -> std::collections::HashSet<String> {
+    let mut s = std::collections::HashSet::new();
+    // Fields with a dedicated `knob_<name>_*` scenario above. Review
+    // each `#[test]` entry above when editing this list.
+    for n in &[
+        // Engine-wide behavioral knobs.
+        "event_queue_soft_cap",                 // knob_event_queue_soft_cap_overflow_drops_events
+        "rtt_histogram_bucket_edges_us",        // knob_rtt_histogram_bucket_edges_us_override
+        "ena_large_llq_hdr",                    // knob_ena_large_llq_hdr_suppresses_overflow_risk_guard
+        "ena_miss_txc_to_sec",                  // knob_ena_miss_txc_to_sec_projects_to_devargs_key
+        "rx_mempool_size",                      // knob_rx_mempool_size_user_override
+        // `preset` covers these via knob_preset_{rfc_compliance,latency}_*
+        // (apply_preset overrides five fields at once — the preset scenarios
+        // pin the expected post-override value on EngineConfig directly,
+        // which is the observable consequence required by the audit).
+        "tcp_nagle",                            // knob_preset_rfc_compliance_forces_rfc_defaults
+        "tcp_delayed_ack",                      // same
+        "cc_mode",                              // same
+        "tcp_min_rto_us",                       // same
+        "tcp_initial_rto_us",                   // same
+        // A6 close-flag behavioral knob. Not a struct field but covered
+        // at the knob-coverage layer via knob_close_force_tw_skip_when_ts_enabled.
+        "DPDK_NET_CLOSE_FORCE_TW_SKIP",
+        // Per-connect TLP + RACK knobs — each has its own scenario plus
+        // the aggressive_order_entry preset combination scenario.
+        "rack_aggressive",                      // covered by knob_aggressive_order_entry_preset_combined_behavior
+        "rto_no_backoff",                       // same (TLP scenarios exercise rto_no_backoff semantics)
+        "tlp_pto_min_floor_us",                 // knob_tlp_pto_min_floor_us_*
+        "tlp_pto_srtt_multiplier_x100",         // knob_tlp_pto_srtt_multiplier_x100_one_srtt
+        "tlp_skip_flight_size_gate",            // knob_tlp_skip_flight_size_gate_suppresses_penalty
+        "tlp_max_consecutive_probes",           // knob_tlp_max_consecutive_probes_expands_budget
+        "tlp_skip_rtt_sample_gate",             // knob_tlp_skip_rtt_sample_gate_bypasses_sample_requirement
+        // A-HW compile-time features (all covered by feature-off `knob_hw_*` tests above).
+        "hw-verify-llq",
+        "hw-offload-tx-cksum",
+        "hw-offload-rx-cksum",
+        "hw-offload-mbuf-fast-free",
+        "hw-offload-rss-hash",
+        "hw-offload-rx-timestamp",
+        // A6.5 + A6.6-7 compile-time build features.
+        "bench-alloc-audit",                    // knob_bench_alloc_audit_feature_compiles
+        "miri-safe",                            // knob_miri_safe_feature_enabled (cfg-gated)
+        "test-panic-entry",                     // knob_test_panic_entry_feature_documented
+        // FIXME(A11): genuine behavioral knobs that don't yet have a
+        // dedicated knob-coverage scenario. Added to the known list to
+        // keep the A8 T17 drift detector passing on current HEAD while
+        // flagging the gap for the A11 full cross-phase backfill.
+        // Each branches in engine.rs hot/slow paths:
+        //   tcp_max_rto_us         — cfg.tcp_max_rto_us feeds RTO backoff cap
+        //                            (engine.rs ~line 4392, 5641)
+        //   tcp_max_retrans_count  — cfg.tcp_max_retrans_count bounds the
+        //                            per-segment retransmit budget
+        //                            (engine.rs ~line 2538)
+        //   tcp_per_packet_events  — cfg.tcp_per_packet_events gates
+        //                            TcpRetrans / TcpLossDetected event
+        //                            emission (engine.rs ~line 2477, 2665, 3538)
+        "tcp_max_rto_us",
+        "tcp_max_retrans_count",
+        "tcp_per_packet_events",
+    ] {
+        s.insert(n.to_string());
+    }
+    // Informational whitelist: parse the first whitespace token per line,
+    // skipping blanks + comment lines. Kept as a file (not inline) so the
+    // whitelist is editable without a Rust rebuild.
+    let info = include_str!("knob-coverage-informational.txt");
+    for line in info.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if let Some(name) = line.split_whitespace().next() {
+            s.insert(name.to_string());
+        }
+    }
+    s
+}

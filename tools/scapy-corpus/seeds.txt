@@ -1,0 +1,6 @@
+i8_fin_piggyback_multi_seg: 0xA9E01
+overlapping_segments:       0xA9E02
+malformed_options:          0xA9E03
+timestamp_wraparound:       0xA9E04
+sack_blocks_outside_window: 0xA9E05
+rst_invalid_seq:            0xA9E06

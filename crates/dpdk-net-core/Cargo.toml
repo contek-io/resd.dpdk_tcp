@@ -9,6 +9,8 @@ dpdk-net-sys = { path = "../dpdk-net-sys" }
 libc.workspace = true
 smallvec = { workspace = true }
 thiserror.workspace = true
+arrayvec = { version = "0.7", optional = true }
+rand = { version = "0.8", optional = true, default-features = false, features = ["small_rng"] }
 
 [features]
 default = [
@@ -58,6 +60,10 @@ hw-offloads-all = [
     "hw-offload-rss-hash",
     "hw-offload-rx-timestamp",
 ]
+# A7: gates the test-only server FSM (src/test_server.rs), the virtual
+# clock swap in clock.rs, and the TX-intercept shim in test_tx_intercept.rs.
+# Never on in production builds.
+test-server = []
 # Meta for the A8 counter-coverage audit.
 obs-all = ["obs-byte-counters", "obs-poll-saturation"]
 # A6.5 Group 5: counting GlobalAlloc wrapper + steady-state
@@ -78,6 +84,20 @@ bench-alloc-audit-backtrace = ["bench-alloc-audit"]
 # error, counters, clock) run fully under miri to detect UB,
 # aliasing, and integer-overflow hazards.
 miri-safe = []
+# A9 test-inject: synthetic RX-frame injection for Scapy / fuzz / A7 packetdrill-shim.
+# Default OFF. Gates `Engine::inject_rx_frame` + `Engine::inject_rx_chain` and the
+# lazily-created test-inject mempool. Release builds carry zero of it. Cbindgen
+# runs without the feature, so the functions never appear in `dpdk_net.h`.
+test-inject = []
+# A9 fault-injector: smoltcp-pattern post-PMD-RX / pre-L2 middleware that
+# drops, duplicates, reorders, or corrupts packets per an env-var-configured
+# rate spec. Default OFF — release builds carry zero of it. Pulls in
+# `arrayvec` (reorder ring) and `rand/small_rng` (PRNG). See fault_injector.rs
+# for the spec format and Task 6 for the process-body wiring.
+fault-injector = ["dep:arrayvec", "dep:rand"]
+
+[dev-dependencies]
+proptest = "1"
 
 [lints.rust]
 unsafe_op_in_unsafe_fn = "warn"

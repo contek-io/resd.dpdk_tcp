@@ -1,0 +1,52 @@
+name: a8-counter-coverage
+
+# Phase A8 Task 23 (spec §6.1). Two-build static counter-coverage audit
+# (--no-default-features and --all-features) + dynamic counter-coverage
+# integration test + observability smoke + knob-coverage static drift.
+#
+# DPDK bootstrap: Ubuntu 24.04 LTS ships libdpdk-dev 23.11 via apt,
+# which satisfies the crate's `pkg_config::Config::atleast_version("23.11")`
+# probe (see crates/dpdk-net-sys/build.rs). No manual DPDK compile needed.
+
+on: [push, pull_request]
+
+jobs:
+  counter-coverage:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install system deps (DPDK + build toolchain)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+              libdpdk-dev pkg-config clang libclang-dev \
+              libnuma-dev ripgrep
+          pkg-config --modversion libdpdk
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Static counter-coverage (default-off build)
+        run: bash scripts/counter-coverage-static.sh --no-default-features
+
+      - name: Static counter-coverage (all-features build)
+        # NOTE: `--all-features` here is safe as of A8 — no features
+        # conflict with the default build. The A9 `fault-injector`
+        # feature is not yet present in the workspace.
+        run: bash scripts/counter-coverage-static.sh --all-features
+
+      - name: Dynamic counter-coverage
+        run: |
+          timeout 240 cargo test -p dpdk-net-core --test counter-coverage \
+              --features test-server -- --test-threads=1
+
+      - name: Observability smoke
+        run: |
+          timeout 180 cargo test -p dpdk-net-core --test obs_smoke \
+              --features test-server
+
+      - name: Knob-coverage static drift
+        run: bash scripts/knob-coverage-static.sh

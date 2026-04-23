@@ -1,0 +1,59 @@
+name: a8-packetdrill-corpus
+
+# Phase A8 Task 23 (spec §6.1). Shim-driven corpus gates: ligurio +
+# shivansh + google packetdrill corpora. Each corpus test pins its
+# runnable count and fails on any script that is classified runnable
+# but errors at runtime (orphan-skip check).
+#
+# S2 adds server-mode support via patch 0006-server-drain.patch and the
+# smoke_server_mode.rs test, so this workflow also runs the server-mode
+# smoke test.
+#
+# Shim build (tools/packetdrill-shim/build.sh) uses git/bison/flex/make
+# plus libdpdk to patch + compile the upstream google/packetdrill source
+# against libdpdk_net.a (dpdk-net crate built with the test-server
+# feature).
+
+on: [push, pull_request]
+
+jobs:
+  corpus:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install system deps (DPDK + shim build toolchain)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+              libdpdk-dev pkg-config clang libclang-dev libnuma-dev \
+              bison flex make gcc
+          pkg-config --modversion libdpdk
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Build packetdrill shim
+        run: bash tools/packetdrill-shim/build.sh
+
+      - name: Smoke — server mode (S2)
+        run: |
+          timeout 300 cargo test -p packetdrill-shim-runner \
+              --features test-server --test smoke_server_mode
+
+      - name: Ligurio corpus
+        run: |
+          timeout 900 cargo test -p packetdrill-shim-runner \
+              --features test-server --test corpus_ligurio
+
+      - name: Shivansh corpus
+        run: |
+          timeout 900 cargo test -p packetdrill-shim-runner \
+              --features test-server --test corpus_shivansh
+
+      - name: Google upstream corpus
+        run: |
+          timeout 900 cargo test -p packetdrill-shim-runner \
+              --features test-server --test corpus_google

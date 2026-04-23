@@ -24,6 +24,10 @@ pub enum Error {
     GatewayMacNotFound(u32),
     #[error("failed to read /proc/net/arp: {0}")]
     ProcArpRead(String),
+    #[error("default gateway not found in /proc/net/route (iface filter: {0:?})")]
+    GatewayIpNotFound(Option<String>),
+    #[error("failed to read /proc/net/route: {0}")]
+    ProcRouteRead(String),
     #[error("could not read NIC MAC for port {0}: rte_errno={1}")]
     MacAddrLookup(u16, i32),
     #[error("too many open connections (max_connections reached)")]
@@ -48,6 +52,19 @@ pub enum Error {
     /// or had an equal-adjacent pair. `engine_create` rejects with null-return.
     #[error("invalid histogram edges (not strictly monotonic)")]
     InvalidHistogramEdges,
+    /// bug_010 → feature: `ConnectOpts.local_addr` is non-zero but does not
+    /// match `EngineConfig.local_ip` nor appear in `secondary_local_ips`.
+    /// Mapped to `-EINVAL` at the FFI boundary (`dpdk_net_connect`).
+    #[error("invalid local source IP for connect: {0:#x}")]
+    InvalidLocalAddr(u32),
+    /// A7 (test-server): `Engine::listen`, `accept_next`, or a related
+    /// test-server FFI got an argument that fails validation — duplicate
+    /// (ip,port), listen-id overflow, unknown listen handle, etc.
+    /// Never exists on a default build — the variant is only constructed
+    /// under `feature = "test-server"`.
+    #[cfg(feature = "test-server")]
+    #[error("invalid argument")]
+    InvalidArgument,
 }
 
 #[cfg(test)]

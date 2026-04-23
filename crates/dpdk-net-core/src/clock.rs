@@ -1,6 +1,9 @@
 use std::sync::OnceLock;
 use std::time::Instant;
 
+#[cfg(feature = "test-server")]
+use std::cell::Cell;
+
 /// Single process-wide TSC calibration shared across all engines,
 /// per spec §7.5.
 #[derive(Debug, Clone, Copy)]
@@ -36,6 +39,7 @@ pub fn rdtsc() -> u64 {
     compile_error!("dpdk-net-core currently only supports x86_64");
 }
 
+#[cfg(not(feature = "test-server"))]
 #[inline]
 pub fn now_ns() -> u64 {
     let e = tsc_epoch();
@@ -43,6 +47,28 @@ pub fn now_ns() -> u64 {
     // delta * (ns_per_tsc_scaled / 2^32) + t0_ns
     let scaled = ((delta as u128) * (e.ns_per_tsc_scaled as u128)) >> 32;
     e.t0_ns + scaled as u64
+}
+
+#[cfg(feature = "test-server")]
+thread_local! {
+    static VIRT_NS: Cell<u64> = const { Cell::new(0) };
+}
+
+#[cfg(feature = "test-server")]
+#[inline]
+pub fn now_ns() -> u64 {
+    VIRT_NS.with(|c| c.get())
+}
+
+/// Set the thread-local virtual clock. Monotonicity is enforced per-thread:
+/// a call with `ns < current` panics.
+#[cfg(feature = "test-server")]
+pub fn set_virt_ns(ns: u64) {
+    VIRT_NS.with(|c| {
+        let prev = c.get();
+        assert!(ns >= prev, "virtual clock must be monotonic");
+        c.set(ns);
+    });
 }
 
 fn calibrate() -> TscEpoch {
@@ -103,6 +129,7 @@ mod tests {
     }
 
     #[cfg_attr(miri, ignore = "uses x86_64 _rdtsc inline asm; miri rejects inline asm")]
+    #[cfg(not(feature = "test-server"))]
     #[test]
     fn now_ns_within_one_percent_of_wall_clock() {
         // Force calibration before capturing wall_start so the 50ms calibration

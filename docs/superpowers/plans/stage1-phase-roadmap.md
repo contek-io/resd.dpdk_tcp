@@ -20,14 +20,15 @@
 | A5.5 | Event-log forensics + in-flight introspection + TLP tuning (emission-time ts, queue overflow counter, stats getter, per-conn TLP knobs) | **Complete** ✓ | `2026-04-19-stage1-phase-a5-5-event-log-forensics-tlp-tuning.md` |
 | A-HW | ENA hardware offload enablement (LLQ verify + TX/RX checksum + MBUF_FAST_FREE + RSS-hash plumbing) | **Complete** ✓ | `2026-04-19-stage1-phase-a-hw-ena-offload.md` |
 | A-HW+ | ENA observability + tuning knobs (WC verify + ENI xstats + per-queue xstats + large_llq_hdr / miss_txc_to knobs) | **Complete** ✓ | `2026-04-20-stage1-phase-a-hw-plus-ena-obs-knobs.md` |
-| A6 | Public API surface completeness **+ per-connection RTT histogram** (merged from former A5.6) | Not started | — |
-| A6.5 | Hot-path allocation elimination (reusable scratch, streaming csum, SmallVec, zero-copy reassembly) | Complete | phase-a6-5-complete |
-| A6.6 | RX zero-copy (scatter-gather iovec API, in-order delivery-path mbuf-ref rework, LRO-compatible multi-segment, `rx_mempool_size` knob) | Complete[^a66fused] | phase-a6-6-7-complete |
-| A6.7 | FFI safety audit & hardening (miri, cbindgen header-drift CI, ABI snapshot, panic-firewall test, no-alloc-on-hot-path audit, C++ consumer under ASan/UBSan/LSan) | Complete | phase-a6-6-7-complete |
-| A7 | Loopback test server + packetdrill-shim | Not started | — |
-| A8 | tcpreq + observability gate | Not started | — |
-| A9 | TCP-Fuzz differential + smoltcp FaultInjector | Not started | — |
+| A6 | Public API surface completeness **+ per-connection RTT histogram** (merged from former A5.6) | **Complete** ✓ | `2026-04-19-stage1-phase-a6-public-api-completeness.md` |
+| A6.5 | Hot-path allocation elimination (reusable scratch, streaming csum, SmallVec, zero-copy reassembly) | **Complete** ✓ | `phase-a6-5-complete` |
+| A6.6 | RX zero-copy (scatter-gather iovec API, in-order delivery-path mbuf-ref rework, LRO-compatible multi-segment, `rx_mempool_size` knob) | **Complete** ✓[^a66fused] | `phase-a6-6-7-complete` |
+| A6.7 | FFI safety audit & hardening (miri, cbindgen header-drift CI, ABI snapshot, panic-firewall test, no-alloc-on-hot-path audit, C++ consumer under ASan/UBSan/LSan) | **Complete** ✓ | `phase-a6-6-7-complete` |
+| A7 | Loopback test server + packetdrill-shim | **Complete** ✓ | `2026-04-21-stage1-phase-a7-loopback-test-server-packetdrill-shim.md` |
+| A8 | tcpreq + observability gate | **Complete** ✓ | `2026-04-22-stage1-phase-a8-tcpreq-observability-gate.md` |
+| A9 | Property + bespoke fuzzing + smoltcp FaultInjector | **Complete** ✓ | `phase-a9-complete` |
 | A10 | Benchmark harness (micro + e2e + stress) | Not started | — |
+| A10.5 | Layer H correctness under WAN-condition fault injection (netem matrix) | Not started | — |
 | A11 | Stage 1 ship gate verification | Not started | — |
 | A12 | Documentation (user + maintainer + future-work) + Stage 1 release tag | Not started | — |
 | A13 | HTTP/1.1 + TLS client integration + bench (via `contek-io/cpp_common`) | Not started | — |
@@ -579,24 +580,30 @@ Group 3 — audit artifacts:
 
 ---
 
-## A9 — TCP-Fuzz differential + smoltcp FaultInjector
+## A9 — Property + bespoke fuzzing + smoltcp FaultInjector
 
-**Goal:** Differential fuzzing vs Linux TCP (in RFC-compliance-preset mode). Port smoltcp's `FaultInjector` pattern as a stackable RX middleware for local soak testing.
+**Goal:** Land property + bespoke fuzz coverage of the Stage 1 TCP stack. proptest suites, cargo-fuzz targets (pure-module + one persistent-mode engine target), Scapy adversarial corpus driven through a test-inject RX hook, smoltcp-pattern FaultInjector RX middleware. Closes I-8 FYI from `docs/superpowers/reviews/phase-a6-6-7-rfc-compliance.md`.
 
-**Spec refs:** §10.5, §10.6.
+**Spec refs:** §10.6. (§10.5 Layer E differential-vs-Linux deferred to new Stage-2 phase S2-A.)
 
 **Deliverables:**
-- `tools/tcp-fuzz-differential/` — TCP-Fuzz driver configured to run `libdpdk_net` in `preset=rfc_compliance` against Linux TCP as oracle.
-- Regression-fuzz track: same inputs compared across `dpdk_net` releases.
-- CI smoke run per merge; 72h continuous run on a dedicated box per stage cut.
-- `FaultInjector` RX middleware — random drop/duplicate/reorder/corrupt with configurable rates, enabled via env var.
-- Property tests (proptest) for TCP options encode/decode and reassembly invariants.
-- cargo-fuzz targets: `tcp_input` with random pre-established state; IP/TCP header parser.
-- Scapy-based adversarial test corpus for overlapping segments, malformed options, timestamp wraparound.
+- 6 `proptest` suites under `crates/dpdk-net-core/tests/proptest_*.rs` (tcp_options, tcp_seq, tcp_sack, tcp_reassembly, paws, rack_xmit_ts)
+- 7 cargo-fuzz targets under `crates/dpdk-net-core/fuzz/fuzz_targets/` (6 pure-module T1 + 1 persistent-mode engine T1.5)
+- `crates/dpdk-net-core/src/fault_injector.rs` + counters + engine wiring, behind `fault-injector` cargo feature
+- `Engine::inject_rx_frame` + `inject_rx_chain` (behind `test-inject` cargo feature) — A7 coordination contract
+- `crates/dpdk-net-core/src/test_fixtures.rs` — hoisted `make_test_engine` for cross-crate test reuse
+- `tools/scapy-corpus/` (6 Python Scapy scripts generating .pcap + .manifest.json pairs)
+- `tools/scapy-fuzz-runner/` — Rust binary replaying pcap corpora via the test-inject hook
+- `scripts/fuzz-smoke.sh` (per-merge CI, 30s per target × 7) + `scripts/fuzz-long-run.sh` (per-stage-cut, 72h dedicated box) + `scripts/scapy-corpus.sh` (regen)
+- I-8 closure in `tcp_input.rs` + directed multi-seg regression test via dispatch
+- `.github/workflows/a9-fuzz.yml` — three parallel CI jobs (fuzz-smoke, scapy-corpus-replay, fault-injector-compile)
+- End-of-phase mTCP + RFC review reports
 
-**Dependencies:** A6.
+**Deferred to Stage 2 (S2-A):** differential-vs-Linux fuzz, `preset=rfc_compliance` engine knob, TCP-Fuzz vendor (zouyonghao/TCP-Fuzz), Linux netns oracle plumbing, divergence-normalisation layer. These combine with spec §10.7 Layer G WAN A/B in S2-A — both need the same Linux-oracle infrastructure.
 
-**Rough scale:** ~15 tasks.
+**Dependencies:** A6 (full API surface stable), A6.6-7 (test-inject hook integrates with the chain-walk ingest + FFI shape).
+
+**Rough scale:** ~26 tasks.
 
 ---
 
@@ -633,6 +640,45 @@ Group 3 — audit artifacts:
 
 ---
 
+## A10.5 — Layer H correctness under WAN-condition fault injection
+
+**Numbering note:** Inserted after A10 as a focused correctness pack. Uses the decimal "A10.5" tag (per the A5.5 / A6.5 precedent) because the scope is correctness-assertion follow-on that reuses A10's netem plumbing without changing public API. Runs serially between A10 and A11.
+
+**Goal:** Promote spec §10.10's informal "end-to-end smoke under `tc netem` loss/delay" to a named Layer H test phase: formal netem matrix with liveness + invariant assertions, not performance measurement. A10 measures *how fast* the stack runs under adversity; A10.5 asserts *that the stack stays correct* under the same adversity.
+
+**Spec refs:** §10.8 (Layer H — Stage 1 subset only; PMTU-blackholing deferred to Stage 2), §10.10 (formalizes the Stage 1 netem ship-gate smoke).
+
+**Deliverables:**
+- `tools/layer-h-correctness/` — netem matrix runner producing pass/fail per scenario, not p50/p99/p999. Reuses A10's `bench-stress` netem scaffolding (driver, precondition checker, scenario harness) as a library; only the assertion layer is new.
+- Netem matrix (Stage 1 subset of §10.8):
+  - Delay: +20 ms, +50 ms, +200 ms (each with and without jitter)
+  - Loss: 0.1%, 1%, 5% random; 1% correlated bursts
+  - Duplication: 0.5%, 2%
+  - Reordering: depth 3
+  - Corruption: 0.01% (checksum-fail drops are expected behaviour; asserted via `rx_drop_cksum_bad` signal)
+- Composable with A9's `FaultInjector` env-var side channel so RX-side and WAN-side adversity can be stacked for the most demanding scenarios.
+- Assertion table (per scenario):
+  - Connection stays in ESTABLISHED for the configured duration — no unexpected transition to CLOSED or ERROR
+  - `tcp.tx_retrans` bounded by per-conn `max_retrans_count` knob; no unbounded retransmit storms
+  - FSM state ∈ legal set per §6.1 throughout the run (sampled via `dpdk_net_conn_stats`)
+  - `obs.events_dropped == 0` at steady load
+  - Per-scenario expected counter-signals table (e.g. 1% loss → nonzero `tcp.tx_retrans`; correlated-burst loss → nonzero `tcp.tx_rack_loss`; reorder-3 → nonzero `rx_dup_ack` without crossing 3-dup-ACK fast-retransmit unless the active preset permits it)
+- CI: Layer-H smoke (one representative bucket per netem dimension) per merge; full matrix per stage cut, report to `docs/superpowers/reports/layer-h-<date>.md`.
+- End-of-phase mTCP + RFC review gates (same pattern as every A3-onward phase).
+
+**Does NOT include:**
+- PMTU-blackholing scenario (drop ICMP frag-needed) — requires PLPMTUD (RFC 8899), Stage 2 (§10.8 explicit).
+- Performance / latency metrics under netem — owned by A10's `bench-stress`. Any perf regressions surfaced here are filed back as A10 follow-ups, not fixed in A10.5.
+- Layer G WAN A/B vs Linux — Stage 2 (S2-A), needs HW tap + real exchange testnet + tap-jitter calibration.
+- New counters or events — Layer H asserts against the existing observability surface. If a scenario reveals a gap, it's filed for a later phase, not smuggled into A10.5.
+- Fuzzing or proptest coverage — A9 territory.
+
+**Dependencies:** A10 (netem harness + `bench-stress` scaffolding), A9 (FaultInjector for composed RX + WAN adversity). Blocks A11.
+
+**Rough scale:** ~6–8 tasks (netem matrix runner reusing A10 scaffolding, assertion-table framework, ~5 scenario implementations plus composed RX+WAN cases, CI smoke + per-stage-cut wiring, end-of-phase review reports).
+
+---
+
 ## A11 — Stage 1 ship gate verification
 
 **Goal:** Run every Stage 1 gate from spec §10.10 and §11.9. Publish the results as the Stage 1 ship artifact.
@@ -640,12 +686,12 @@ Group 3 — audit artifacts:
 **Spec refs:** §10.10, §11.9.
 
 **Deliverables:**
-- Documented pass matrix: Layer A unit tests (100%), Layer B packetdrill runnable subset (100%), Layer C tcpreq MUST rules (100%), observability smoke, e2e smoke against chosen test peer (§13 nice-to-have resolved), §11 microbench targets met, §11.3 e2e p999 within documented bound of HW RTT, §11.4 stress matrix all green.
+- Documented pass matrix: Layer A unit tests (100%), Layer B packetdrill runnable subset (100%), Layer C tcpreq MUST rules (100%), Layer H netem correctness matrix (100% of Stage 1 scenarios from A10.5), observability smoke, e2e smoke against chosen test peer (§13 nice-to-have resolved), §11 microbench targets met, §11.3 e2e p999 within documented bound of HW RTT, §11.4 stress matrix all green.
 - `docs/superpowers/reports/stage1-ship-report.md` — signed off with commit SHAs and host/NIC/DPDK versions.
 
 **Does NOT include:** the `stage-1-ship` git tag — that moves to A12 after documentation lands.
 
-**Dependencies:** A1–A10 all complete.
+**Dependencies:** A1–A10.5 all complete.
 
 **Rough scale:** ~5 tasks (mostly verification + reporting).
 
@@ -810,6 +856,26 @@ The PR is reviewed and merged in `contek-io/cpp_common`'s own process; this repo
 
 ---
 
+## S2-A — Differential-vs-Linux fuzz + Layer G WAN A/B
+
+**Goal:** Differential-vs-Linux fuzzing (deferred from A9) + Layer G WAN A/B harness (spec §10.7). Both share Linux-oracle infrastructure; unified phase introduces it once.
+
+**Spec refs:** §10.5 (Layer E), §10.7 (Layer G).
+
+**Deliverables:**
+- `preset=rfc_compliance` engine-wide knob (cc_mode=reno, delayed-ACK on ~40 ms, minRTO=200 ms, Nagle default) — ownership: this phase if A7 hasn't introduced it for packetdrill needs
+- `third_party/tcp-fuzz/` submodule (zouyonghao/TCP-Fuzz)
+- `tools/tcp-fuzz-differential/` driver running libdpdk_net + Linux TCP in same-host netns; divergence-normalisation layer (ISS, TSecr skew, etc.)
+- `tools/wan-ab-bench/` — pcap replay + HW-timestamp tap harness + tap-jitter calibration
+- §6.4 deviation row for `preset=rfc_compliance`; knob-coverage scenario in `tests/knob-coverage.rs` (if not already introduced by A7)
+- CI smoke + per-stage-cut 72 h run extensions
+
+**Dependencies:** A11 (Stage 1 ship). S2-A is the first Stage 2 hardening phase.
+
+**Rough scale:** ~14 tasks (~6 differential + ~8 Layer G).
+
+---
+
 ## Cross-phase process notes
 
 - Each per-phase plan file gets its date-prefixed name: `YYYY-MM-DD-stage1-phase-aN-<slug>.md`. Prefix with the date the plan is written, not the phase number.
@@ -821,3 +887,12 @@ The PR is reviewed and merged in `contek-io/cpp_common`'s own process; this repo
 - After a phase ships, tag: `git tag -a phase-aN-complete -m "Phase AN: <title>"`.
 - Update the "Status" column in this file when a phase starts (→ In progress) or ships (→ Complete, link the plan file if not already there).
 - The spec at `docs/superpowers/specs/2026-04-17-dpdk-tcp-design.md` is the single source of truth for what Stage 1 actually needs. If a phase reveals a spec gap or contradiction, amend the spec first (in a separate commit), then the plan.
+
+### Preset=rfc_compliance ownership
+
+The `preset=rfc_compliance` engine-wide knob (cc_mode=reno, delayed-ACK on ~40 ms, minRTO=200 ms, Nagle default) is owned by whichever Stage-1 phase first needs it:
+
+- If A7 curates a packetdrill subset that includes scripts requiring RFC behaviour, A7 introduces the preset.
+- If A7's runnable subset matches trading-latency defaults (RFC-only scripts marked SKIPPED), Stage-1 ships without the preset; S2-A introduces it for differential + Layer G.
+
+A9 does NOT introduce the preset (differential-vs-Linux deferred; all A9 fuzz/property tests operate against the engine's default config or override individual knobs per test case).

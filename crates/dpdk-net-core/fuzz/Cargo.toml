@@ -1,0 +1,72 @@
+[package]
+name = "dpdk-net-core-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+# Empty [workspace] table marks this as a standalone sub-Cargo-project so
+# it is not pulled into the parent `dpdk-net-core` / root workspace. The
+# root Cargo.toml also lists it in `workspace.exclude` for documentation.
+[workspace]
+
+[dependencies]
+libfuzzer-sys = "0.4"
+arbitrary = { version = "1", features = ["derive"] }
+dpdk-net-core = { path = "..", features = ["test-inject"] }
+# Direct dep for the `tcp_reassembly` target: it names `rte_mbuf` in a
+# `NonNull<rte_mbuf>` pointer when seeding a fake mbuf backing (mirrors
+# the pattern in `tests/proptest_tcp_reassembly.rs`). No other target
+# references sys symbols.
+dpdk-net-sys = { path = "../../dpdk-net-sys" }
+
+[[bin]]
+name = "tcp_options"
+path = "fuzz_targets/tcp_options.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "tcp_sack"
+path = "fuzz_targets/tcp_sack.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "tcp_reassembly"
+path = "fuzz_targets/tcp_reassembly.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "tcp_state_fsm"
+path = "fuzz_targets/tcp_state_fsm.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "tcp_seq"
+path = "fuzz_targets/tcp_seq.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "header_parser"
+path = "fuzz_targets/header_parser.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "engine_inject"
+path = "fuzz_targets/engine_inject.rs"
+test = false
+doc = false
+bench = false

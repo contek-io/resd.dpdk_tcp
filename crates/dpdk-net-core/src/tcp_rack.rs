@@ -96,22 +96,23 @@ pub fn compute_reo_wnd_us(rack_aggressive: bool, min_rtt_us: u32, srtt_us: Optio
 /// - `e` is NOT sacked, NOT already lost, AND still in flight
 ///   (`e.end_seq > snd_una`), AND
 /// - `e.seq == snd_una` (the front entry always retransmits) OR
-///   `e.xmit_us + RACK.rtt + RACK.reo_wnd <= now_us` (age expired).
+///   `now - e.xmit_ts >= RACK.rtt + RACK.reo_wnd` (age expired).
 ///
 /// `rtt_us` maps to `rtt_est.srtt_us().unwrap_or(rack.min_rtt_us)` at
 /// the call site — RFC 8985 calls this `RACK.rtt`, but we do not carry
-/// a dedicated `rack.rtt_us` field. Saturating arithmetic keeps the
-/// age check sound across the monotonic-clock wraparound boundary
-/// (u32 µs wraps ~71 min).
+/// a dedicated `rack.rtt_us` field. Arithmetic is done in u64 ns to
+/// match sibling `RackState::detect_lost`; u64 ns wraps only every
+/// ~584 years so the age check stays sound across any realistic
+/// monotonic-clock range (vs. the ~71-min horizon of a u32 µs space).
 pub fn rack_mark_losses_on_rto(
     entries: &VecDeque<RetransEntry>,
     snd_una: u32,
     rtt_us: u32,
     reo_wnd_us: u32,
-    now_us: u32,
+    now_ns: u64,
 ) -> Vec<u16> {
     let mut out = Vec::new();
-    rack_mark_losses_on_rto_into(entries, snd_una, rtt_us, reo_wnd_us, now_us, &mut out);
+    rack_mark_losses_on_rto_into(entries, snd_una, rtt_us, reo_wnd_us, now_ns, &mut out);
     out
 }
 
@@ -127,7 +128,7 @@ pub fn rack_mark_losses_on_rto_into(
     snd_una: u32,
     rtt_us: u32,
     reo_wnd_us: u32,
-    now_us: u32,
+    now_ns: u64,
     out: &mut Vec<u16>,
 ) {
     for (i, e) in entries.iter().enumerate() {
@@ -139,12 +140,32 @@ pub fn rack_mark_losses_on_rto_into(
             // Already cum-ACKed; prune_below will drop it shortly.
             continue;
         }
-        let xmit_us = (e.xmit_ts_ns / 1_000) as u32;
-        let age_expired = xmit_us.saturating_add(rtt_us).saturating_add(reo_wnd_us) <= now_us;
-        if e.seq == snd_una || age_expired {
+        if e.seq == snd_una || rto_age_expired(e.xmit_ts_ns, now_ns, rtt_us, reo_wnd_us) {
             out.push(i as u16);
         }
     }
+}
+
+/// Pure arithmetic for the §6.3 age clause.
+///
+/// Returns true iff the entry's age (`now_ns - xmit_ns`) has reached
+/// `rtt_us + reo_wnd_us` (both promoted to ns). Uses u64 ns throughout
+/// to avoid the u32 µs wrap (~71 min) that previously bit
+/// long-lived trading flows via silent dropped age expirations.
+/// `saturating_sub` preserves correctness for the (practically
+/// impossible but defensible) case where `now_ns < xmit_ns` — the
+/// age saturates to 0 and the clause returns false.
+#[inline]
+pub(crate) fn rto_age_expired(
+    xmit_ns: u64,
+    now_ns: u64,
+    rtt_us: u32,
+    reo_wnd_us: u32,
+) -> bool {
+    let rtt_ns = (rtt_us as u64) * 1_000;
+    let reo_ns = (reo_wnd_us as u64) * 1_000;
+    let age_ns = now_ns.saturating_sub(xmit_ns);
+    age_ns >= rtt_ns + reo_ns
 }
 
 #[cfg(test)]
@@ -245,6 +266,8 @@ mod tests {
     fn rack_rto_marks_front_entry_at_snd_una() {
         // Front entry (seq == snd_una) is always marked lost regardless
         // of age — §6.3's "fire retrans for the front unacked" clause.
+        // xmit_ts_ns=u64::MAX with now_ns=0 means saturating_sub yields
+        // 0 age; the front-entry clause still fires regardless.
         let entries = deque(vec![make_entry(100, 50, u64::MAX, false, false)]);
         let lost = rack_mark_losses_on_rto(&entries, 100, 50_000, 1_000, 0);
         assert_eq!(lost, vec![0]);
@@ -252,12 +275,12 @@ mod tests {
 
     #[test]
     fn rack_rto_marks_aged_out_entries() {
-        // xmit_us=1_000 (from xmit_ts_ns=1_000_000 ns), rtt=50_000,
-        // reo_wnd=1_000, now=52_100 → 1_000 + 50_000 + 1_000 = 52_000
-        // ≤ 52_100 → lost. snd_una differs from entry.seq to isolate
-        // the age clause.
+        // xmit_ts_ns=1_000_000 (1 ms), rtt=50_000 µs, reo_wnd=1_000 µs,
+        // now_ns=52_100_000 (52.1 ms) → age_ns=51_100_000, threshold_ns
+        // = 51_000_000 → age >= threshold → lost. snd_una differs from
+        // entry.seq to isolate the age clause.
         let entries = deque(vec![make_entry(100, 50, 1_000_000, false, false)]);
-        let lost = rack_mark_losses_on_rto(&entries, 50, 50_000, 1_000, 52_100);
+        let lost = rack_mark_losses_on_rto(&entries, 50, 50_000, 1_000, 52_100_000);
         assert_eq!(lost, vec![0]);
     }
 
@@ -265,7 +288,7 @@ mod tests {
     fn rack_rto_skips_sacked_entries() {
         // Sacked entry — skipped even at seq == snd_una and ancient age.
         let entries = deque(vec![make_entry(100, 50, 0, true, false)]);
-        let lost = rack_mark_losses_on_rto(&entries, 100, 50_000, 1_000, 1_000_000);
+        let lost = rack_mark_losses_on_rto(&entries, 100, 50_000, 1_000, 1_000_000_000);
         assert!(lost.is_empty());
     }
 
@@ -273,7 +296,7 @@ mod tests {
     fn rack_rto_skips_already_lost_entries() {
         // Already-lost entry — skipped so we don't double-mark.
         let entries = deque(vec![make_entry(100, 50, 0, false, true)]);
-        let lost = rack_mark_losses_on_rto(&entries, 100, 50_000, 1_000, 1_000_000);
+        let lost = rack_mark_losses_on_rto(&entries, 100, 50_000, 1_000, 1_000_000_000);
         assert!(lost.is_empty());
     }
 
@@ -282,16 +305,17 @@ mod tests {
         // Entry range is [100, 150); snd_una=200 has advanced past 150.
         // Not in flight — prune_below handles it; helper must not touch.
         let entries = deque(vec![make_entry(100, 50, 0, false, false)]);
-        let lost = rack_mark_losses_on_rto(&entries, 200, 50_000, 1_000, 1_000_000);
+        let lost = rack_mark_losses_on_rto(&entries, 200, 50_000, 1_000, 1_000_000_000);
         assert!(lost.is_empty());
     }
 
     #[test]
     fn rack_rto_multi_segment_marks_all_eligible() {
         // Five back-to-back segments, all unacked, all past the age
-        // window (xmit_us=1_000, now_us=1_100_000 → age well beyond
-        // rtt+reo_wnd). All five must be marked; this is the A5 fix
-        // that stops tail recovery from dribbling one-segment-per-ACK.
+        // window (xmit_ts_ns=1 ms, now_ns=1.1 s → age well beyond
+        // rtt+reo_wnd=51 ms). All five must be marked; this is the A5
+        // fix that stops tail recovery from dribbling one-segment-per-
+        // ACK.
         let entries = deque(vec![
             make_entry(100, 50, 1_000_000, false, false),
             make_entry(150, 50, 1_000_000, false, false),
@@ -299,18 +323,130 @@ mod tests {
             make_entry(250, 50, 1_000_000, false, false),
             make_entry(300, 50, 1_000_000, false, false),
         ]);
-        let lost = rack_mark_losses_on_rto(&entries, 100, 50_000, 1_000, 1_100_000);
+        let lost = rack_mark_losses_on_rto(&entries, 100, 50_000, 1_000, 1_100_000_000);
         assert_eq!(lost, vec![0, 1, 2, 3, 4]);
     }
 
     #[test]
     fn rack_rto_fresh_entries_not_aged_out_not_marked() {
-        // Entry xmitted 1µs ago (xmit_us=49_999, now_us=50_000) —
-        // age=1, rtt=50_000, reo_wnd=1_000 → 49_999 + 50_000 + 1_000
-        // = 100_999, not ≤ 50_000. snd_una differs from entry.seq so
-        // the front-entry clause is also inert. Must NOT be marked.
+        // Entry xmitted 1µs ago (xmit_ts_ns=49_999_000, now_ns=
+        // 50_000_000) — age_ns=1_000, rtt+reo threshold_ns=51_000_000 →
+        // age < threshold. snd_una differs from entry.seq so the
+        // front-entry clause is also inert. Must NOT be marked.
         let entries = deque(vec![make_entry(150, 50, 49_999_000, false, false)]);
-        let lost = rack_mark_losses_on_rto(&entries, 100, 50_000, 1_000, 50_000);
+        let lost = rack_mark_losses_on_rto(&entries, 100, 50_000, 1_000, 50_000_000);
         assert!(lost.is_empty());
+    }
+
+    // ---- u32-µs wraparound regression (bug_008) ----
+
+    #[test]
+    fn rack_rto_age_expired_across_u32_us_wrap() {
+        // bug_008 regression: before the fix, `rack_mark_losses_on_rto`
+        // coerced `xmit_ts_ns / 1_000` into u32 µs and used saturating
+        // arithmetic to compare against `now_us`. Saturating add clamps
+        // at u32::MAX rather than wrapping correctly, so a xmit that
+        // lands just before the u32 µs rollover (~2^32 µs ≈ 71m35s) and
+        // a `now` that has rolled over would never mark the entry lost
+        // — silently breaking RACK RTO tail-loss recovery every ~71
+        // minutes. A long-lived trading session (market-data 6.5h+)
+        // would hit this several times per day at the worst possible
+        // moment.
+        //
+        // Case A: near-wrap, stuck entry.
+        //   xmit_ns = 4_294_000_000_000  (≈ 4_294_000_000 µs, just
+        //                                 under 2^32 µs)
+        //   now_ns  = 4_295_000_000_000  (age = 1 s)
+        //   rtt+reo = 1_250 µs → entry MUST be marked lost.
+        //
+        // Under the old u32-µs formula, `now_us = 32_704` (wrapped) and
+        // `xmit_us + rtt + reo = 4_294_001_250`, which trivially fails
+        // the `<=` check → entry silently not marked.
+        let entries = deque(vec![make_entry(
+            100,
+            50,
+            4_294_000_000_000,
+            false,
+            false,
+        )]);
+        let lost = rack_mark_losses_on_rto(
+            &entries,
+            50, // snd_una differs from entry.seq — isolate age clause
+            1_000, // rtt_us
+            250,   // reo_wnd_us
+            4_295_000_000_000,
+        );
+        assert_eq!(
+            lost,
+            vec![0],
+            "age across u32-µs wrap must still be detected",
+        );
+
+        // Case B: recent entry (100 µs old), rtt+reo=1_250 µs → NOT
+        // expired. Exercises the near-threshold side of the helper.
+        let entries = deque(vec![make_entry(
+            100,
+            50,
+            4_295_000_000_000 - 100_000,
+            false,
+            false,
+        )]);
+        let lost = rack_mark_losses_on_rto(
+            &entries,
+            50, // isolate age clause
+            1_000,
+            250,
+            4_295_000_000_000,
+        );
+        assert!(
+            lost.is_empty(),
+            "100 µs age must not trip rtt+reo=1250 µs threshold",
+        );
+
+        // Case C: clock appears to run backwards (xmit_ns > now_ns).
+        // `saturating_sub` → age_ns=0 → NOT expired. Helper must not
+        // panic and must not falsely mark the entry lost.
+        let entries = deque(vec![make_entry(100, 50, 2_000_000_000, false, false)]);
+        let lost = rack_mark_losses_on_rto(
+            &entries,
+            50, // isolate age clause
+            1_000,
+            250,
+            1_000_000_000,
+        );
+        assert!(
+            lost.is_empty(),
+            "now_ns < xmit_ns must saturate to age 0 (not panic)",
+        );
+    }
+
+    #[test]
+    fn rto_age_expired_pure_helper() {
+        // Direct coverage for the pure arithmetic helper; mirrors the
+        // three cases in rack_rto_age_expired_across_u32_us_wrap but
+        // without a retransmit-queue fixture.
+
+        // Case A: 1 s old, 1_250 µs threshold → expired.
+        assert!(rto_age_expired(
+            4_294_000_000_000,
+            4_295_000_000_000,
+            1_000,
+            250,
+        ));
+
+        // Case B: 100 µs old, 1_250 µs threshold → not expired.
+        assert!(!rto_age_expired(
+            4_295_000_000_000 - 100_000,
+            4_295_000_000_000,
+            1_000,
+            250,
+        ));
+
+        // Case C: now before xmit → saturates to 0 age → not expired.
+        assert!(!rto_age_expired(2_000_000_000, 1_000_000_000, 1_000, 250));
+
+        // Boundary: age exactly equals threshold → expired (>= in
+        // the age clause, matching the inclusive §6.3 encoding).
+        assert!(rto_age_expired(0, 1_250_000, 1_000, 250));
     }
 }

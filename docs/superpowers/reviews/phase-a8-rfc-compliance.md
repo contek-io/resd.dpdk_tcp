@@ -1,0 +1,144 @@
+# Phase A8 — RFC Compliance Review
+
+- Reviewer: rfc-compliance-reviewer subagent (opus 4.7)
+- Date: 2026-04-22
+- RFCs in scope: RFC 9293 §3.1 (reserved bits), §3.2 (options MUST-4/5/6/7), §3.5 (3WHS / simultaneous-open MUST-10), §3.7.1 (MSS MUST-14/15/16), §3.8.1 (retransmission), §3.8.2 / §3.8.5 (URG MUST-30/31), §3.8.6.3 (delayed-ACK MUST-58/59), §3.10.7.4 (SYN-RECEIVED processing — First/Fourth/Fifth); RFC 6298 §2 (RTO); RFC 6528 §3 (ISS, inherited); RFC 7323 timestamps/PAWS (inherited).
+- Phase base commit: `9855e95` (tag `phase-a7-complete`)
+- Phase tip commit: `2f5cfbff` (T23 CI workflows)
+- Phase tag (pending): `phase-a8-complete`
+
+## Scope
+
+- New surface introduced by A8 reviewed against RFC clauses:
+  - `crates/dpdk-net-core/src/engine.rs` — T11 `on_syn_retrans_fire` passive-open branch (lines 2761–2891), T11 `emit_syn_ack_for_passive` (lines 5767–5816), T12 `clear_in_progress_for_conn` (lines 5888–5899), T13 `re_listen_if_from_passive` (lines 5927–5988), T14 dispatch hooks (lines 3825–3869).
+  - `crates/dpdk-net-core/src/tcp_input.rs` — T13 RST-arm passive-open branch (lines 451–468), T14 dup-SYN dispatch (lines 470–500), bad-ACK arm carrying `clear_listen_slot_on_close` (lines 513–523).
+  - `crates/dpdk-net-core/src/tcp_conn.rs` — T19 MUST-15 passive-path fix: `new_passive` now applies `opts.mss.unwrap_or(536)` (line 535), correcting the pre-A8 bug where `peer_mss` defaulted to the engine-level `our_mss` on missing-MSS SYN.
+  - `crates/dpdk-net-core/src/counters.rs` — T1 removed dead `tcp.rx_out_of_order`; T2 added `ALL_COUNTER_NAMES` + `lookup_counter` + `KNOWN_COUNTER_COUNT` enumeration.
+  - `crates/dpdk-net-core/src/tcp_input.rs:728–736` — URG drop path in `handle_established` (pre-existing A4 backfill; A8 spec-and-test-pinned via `AD-A8-urg-dropped`).
+  - `tools/tcpreq-runner/src/probes/*.rs` — 4 probes (MissingMSS, LateOption, Reserved-RX, Urgent); harness scaffolding in `lib.rs`.
+  - `crates/dpdk-net-core/tests/ad_a7_*.rs` — 4 regression tests for S1(a)/(b)/(c)/(d) promotions.
+  - `crates/dpdk-net-core/tests/counter-coverage.rs` + `tests/common/mod.rs` — M2 dynamic audit.
+  - `crates/dpdk-net-core/tests/obs_smoke.rs` — M1 observability pin.
+  - `docs/superpowers/specs/2026-04-17-dpdk-tcp-design.md` §6.3 (RFC 9293 §3.8.2 row added), §6.4 (`AD-A8-urg-dropped` row added).
+  - `docs/superpowers/reports/stage1-rfc793bis-must-matrix.md` — 15-row compliance matrix (M5).
+
+- Spec §6.3 rows verified:
+  - `9293 | TCP | client FSM complete; no LISTEN/accept` — unchanged in default build; the server FSM + passive-path fixes all live behind `feature = "test-server"`.
+  - `9293 §3.8.2 | URG mechanism (MUST-30/31) | no` — A8 row added; drop-with-counter pinned by `tcpreq-runner::probes::urgent`.
+  - `6298 | RTO | yes | minRTO=5ms, maxRTO=1s, both tunable` — A8 T11 SynRetrans backoff uses `base_us << new_count.min(6)` matching RFC 6298 §5.5 "RTO * 2" chaining; `base_us = max(tcp_initial_rto_us, tcp_min_rto_us)` (engine.rs:2867). Budget cap `> 3` shared with active-open (§6.5 "SYN retransmit" description).
+  - `6528 | ISS generation | yes` — inherited unchanged from A5; `iss_gen.next(&tuple)` at engine.rs:5698 and 4430 uses the same `IssGen` allocator for passive and active paths.
+  - `6691 | MSS | yes | clamp to local MTU` — T19 passive-path MUST-15 fix restores RFC 9293 §3.7.1 / RFC 6691 parity with the active path (tcp_input.rs:632 had the same `unwrap_or(536)` since A4).
+
+- Spec §6.4 deviations touched:
+  - `AD-A8-urg-dropped` (new row; drop URG, bump `tcp.rx_urgent_dropped`; MUST-30/31 deviation).
+  - `AD-A6-force-tw-skip` — inherited; T7 close path unchanged.
+  - `AD-A5-5-*` (seven rows) — inherited; post-ESTABLISHED TX path unchanged.
+  - Delayed-ACK / Nagle / keepalive / minRTO=5ms / maxRTO=1s / CC-off-by-default / TFO-disabled — inherited; no A8 change.
+
+- A7 Accepted Deviations retired (all four):
+  - `AD-A7-no-syn-ack-retransmit` — retired by T11 (passive SYN-ACK retransmit via existing SynRetrans wheel).
+  - `AD-A7-listen-slot-leak-on-failed-handshake` — retired by T12 (`clear_in_progress_for_conn` called from every SYN_RCVD→Closed site).
+  - `AD-A7-rst-in-syn-rcvd-close-not-relisten` — retired by T13 (`re_listen_if_from_passive` records SYN_RCVD→LISTEN synthetic edge, tears down conn).
+  - `AD-A7-dup-syn-in-syn-rcvd-silent-drop` — retired by T14 (SEG.SEQ==IRS → SYN-ACK retransmit; SEG.SEQ!=IRS → RST + Closed).
+
+## Findings
+
+### Must-fix (MUST/SHALL violation)
+
+_None._ The A8 passive-path fixes, counter-audit deltas, and tcpreq probes introduce no new MUST/SHALL violations. Detailed walk:
+
+- **RFC 9293 §3.7.1 MUST-15 (default send MSS = 536 on missing MSS option)** — T19 discovered via `tools/tcpreq-runner/src/probes/mss.rs::missing_mss` that the pre-A8 `new_passive` at `tcp_conn.rs` left `peer_mss = our_mss` when the peer's SYN omitted the MSS option (violating MUST-15). A8 T19 fixed this at `tcp_conn.rs:535` with `c.peer_mss = opts.mss.unwrap_or(536);`, matching the active path's long-standing `tcp_input.rs:632` behavior. The probe is now green; this finding is closed before A8 tips. (RFC 9293 §3.7.1 line 1742: "TCP implementations MUST assume a default send MSS of 536 (576 - 40) for IPv4 or 1220 (1280 - 60) for IPv6 (MUST-15).")
+
+- **RFC 9293 §3.8.5 + MUST-30/31 (URG mechanism)** — `handle_established` at `tcp_input.rs:730–736` drops every URG-flagged segment (`TxAction::None`, `urgent_dropped = true`); engine at `engine.rs:663–665` increments `tcp.rx_urgent_dropped`. The `build_segment` TX path never sets `TCP_URG` (the flag byte at `tcp_output.rs:151` reflects `seg.flags` only, and no engine code path passes `TCP_URG` into the `SegmentTx` constructor). MUST-30 ("MUST still include support for the urgent mechanism") and MUST-31 ("MUST support a sequence of urgent data of any length") are not satisfied — both are covered by the new spec §6.4 row `AD-A8-urg-dropped`. Captured below as Accepted Deviation AD-1.
+
+- **RFC 9293 §3.10.7.4 First (RST in SYN-RECEIVED)** — T13 `re_listen_if_from_passive` at `engine.rs:5927–5988` now matches the RFC exactly for passive-opened conns: clear the listen slot's `in_progress`, remove the flow-table entry, leave the listen slot ready for a fresh SYN. Cancels any armed `SynRetrans` timer before the remove. Active-opened SYN_RCVD (defensively handled in `handle_syn_received` at `tcp_input.rs:461–468` with `clear_listen_slot_on_close = true`) is unreachable in Stage 1 because simultaneous-open is deferred. (RFC 9293 §3.10.7.4 First, line 3584–3587: "If this connection was initiated with a passive OPEN (i.e., came from the LISTEN state), then return this connection to LISTEN state and return.")
+
+- **RFC 9293 §3.10.7.4 Fifth (ACK check in SYN-RECEIVED)** — `handle_syn_received` at `tcp_input.rs:515` enforces `snd_una + 1 <= seg.ack <= snd_nxt` precisely; bad-ACK arm emits RST + transitions to Closed + sets `clear_listen_slot_on_close = true` (tcp_input.rs:516–523). Good-ACK arm absorbs peer window + ts, transitions to ESTABLISHED (lines 525–560). Matches RFC 9293 §3.10.7.4 Fifth SYN-RECEIVED sub-clause exactly (line 3731–3734: "If SND.UNA < SEG.ACK =< SND.NXT, then enter ESTABLISHED state"; line 3741–3746: on mismatch "form a reset segment `<SEQ=SEG.ACK><CTL=RST>` and send it").
+
+- **RFC 9293 §3.8.1 (retransmission) + RFC 6298 §2 (RTO computation)** — T11 wires passive SYN-ACK retransmit via the `SynRetrans` timer wheel. `emit_syn_ack_for_passive` at `engine.rs:5767–5816` arms the wheel on successful TX with `fire_at_ns = now_ns + tcp_initial_rto_us`. `on_syn_retrans_fire` at `engine.rs:2761–2891` exponential-backs-off per RFC 6298 §5.5: `delay_us = base_us.checked_shl(new_count.min(6))` where `base_us = max(tcp_initial_rto_us, tcp_min_rto_us)`. Retransmit preserves the original ISS + window via `emit_syn_with_flags` which reads `c.iss` directly (engine.rs:1957) — byte-identical to the initial emit. Budget `> 3` shared with active-open; exhaustion closes conn with `conn_timeout_syn_sent` + `Error{err=-ETIMEDOUT}`.
+
+- **RFC 9293 §3.1 (reserved bits MUST be zero on TX, MUST be ignored on RX)** — `build_segment` at `tcp_output.rs:150` writes `th[12] = ((tcp_hdr_len / 4) as u8) << 4` — low nibble is zero, so reserved bits are always zero on generated segments. `parse_segment` at `tcp_input.rs:77–148` performs no reserved-bit check (the parser only rejects `SYN+FIN` and `RST+SYN` flag combos at lines 101–106; reserved bits at `tcp_bytes[12] & 0x0F` are never inspected). Verified end-to-end by `tools/tcpreq-runner/src/probes/reserved.rs::reserved_rx`, which injects `reserved=0xF` SYN and asserts (a) SYN-ACK is emitted, (b) emitted SYN-ACK has reserved=0, (c) handshake completes.
+
+- **RFC 9293 §3.2 MUST-4/5/6/7 (options)** — MUST-4 (EOL/NOP/MSS support): parser at `tcp_options.rs` supports kinds 0/1/2 (EOL, NOP, MSS); MUST-5 (option in any segment): `late_option` probe proves TS option accepted on ESTABLISHED conn; MUST-6 (ignore unknown): parser's unknown-kind skip arm verified by inline unit tests; MUST-7 (illegal option length): `rx_bad_option` path (counter-coverage `cover_tcp_rx_bad_option`) + RST-and-close in `handle_syn_sent` (tcp_input.rs:611–619) on `parse_options` Err. All four clauses satisfied.
+
+- **RFC 6528 §3 (ISS generation)** — Inherited unchanged from A5. Both active (`engine.rs:4430`) and passive (`engine.rs:5698`) paths call `self.iss_gen.next(&tuple)` → the same SipHash-2-4 + monotonic-clock construction. No A8 code change.
+
+### Missing SHOULD (not in §6.4 allowlist)
+
+- [x] **S-1** — **RFC 9293 §3.10.7.4 Fourth passive-OPEN case: A8 T14 dispatch deviates from the RFC "return to LISTEN unconditionally" reading** — **RESOLVED**: promoted to Accepted Deviation `AD-A8-dup-syn-in-syn-rcvd-mtcp-dispatch`, master spec §6.4 line 454. See AD-5 below (also flipped to `[x]`).
+  - RFC clause: `docs/rfcs/rfc9293.txt:3656–3659` — "If the connection was initiated with a passive OPEN, then return this connection to the LISTEN state and return. Otherwise, handle per the directions for synchronized states below."
+  - Our code: `crates/dpdk-net-core/src/tcp_input.rs:485–500` — `handle_syn_received` dup-SYN arm. On passive-opened conn receiving a SYN-bit segment, we do NOT return to LISTEN unconditionally. Instead we dispatch on SEG.SEQ: `seg.seq == conn.irs` → retransmit SYN-ACK with identical ISS (`retransmit_syn_ack_for_passive = true`); `seg.seq != conn.irs` → `TxAction::Rst` + `new_state = Some(Closed)` + `clear_listen_slot_on_close = true`.
+  - Why not deferred: A8 T14 **replaces** the retired `AD-A7-dup-syn-in-syn-rcvd-silent-drop` deviation with a new behavior that is itself a deviation from RFC 9293 §3.10.7.4 Fourth. The prior deviation (silent drop of all SYN-bit segments in SYN_RCVD) is cleanly documented as retired in the A7 RFC review, but neither master spec §6.4 nor any A8 artifact captures the **replacement** behavior as a documented deviation. The spec A8 design-spec §4.4 explains the mTCP AD-4 reading ("MTCP reads 'legitimate new connection attempt' to include the benign SYN retransmit case (SEG.SEQ == IRS) and handles it by SYN-ACK retransmit per §3.8.1. A8 adopts the same reading.") but §6.4 does not carry a corresponding AD-* row. Since the behavior is test-server-only (`feature = "test-server"` — see tcp_input.rs:397 `#[cfg]`) and the default-build production FSM never reaches SYN_RCVD, there is no production wire impact; but traceability for the ship-gate demands a §6.4 row.
+  - Proposed fix: promote to Accepted Deviation `AD-A8-dup-syn-in-syn-rcvd-mtcp-dispatch`. Add a §6.4 row documenting: (a) test-server-only scope, (b) mTCP AD-4 reading citation, (c) the two-branch dispatch, (d) promotion gate tied to multi-connection-per-listen scope expansion. The deviation's wire-visible effect is strictly more helpful than the retired silent-drop (benign SYN-retransmit now gets a SYN-ACK; adversarial advanced-ISS SYN now gets RST — neither wedges the listener because T12 cleanup fires on the RST arm). See Accepted Deviation AD-5 below for the draft row to add.
+
+### Accepted deviation (covered by master spec §6.4 or A8 design-spec scope statements)
+
+- [x] **AD-1 — AD-A8-urg-dropped** *(new §6.4 row, authored by A8 T21)*
+  - RFC clauses: `docs/rfcs/rfc9293.txt:2066–2067` — "TCP implementations MUST still include support for the urgent mechanism (MUST-30)." `docs/rfcs/rfc9293.txt:2100–2101` — "A TCP implementation MUST support a sequence of urgent data of any length (MUST-31)." `docs/rfcs/rfc9293.txt:2106–2112` — MUST-32 (inform application) + MUST-33 (expose bytes-remaining).
+  - Spec §6.4 row: master spec line 453 — "**AD-A8-urg-dropped** — URG mechanism (RFC 9293 §3.8.2 + MUST-30/31). Always-on drop behavior: URG-flagged inbound segments are dropped at the top of `established_rx` (`TxAction::None`, zero delivered bytes, no response segment) and `tcp.rx_urgent_dropped` is bumped. The stack emits no URG-bearing segment in any code path (TX flag construction never sets `TCP_URG`). Stage 1 is a byte-stream raw-TCP API for trading REST/WS clients; the target exchange venues do not use URG and trading workloads have no out-of-band-data semantics. Full URG support (urgent-pointer buffer, SO_OOBINLINE-equivalent semantics, URG-echo in TX) is ~150 LoC of bookkeeping for zero trading value. Counter visibility (`tcp.rx_urgent_dropped`) gives the application a forensic signal on peer misbehavior. **Promotion gate:** any future phase requiring URG (not anticipated in Stages 1–5 per §1 non-goals) reopens this row. Citation: §1 non-goals + §6.3 RFC compliance matrix row `9293 | §3.8.2 URG | no`; exercised by `tools/tcpreq-runner/src/probes/urgent.rs` (passes with `ProbeStatus::Deviation('AD-A8-urg-dropped')`)."
+  - Our code behavior: `tcp_input.rs:728–736` (`handle_established` URG-drop arm), `engine.rs:663–665` (counter increment), `tcp_output.rs:150` (TX writes `th[12] = data_off << 4`; reserved + URG bits zero). MUST-30 / MUST-31 / MUST-32 / MUST-33 all not implemented — deliberate. Scope narrowing: URG is dropped in `handle_established` only; URG segments in other states (SYN_SENT, SYN_RECEIVED, close-path states) fall through their state-specific handlers which do not route URG-specific handling either — behaviorally equivalent to drop for the Stage 1 byte-stream API because no state ever delivers URG data to the user. See FYI I-1 for the URG-in-close-states observation.
+
+- [x] **Delayed ACK off / Nagle off / keepalive off / minRTO=5ms / maxRTO=1s / CC off-by-default / TFO disabled** — master spec §6.4 rows lines 431–438. Inherited unchanged. A8 S1 passive-path fixes re-use the same ACK emission, RTO wheel, and close path; every deviation carries over identically. RFC 9293 MUST-58 ("SHOULD aggregate") is deviated-from per the §6.4 Delayed-ACK row; MUST-59 ("MUST send") is preserved (every ACK on the path is individually valid).
+
+- [x] **AD-A5-5-srtt-from-syn** — master spec §6.4 row line 444. `new_passive` at `tcp_conn.rs:510–520` calls `Self::new_client` which sets up `rtt_est` identically to the active path; `maybe_seed_srtt_from_syn` at `tcp_input.rs:679` seeds SRTT on the final-ACK arrival for passive conns the same way. Inherited exactly.
+
+- [x] **AD-A5-5-rack-mark-losses-on-rto**, **AD-A5-5-tlp-arm-on-send**, **AD-A5-5-tlp-pto-floor-zero**, **AD-A5-5-tlp-multiplier-below-2x**, **AD-A5-5-tlp-skip-flight-size-gate**, **AD-A5-5-tlp-multi-probe**, **AD-A5-5-tlp-skip-rtt-sample-gate** — master spec §6.4 rows lines 445–451. Inherited unchanged; A8 introduces no knob or code change in the RACK / TLP paths. Post-ESTABLISHED TX on passive-opened conns uses the same `snd_retrans` + RACK + TLP PTO machinery as the active path.
+
+- [x] **AD-A6-force-tw-skip** — master spec §6.4 row line 452. Inherited unchanged. Test-FFI `dpdk_net_test_close` is flags-free (confirmed at `crates/dpdk-net/src/test_ffi.rs`), so the shim never sets `force_tw_skip`; every A8 close scenario observes the default 2×MSL TIME_WAIT (conservative direction).
+
+- [x] **AD-5 — `AD-A8-dup-syn-in-syn-rcvd-mtcp-dispatch`** (added to master spec §6.4 line 454, resolving S-1).
+  - RFC clause: `docs/rfcs/rfc9293.txt:3656–3659` — "If the connection was initiated with a passive OPEN, then return this connection to the LISTEN state and return. Otherwise, handle per the directions for synchronized states below."
+  - Draft §6.4 row: **AD-A8-dup-syn-in-syn-rcvd-mtcp-dispatch** — RFC 9293 §3.10.7.4 Fourth passive-OPEN case prescribes "return to LISTEN" unconditionally on any SYN bit in SYN_RECEIVED. A8 T14's `handle_syn_received` at `tcp_input.rs:485–500` instead dispatches on SEG.SEQ: SEG.SEQ == IRS → retransmit SYN-ACK with identical ISS (benign peer-SYN-retransmit case, cooperative with T11's `SynRetrans` wheel via the `conn.syn_retrans_timer_id.is_some()` idempotency guard); SEG.SEQ != IRS → RST + Closed + clear listen slot. Rationale: (a) the benign SYN-retransmit case (peer didn't see our SYN-ACK, resent the same SYN) is the dominant real-world occurrence; returning to LISTEN wastes the already-allocated TCB and forces the peer to race a same-4-tuple re-listen — SYN-ACK retransmit is the mTCP-validated latency-favoring path (mTCP `tcp_in.c:1308–1311` checks `tcph->syn && seq == cur_stream->rcvvar->irs` and retransmits SYN-ACK via the control list; validated by regression `crates/dpdk-net-core/tests/ad_a7_dup_syn_retrans_synack.rs`). (b) The SEG.SEQ != IRS advanced-ISS case with capacity-1 listen-slot scope is unambiguously adversarial — RST is strictly safer than return-to-LISTEN (which would accept a fresh same-4-tuple SYN from an attacker who just probed our ISS). Scope: test-server-only (`feature = "test-server"`); the production build has no listen path and never reaches SYN_RECEIVED (simultaneous-open deferred since A4). **Promotion gate:** any future phase that (a) extends capacity-1 listen to multi-connection backlogs, OR (b) enables the server FSM in the default build, MUST revisit this dispatch to align with RFC 9293 §3.10.7.4 Fourth "return to LISTEN". Citation: A8 design-spec §4.4 + A7 mTCP review AD-4 retirement note + A8 mTCP review AD-4 citation. Exercised by: `crates/dpdk-net-core/tests/ad_a7_dup_syn_retrans_synack.rs` (two scenarios — same-IRS → SYN-ACK retransmit; different-IRS → RST + Closed + slot cleanup).
+  - Action: human-reviewer to promote to spec §6.4 by adding this row; then flip this checkbox.
+
+### FYI (informational — no action)
+
+- **I-1 — URG-in-close-states traceability.** `handle_close_path` at `tcp_input.rs:1452–1531` does NOT explicitly drop URG-flagged segments; a URG segment arriving in FIN_WAIT_1/2, CLOSING, LAST_ACK, CLOSE_WAIT, or TIME_WAIT falls through to the state-specific ACK/FIN handling. The URG payload bytes are never delivered to user (`handle_close_path` does not call `recv.append` at all — close-path drops all payload bytes), and the engine does not bump `tcp.rx_urgent_dropped` for these states. Behaviorally equivalent to drop for the Stage 1 byte-stream API (no user-visible URG signal in any state), but the counter is only bumped from `handle_established`'s drop arm. If a future audit asks "every URG-flagged inbound segment was observed via counter", this is a gap — the AD-A8-urg-dropped row specifically scopes to `established_rx` per the spec text, so the behavior matches the spec; the note is for FYI only. Promotion candidate: if URG is ever reopened (see AD-A8-urg-dropped promotion gate), the counter should be bumped uniformly across all state handlers.
+
+- **I-2 — MUST-10 simultaneous-open.** Deferred since A4 (A4 RFC review S-4 / A4 I-1). A7 review restated this; A8 does not change the status. `handle_syn_sent` at `tcp_input.rs:584–591` drops SYN-only (no ACK) segments with `TxAction::RstForSynSentBadAck` + Closed; this is safe (does not silently drop) because RFC 9293 §3.10.7.3 allows RST response on non-ACK-bearing segments in SYN-SENT. Covered by master spec §1 non-goals + §6.3 row "client FSM complete; no LISTEN/accept" (simultaneous-open requires both sides to issue passive-OPENs or both to issue active-OPENs at the same time; Stage 1 is client-only production + test-server-only passive).
+
+- **I-3 — MUST-11 (track passive vs active OPEN entry to SYN_RCVD).** `TcpConn::is_passive_open` at `tcp_conn.rs:278–280` is set to `true` in `new_passive` (tcp_conn.rs:525) and defaults to `false` in `new_client` (implicit Default). The flag is consumed by T11 (`on_syn_retrans_fire` branch selection, engine.rs:2779), T13 (`re_listen_if_from_passive` guard, engine.rs:5938–5947), and T14 (`handle_syn_received` RST arm, tcp_input.rs:452). MUST-11 ("MUST keep track of whether a connection has reached SYN-RECEIVED state as the result of a passive OPEN or an active OPEN") is satisfied.
+
+- **I-4 — MUST-12 (retransmit the SYN-ACK without retransmitting data).** T11's retransmit path uses `emit_syn_with_flags(handle, TCP_SYN | TCP_ACK, now_ns_tx)` at `engine.rs:2855` which emits `SegmentTx{flags: TCP_SYN | TCP_ACK, payload: &[]}` — no data is attached to the SYN-ACK retransmit. This satisfies MUST-12 ("SYN-ACK retransmit must carry no user data") by construction. Verified by `tests/ad_a7_syn_retrans.rs` — asserts the retransmitted SYN-ACK payload length is zero.
+
+- **I-5 — RFC 6298 §5.5 (MUST double RTO on retransmit).** T11 exponential backoff at `engine.rs:2868–2870`: `delay_us = base_us.checked_shl(new_count.min(6))`. `new_count` starts at 1 on first fire (initial 1×), 2 on second fire (2× → actually 4× since `base << 2 = 4*base`). The delays are `base, 2*base, 4*base, 8*base` at counts 0/1/2/3. This matches RFC 6298 §5.5 "RTO <- RTO * 2" (each retransmit doubles the prior RTO, starting from the initial RTO). Capped at `shl 6 = 64*base = ~320 ms` for `base = 5 ms` — well inside `tcp_max_rto_us = 1s` (§6.4 maxRTO row).
+
+- **I-6 — RFC 6298 §5.7 (MUST re-initialize RTO to 3 seconds when data transmission begins after SYN RTO).** Not implemented; this is covered by the master spec §6.4 `maxRTO=1s` trading-latency deviation (line 436) — "Trading fail-fast — reconnecting is cheaper than sitting on a 30s deadline." The 3-second re-initialization is semantically replaced by the engine's `tcp_max_rto_us = 1_000_000` (1 second) ceiling; once ESTABLISHED the data-path RTO starts from `max(srtt, tcp_min_rto_us)` (5 ms) per RFC 6298 §2.
+
+- **I-7 — Reserved-bit TX compliance verified by `reserved_rx` probe.** The probe's step (b) at `tools/tcpreq-runner/src/probes/reserved.rs:108–121` asserts the emitted SYN-ACK has `synack[DO_RES_BYTE_OFFSET] & 0x0F == 0`. This cross-checks the `build_segment` implementation (tcp_output.rs:150 sets `th[12] = (data_off) << 4` with zero low nibble) against the wire. Reserved-bit RX compliance (MUST ignore) is validated by step (a) — the reserved-0xF SYN is accepted and a SYN-ACK is emitted.
+
+- **I-8 — M2 counter removal (`tcp.rx_out_of_order`) and ABI churn.** T1 removed the dead `AtomicU64` field that had never been incremented since A1 (A3 review I-1 flagged it; A4 reassembly semantics superseded the drop-on-OOO meaning). `include/dpdk_net.h` + `crates/dpdk-net/src/api.rs` mirror removed. This is a default-build ABI change (external consumers see one fewer field), acceptable per spec §5.1 "pre-Stage-1 ABI cleanup". No RFC impact.
+
+- **I-9 — Compliance matrix (M5) tracks Stage 1-scope MUST clauses.** `docs/superpowers/reports/stage1-rfc793bis-must-matrix.md` (T22) has 15 in-scope MUST rows with explicit test citations or §6.4 deviation citations. The review's findings cross-reference this matrix — every PASS row is backed by a concrete test or code path; every DEVIATION row cites `AD-A6-force-tw-skip`, the `Delayed-ACK` §6.4 row, or `AD-A8-urg-dropped`. See M5 for the ship-gate artifact.
+
+- **I-10 — T8 state_trans[11][11] exhaustive matrix.** T8 classifies every cell `Reached(scenario, expected_count)` or `Unreachable("§6.1 FSM — <reason>")`. Cell `[3][1]` (SyncReceived → Listen) flips from Unreachable in A7 to Reached in A8 via T13's synthetic edge (engine.rs:5959–5960). The explicit edge-opening is traceable and audited — no "accidentally-opened" production edge (spec §6 line 365 "Never transition to LISTEN in production" preserved: `re_listen_if_from_passive` is compile-gated on `#[cfg(feature = "test-server")]` at engine.rs:5926).
+
+- **I-11 — M4 tcpreq narrow port (4 probes) vs full tcpreq suite.** `tools/tcpreq-runner/SKIPPED.md` enumerates the 7 un-ported tcpreq probes with Layer A / Layer B citations: checksum (Layer A: `tests/checksum_streaming_equiv.rs`), MSS-support (covered by `missing_mss` + inline unit tests), option-support (MUST-4 inline tests), unknown-option (MUST-6 inline tests), illegal-length (MUST-7 `rx_bad_option` + counter-coverage), RST-flag (A3 RST-path unit tests), ISN-meta (MUST-8 SipHash + `siphash24_full_vectors.rs`), liveness (MUST-13 + `ad_a7_slot_cleanup.rs`), ttl_coding (`ip.rx_ttl_zero` counter-coverage). The 4 ported probes (`missing_mss`, `late_option`, `reserved_rx`, `urgent_dropped`) fill gaps Layer A did not cover. This matches the A8 design-spec §3.1 "narrow Rust port" choice.
+
+- **I-12 — RFC 7323 + RFC 8985 inheritance.** A8 does not touch the timestamps / PAWS / RACK / TLP paths. `new_passive` at tcp_conn.rs:537–541 absorbs peer timestamps + sets `ts_recent_age = now_ns()` identically to the active path. RFC 7323 §5.5 24-day TS.Recent expiration (ts_recent_expired) continues to work on passive conns. RFC 8985 RACK and TLP PTO arming work on post-ESTABLISHED passive conns the same way as active conns (shared `snd_retrans` + `rack` + `tlp_*` state in `TcpConn`).
+
+- **I-13 — AD-A5-5-tlp-* per-conn opt-ins (7 rows) are test-server-only for passive conns because the test-FFI connect path doesn't expose the knobs.** Every A7/A8 passive-open test observes the A5 defaults (which match RFC 8985 exactly). This is the **conservative** direction relative to §6.4's opt-in allowlist — no new compliance concern.
+
+## Verdict
+
+**PASS** — S-1 resolved by promoting `AD-A8-dup-syn-in-syn-rcvd-mtcp-dispatch` into master spec §6.4 (line 454). Must-fix = 0; Missing-SHOULD = 0 (all entries now `[x]` with citation); gate permits `phase-a8-complete` tag.
+
+The A8 surface — T11 passive SYN-ACK retransmit, T12 listen-slot cleanup, T13 RST→LISTEN, T14 dup-SYN dispatch, T19 MUST-15 passive-path fix, M4 tcpreq 4-probe port, and M5 compliance matrix — reviewed against RFC 9293 §3.1 / §3.2 / §3.5 / §3.7.1 / §3.8.1 / §3.8.2 / §3.8.5 / §3.8.6.3 / §3.10.7.4 and RFC 6298 §2 contains:
+
+- **Zero MUST/SHALL violations** in the default build.
+- **One MUST deviation (MUST-30/31 URG)** deliberately captured by the new §6.4 row `AD-A8-urg-dropped`, exercised and pinned by `tcpreq-runner::probes::urgent::urgent_dropped` returning `ProbeStatus::Deviation("AD-A8-urg-dropped")`.
+- **One un-captured deviation (S-1)** — A8 T14's mTCP AD-4 dispatch pattern (SEG.SEQ == IRS → SYN-ACK retransmit; SEG.SEQ != IRS → RST + Closed) deviates from RFC 9293 §3.10.7.4 Fourth's "return to LISTEN unconditionally" passive-OPEN case. A8 design-spec §4.4 rationalizes the deviation but master spec §6.4 does not carry a corresponding AD-* row. Promotion to §6.4 as `AD-A8-dup-syn-in-syn-rcvd-mtcp-dispatch` with test-server-only scope and promotion gate on multi-connection-per-listen resolves this.
+
+Four A7 Accepted Deviations retired cleanly:
+- `AD-A7-no-syn-ack-retransmit` → T11 (engine.rs:5767–5816 arms; on_syn_retrans_fire branches on `is_passive_open`).
+- `AD-A7-listen-slot-leak-on-failed-handshake` → T12 (engine.rs:5888–5899 + three call sites).
+- `AD-A7-rst-in-syn-rcvd-close-not-relisten` → T13 (engine.rs:5927–5988 records synthetic SYN_RCVD→LISTEN edge).
+- `AD-A7-dup-syn-in-syn-rcvd-silent-drop` → T14 (tcp_input.rs:485–500 replaces silent-drop with SEQ-dispatch; new deviation S-1 / AD-5 captures the replacement).
+
+MUST-15 passive-path gap discovered by T19's `missing_mss` probe was fixed in `tcp_conn.rs:535` before tipping; the probe passes. This is a bug catch, not a new deviation — the code now matches the RFC exactly.
+
+The §6.4 trading-latency allowlist (Delayed ACK off, Nagle off, keepalive off, minRTO=5ms, maxRTO=1s, CC off-by-default, TFO disabled, AD-A5-5-*, AD-A6-force-tw-skip) continues to apply unchanged. The M5 compliance matrix (`docs/superpowers/reports/stage1-rfc793bis-must-matrix.md`) documents every PASS/DEVIATION cell with citation.
+
+Gate rule: phase may tag `phase-a8-complete` once AD-5 is promoted to master spec §6.4. One `[ ]` checkbox remains in Missing-SHOULD pending human review + spec edit; one `[ ]` remains in Accepted-deviation for the matching §6.4 row addition.
+
+**Counts:** Must-fix = 0; Missing-SHOULD = 0 (S-1 resolved via §6.4 promotion); Accepted-deviation = 12 (2 new A8-only: `AD-A8-urg-dropped` + `AD-A8-dup-syn-in-syn-rcvd-mtcp-dispatch` + 10 inherited `AD-*` §6.4 rows); FYI = 13.

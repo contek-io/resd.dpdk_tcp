@@ -134,7 +134,6 @@ pub struct TcpCounters {
     pub rx_data: AtomicU64,
     pub rx_ack: AtomicU64,
     pub rx_rst: AtomicU64,
-    pub rx_out_of_order: AtomicU64,
     pub tx_retrans: AtomicU64,
     pub tx_rto: AtomicU64,
     pub tx_tlp: AtomicU64,
@@ -313,6 +312,42 @@ const _: () = {
     assert!(size_of::<EthCounters>().is_multiple_of(64));
 };
 
+// A8-t2-drift-detect-pin: if any of these size pins becomes stale, a new
+// AtomicU64 field has been added to the corresponding *Counters struct
+// without updating ALL_COUNTER_NAMES + KNOWN_COUNTER_COUNT + lookup_counter.
+// Update all three list sites AND this pin together.
+//
+// Every field in these structs is 8 bytes (AtomicU64 or u64 _pad). A new
+// field shifts the struct size by at least 8 bytes — and for the
+// cacheline-aligned groups, by a full 64 bytes once the tail padding is
+// consumed. Either way, this pin breaks at compile time. That closes the
+// scenario the two `a8_tests` runtime tests cannot see: new field present
+// on Counters, absent from ALL_COUNTER_NAMES.
+//
+// To update: insert the new field in the matching *Counters struct (+
+// adjust _pad, if any, so the struct stays cacheline-multiple), add a
+// "group.field" entry to ALL_COUNTER_NAMES, extend the `lookup_counter`
+// match arm, bump KNOWN_COUNTER_COUNT, then update the byte-count on the
+// line below whose struct you changed.
+const _: () = {
+    use std::mem::size_of;
+    // EthCounters: 38 named AtomicU64 + _pad: [AtomicU64; 2] = 40 * 8 = 320 bytes.
+    assert!(size_of::<EthCounters>() == 320);
+    // IpCounters: 12 named AtomicU64 + _pad: [u64; 4] = 16 * 8 = 128 bytes.
+    assert!(size_of::<IpCounters>() == 128);
+    // TcpCounters: 56 named scalar AtomicU64 + state_trans[11][11] matrix of
+    // 121 AtomicU64 = 177 u64s = 1416 bytes; cacheline-align tail pads to
+    // next 64-byte multiple = 1472 bytes.
+    assert!(size_of::<TcpCounters>() == 1472);
+    // PollCounters: 5 named AtomicU64 + _pad: [u64; 11] = 16 * 8 = 128 bytes.
+    assert!(size_of::<PollCounters>() == 128);
+    // ObsCounters: 2 named AtomicU64, repr(C) without align → 16 bytes.
+    assert!(size_of::<ObsCounters>() == 16);
+    // FaultInjectorCounters (A9): 4 named AtomicU64, repr(C, align(64)) →
+    // 32 bytes of fields, padded to 64-byte multiple = 64 bytes.
+    assert!(size_of::<FaultInjectorCounters>() == 64);
+};
+
 #[repr(C)]
 pub struct Counters {
     pub eth: EthCounters,
@@ -320,6 +355,16 @@ pub struct Counters {
     pub tcp: TcpCounters,
     pub poll: PollCounters,
     pub obs: ObsCounters,
+    /// A9 fault-injector group. Struct is always present on the C ABI
+    /// (matching the `obs_events_dropped`/`tx_retrans` pre-declared
+    /// pattern); cargo feature `fault-injector` only controls whether
+    /// the FaultInjector middleware runs and populates these. cbindgen
+    /// doesn't honour `#[cfg(feature=...)]` when scanning module trees,
+    /// so feature-gated fields would leak into the default-build header.
+    /// Keeping the field unconditional + populated-when-feature-on avoids
+    /// that footgun (same pattern used for the A5 deferred tx_retrans /
+    /// tx_rto / tx_tlp counters).
+    pub fault_injector: FaultInjectorCounters,
 }
 
 impl Counters {
@@ -331,8 +376,322 @@ impl Counters {
             tcp: TcpCounters::default(),
             poll: PollCounters::default(),
             obs: ObsCounters::default(),
+            fault_injector: FaultInjectorCounters::default(),
         }
     }
+}
+
+/// Canonical source-of-truth list of every declared counter path.
+/// Consumed by:
+///   - tests/counter-coverage.rs (dynamic audit: one scenario per counter)
+///   - scripts/counter-coverage-static.sh (static audit: every name must
+///     have >= 1 increment site in default OR all-features build)
+///   - tests/obs_smoke.rs (fail-loud: every non-zero counter must be in
+///     the expected table)
+///
+/// Fields are listed in struct declaration order per group. When adding
+/// or removing a counter: update this list + lookup_counter + bump
+/// KNOWN_COUNTER_COUNT.
+///
+/// `fault_injector.*` counters are included (added on the A8-into-master
+/// merge). They are feature-gated by the `fault-injector` cargo feature —
+/// see `tests/feature-gated-counters.txt`; the static audit permits them
+/// to have zero increment sites in the default build.
+pub const ALL_COUNTER_NAMES: &[&str] = &[
+    // --- eth (pre-A-HW + A-HW + A-HW+; _pad excluded) ---
+    "eth.rx_pkts",
+    "eth.rx_bytes",
+    "eth.rx_drop_miss_mac",
+    "eth.rx_drop_nomem",
+    "eth.tx_pkts",
+    "eth.tx_bytes",
+    "eth.tx_drop_full_ring",
+    "eth.tx_drop_nomem",
+    "eth.rx_drop_short",
+    "eth.rx_drop_unknown_ethertype",
+    "eth.rx_arp",
+    "eth.tx_arp",
+    "eth.offload_missing_rx_cksum_ipv4",
+    "eth.offload_missing_rx_cksum_tcp",
+    "eth.offload_missing_rx_cksum_udp",
+    "eth.offload_missing_tx_cksum_ipv4",
+    "eth.offload_missing_tx_cksum_tcp",
+    "eth.offload_missing_tx_cksum_udp",
+    "eth.offload_missing_mbuf_fast_free",
+    "eth.offload_missing_rss_hash",
+    "eth.offload_missing_llq",
+    "eth.offload_missing_rx_timestamp",
+    "eth.rx_drop_cksum_bad",
+    "eth.llq_wc_missing",
+    "eth.llq_header_overflow_risk",
+    "eth.eni_bw_in_allowance_exceeded",
+    "eth.eni_bw_out_allowance_exceeded",
+    "eth.eni_pps_allowance_exceeded",
+    "eth.eni_conntrack_allowance_exceeded",
+    "eth.eni_linklocal_allowance_exceeded",
+    "eth.tx_q0_linearize",
+    "eth.tx_q0_doorbells",
+    "eth.tx_q0_missed_tx",
+    "eth.tx_q0_bad_req_id",
+    "eth.rx_q0_refill_partial",
+    "eth.rx_q0_bad_desc_num",
+    "eth.rx_q0_bad_req_id",
+    "eth.rx_q0_mbuf_alloc_fail",
+    // --- ip (_pad excluded) ---
+    "ip.rx_csum_bad",
+    "ip.rx_ttl_zero",
+    "ip.rx_frag",
+    "ip.rx_icmp_frag_needed",
+    "ip.pmtud_updates",
+    "ip.rx_drop_short",
+    "ip.rx_drop_bad_version",
+    "ip.rx_drop_bad_hl",
+    "ip.rx_drop_not_ours",
+    "ip.rx_drop_unsupported_proto",
+    "ip.rx_tcp",
+    "ip.rx_icmp",
+    // --- tcp (pre-A5 + A5 + A5.5 + A6 + A6.6-7; rx_out_of_order removed in T1) ---
+    "tcp.rx_syn_ack",
+    "tcp.rx_data",
+    "tcp.rx_ack",
+    "tcp.rx_rst",
+    "tcp.tx_retrans",
+    "tcp.tx_rto",
+    "tcp.tx_tlp",
+    "tcp.conn_open",
+    "tcp.conn_close",
+    "tcp.conn_rst",
+    "tcp.send_buf_full",
+    "tcp.recv_buf_delivered",
+    "tcp.tx_syn",
+    "tcp.tx_ack",
+    "tcp.tx_data",
+    "tcp.tx_fin",
+    "tcp.tx_rst",
+    "tcp.rx_fin",
+    "tcp.rx_unmatched",
+    "tcp.rx_bad_csum",
+    "tcp.rx_bad_flags",
+    "tcp.rx_short",
+    "tcp.recv_buf_drops",
+    "tcp.rx_paws_rejected",
+    "tcp.rx_bad_option",
+    "tcp.rx_reassembly_queued",
+    "tcp.rx_reassembly_hole_filled",
+    "tcp.tx_sack_blocks",
+    "tcp.rx_sack_blocks",
+    "tcp.rx_bad_seq",
+    "tcp.rx_bad_ack",
+    "tcp.rx_dup_ack",
+    "tcp.rx_zero_window",
+    "tcp.rx_urgent_dropped",
+    "tcp.tx_zero_window",
+    "tcp.tx_window_update",
+    "tcp.conn_table_full",
+    "tcp.conn_time_wait_reaped",
+    "tcp.tx_payload_bytes",
+    "tcp.rx_payload_bytes",
+    // state_trans is the 11x11 matrix — handled separately (see comment on
+    // KNOWN_COUNTER_COUNT below).
+    "tcp.conn_timeout_retrans",
+    "tcp.conn_timeout_syn_sent",
+    "tcp.rtt_samples",
+    "tcp.tx_rack_loss",
+    "tcp.rack_reo_wnd_override_active",
+    "tcp.rto_no_backoff_active",
+    "tcp.rx_ws_shift_clamped",
+    "tcp.rx_dsack",
+    "tcp.tx_tlp_spurious",
+    "tcp.tx_api_timers_fired",
+    "tcp.ts_recent_expired",
+    "tcp.tx_flush_bursts",
+    "tcp.tx_flush_batched_pkts",
+    "tcp.rx_iovec_segs_total",
+    "tcp.rx_multi_seg_events",
+    "tcp.rx_partial_read_splits",
+    // --- poll (_pad excluded) ---
+    "poll.iters",
+    "poll.iters_with_rx",
+    "poll.iters_with_tx",
+    "poll.iters_idle",
+    "poll.iters_with_rx_burst_max",
+    // --- obs (A5.5) ---
+    "obs.events_dropped",
+    "obs.events_queue_high_water",
+    // --- fault_injector (A9) — feature-gated; listed in feature-gated-counters.txt ---
+    "fault_injector.drops",
+    "fault_injector.dups",
+    "fault_injector.reorders",
+    "fault_injector.corrupts",
+];
+
+/// Number of names in `ALL_COUNTER_NAMES`.
+///
+/// **Critical contract**: this count MUST be updated whenever a counter
+/// is added or removed. The `all_counter_names_count_pinned` test fails
+/// loudly when `ALL_COUNTER_NAMES.len() != KNOWN_COUNTER_COUNT`.
+///
+/// Count excludes state_trans (the 121-cell matrix is handled by a
+/// dedicated coverage table in tests/counter-coverage.rs, not by a flat
+/// name list). A9's `fault_injector.*` group IS present in the list
+/// (4 entries) and is feature-gated by `fault-injector` per
+/// `tests/feature-gated-counters.txt`.
+///
+/// **Scenario caught:** counter added to `ALL_COUNTER_NAMES` without
+/// bumping this constant (or vice-versa) → count-pinned test fails.
+///
+/// **Scenario NOT caught by this constant alone:** a new `AtomicU64`
+/// field added to a `*Counters` struct without also updating
+/// `ALL_COUNTER_NAMES` + this count. The two `a8_tests` tests pass
+/// cleanly in that scenario; the new counter becomes invisible to
+/// every downstream M2 / M1 audit. That scenario IS caught by the
+/// compile-time `size_of::<*Counters>()` pins above — they fail at
+/// compile time when a new field shifts struct size past the pinned
+/// byte count.
+pub const KNOWN_COUNTER_COUNT: usize = 117;
+
+/// Resolve a counter path from ALL_COUNTER_NAMES to a live &AtomicU64
+/// on the given Counters. Returns None for typos or paths that have
+/// been removed. The match is exhaustive over the name list; adding a
+/// name to ALL_COUNTER_NAMES without a matching arm here will cause
+/// `all_counter_names_lookup_valid` to fail at runtime with "name X
+/// does not resolve".
+///
+/// Match-arm order mirrors `ALL_COUNTER_NAMES` so a reviewer can diff
+/// the two by eye.
+///
+/// **`tcp.state_trans[11][11]` is NOT addressable via this function.**
+/// The 121-cell matrix is a separate audit concern (see T8 in the A8
+/// plan + `tests/counter-coverage.rs::state_trans_coverage_exhaustive`).
+/// Callers that need cell-level access read `c.tcp.state_trans[from][to]`
+/// directly by index. Do NOT extend this match with a
+/// `"tcp.state_trans[X][Y]"` parser — the grammar is deliberately flat.
+pub fn lookup_counter<'a>(c: &'a Counters, name: &str) -> Option<&'a AtomicU64> {
+    Some(match name {
+        // --- eth ---
+        "eth.rx_pkts" => &c.eth.rx_pkts,
+        "eth.rx_bytes" => &c.eth.rx_bytes,
+        "eth.rx_drop_miss_mac" => &c.eth.rx_drop_miss_mac,
+        "eth.rx_drop_nomem" => &c.eth.rx_drop_nomem,
+        "eth.tx_pkts" => &c.eth.tx_pkts,
+        "eth.tx_bytes" => &c.eth.tx_bytes,
+        "eth.tx_drop_full_ring" => &c.eth.tx_drop_full_ring,
+        "eth.tx_drop_nomem" => &c.eth.tx_drop_nomem,
+        "eth.rx_drop_short" => &c.eth.rx_drop_short,
+        "eth.rx_drop_unknown_ethertype" => &c.eth.rx_drop_unknown_ethertype,
+        "eth.rx_arp" => &c.eth.rx_arp,
+        "eth.tx_arp" => &c.eth.tx_arp,
+        "eth.offload_missing_rx_cksum_ipv4" => &c.eth.offload_missing_rx_cksum_ipv4,
+        "eth.offload_missing_rx_cksum_tcp" => &c.eth.offload_missing_rx_cksum_tcp,
+        "eth.offload_missing_rx_cksum_udp" => &c.eth.offload_missing_rx_cksum_udp,
+        "eth.offload_missing_tx_cksum_ipv4" => &c.eth.offload_missing_tx_cksum_ipv4,
+        "eth.offload_missing_tx_cksum_tcp" => &c.eth.offload_missing_tx_cksum_tcp,
+        "eth.offload_missing_tx_cksum_udp" => &c.eth.offload_missing_tx_cksum_udp,
+        "eth.offload_missing_mbuf_fast_free" => &c.eth.offload_missing_mbuf_fast_free,
+        "eth.offload_missing_rss_hash" => &c.eth.offload_missing_rss_hash,
+        "eth.offload_missing_llq" => &c.eth.offload_missing_llq,
+        "eth.offload_missing_rx_timestamp" => &c.eth.offload_missing_rx_timestamp,
+        "eth.rx_drop_cksum_bad" => &c.eth.rx_drop_cksum_bad,
+        "eth.llq_wc_missing" => &c.eth.llq_wc_missing,
+        "eth.llq_header_overflow_risk" => &c.eth.llq_header_overflow_risk,
+        "eth.eni_bw_in_allowance_exceeded" => &c.eth.eni_bw_in_allowance_exceeded,
+        "eth.eni_bw_out_allowance_exceeded" => &c.eth.eni_bw_out_allowance_exceeded,
+        "eth.eni_pps_allowance_exceeded" => &c.eth.eni_pps_allowance_exceeded,
+        "eth.eni_conntrack_allowance_exceeded" => &c.eth.eni_conntrack_allowance_exceeded,
+        "eth.eni_linklocal_allowance_exceeded" => &c.eth.eni_linklocal_allowance_exceeded,
+        "eth.tx_q0_linearize" => &c.eth.tx_q0_linearize,
+        "eth.tx_q0_doorbells" => &c.eth.tx_q0_doorbells,
+        "eth.tx_q0_missed_tx" => &c.eth.tx_q0_missed_tx,
+        "eth.tx_q0_bad_req_id" => &c.eth.tx_q0_bad_req_id,
+        "eth.rx_q0_refill_partial" => &c.eth.rx_q0_refill_partial,
+        "eth.rx_q0_bad_desc_num" => &c.eth.rx_q0_bad_desc_num,
+        "eth.rx_q0_bad_req_id" => &c.eth.rx_q0_bad_req_id,
+        "eth.rx_q0_mbuf_alloc_fail" => &c.eth.rx_q0_mbuf_alloc_fail,
+        // --- ip ---
+        "ip.rx_csum_bad" => &c.ip.rx_csum_bad,
+        "ip.rx_ttl_zero" => &c.ip.rx_ttl_zero,
+        "ip.rx_frag" => &c.ip.rx_frag,
+        "ip.rx_icmp_frag_needed" => &c.ip.rx_icmp_frag_needed,
+        "ip.pmtud_updates" => &c.ip.pmtud_updates,
+        "ip.rx_drop_short" => &c.ip.rx_drop_short,
+        "ip.rx_drop_bad_version" => &c.ip.rx_drop_bad_version,
+        "ip.rx_drop_bad_hl" => &c.ip.rx_drop_bad_hl,
+        "ip.rx_drop_not_ours" => &c.ip.rx_drop_not_ours,
+        "ip.rx_drop_unsupported_proto" => &c.ip.rx_drop_unsupported_proto,
+        "ip.rx_tcp" => &c.ip.rx_tcp,
+        "ip.rx_icmp" => &c.ip.rx_icmp,
+        // --- tcp ---
+        "tcp.rx_syn_ack" => &c.tcp.rx_syn_ack,
+        "tcp.rx_data" => &c.tcp.rx_data,
+        "tcp.rx_ack" => &c.tcp.rx_ack,
+        "tcp.rx_rst" => &c.tcp.rx_rst,
+        "tcp.tx_retrans" => &c.tcp.tx_retrans,
+        "tcp.tx_rto" => &c.tcp.tx_rto,
+        "tcp.tx_tlp" => &c.tcp.tx_tlp,
+        "tcp.conn_open" => &c.tcp.conn_open,
+        "tcp.conn_close" => &c.tcp.conn_close,
+        "tcp.conn_rst" => &c.tcp.conn_rst,
+        "tcp.send_buf_full" => &c.tcp.send_buf_full,
+        "tcp.recv_buf_delivered" => &c.tcp.recv_buf_delivered,
+        "tcp.tx_syn" => &c.tcp.tx_syn,
+        "tcp.tx_ack" => &c.tcp.tx_ack,
+        "tcp.tx_data" => &c.tcp.tx_data,
+        "tcp.tx_fin" => &c.tcp.tx_fin,
+        "tcp.tx_rst" => &c.tcp.tx_rst,
+        "tcp.rx_fin" => &c.tcp.rx_fin,
+        "tcp.rx_unmatched" => &c.tcp.rx_unmatched,
+        "tcp.rx_bad_csum" => &c.tcp.rx_bad_csum,
+        "tcp.rx_bad_flags" => &c.tcp.rx_bad_flags,
+        "tcp.rx_short" => &c.tcp.rx_short,
+        "tcp.recv_buf_drops" => &c.tcp.recv_buf_drops,
+        "tcp.rx_paws_rejected" => &c.tcp.rx_paws_rejected,
+        "tcp.rx_bad_option" => &c.tcp.rx_bad_option,
+        "tcp.rx_reassembly_queued" => &c.tcp.rx_reassembly_queued,
+        "tcp.rx_reassembly_hole_filled" => &c.tcp.rx_reassembly_hole_filled,
+        "tcp.tx_sack_blocks" => &c.tcp.tx_sack_blocks,
+        "tcp.rx_sack_blocks" => &c.tcp.rx_sack_blocks,
+        "tcp.rx_bad_seq" => &c.tcp.rx_bad_seq,
+        "tcp.rx_bad_ack" => &c.tcp.rx_bad_ack,
+        "tcp.rx_dup_ack" => &c.tcp.rx_dup_ack,
+        "tcp.rx_zero_window" => &c.tcp.rx_zero_window,
+        "tcp.rx_urgent_dropped" => &c.tcp.rx_urgent_dropped,
+        "tcp.tx_zero_window" => &c.tcp.tx_zero_window,
+        "tcp.tx_window_update" => &c.tcp.tx_window_update,
+        "tcp.conn_table_full" => &c.tcp.conn_table_full,
+        "tcp.conn_time_wait_reaped" => &c.tcp.conn_time_wait_reaped,
+        "tcp.tx_payload_bytes" => &c.tcp.tx_payload_bytes,
+        "tcp.rx_payload_bytes" => &c.tcp.rx_payload_bytes,
+        "tcp.conn_timeout_retrans" => &c.tcp.conn_timeout_retrans,
+        "tcp.conn_timeout_syn_sent" => &c.tcp.conn_timeout_syn_sent,
+        "tcp.rtt_samples" => &c.tcp.rtt_samples,
+        "tcp.tx_rack_loss" => &c.tcp.tx_rack_loss,
+        "tcp.rack_reo_wnd_override_active" => &c.tcp.rack_reo_wnd_override_active,
+        "tcp.rto_no_backoff_active" => &c.tcp.rto_no_backoff_active,
+        "tcp.rx_ws_shift_clamped" => &c.tcp.rx_ws_shift_clamped,
+        "tcp.rx_dsack" => &c.tcp.rx_dsack,
+        "tcp.tx_tlp_spurious" => &c.tcp.tx_tlp_spurious,
+        "tcp.tx_api_timers_fired" => &c.tcp.tx_api_timers_fired,
+        "tcp.ts_recent_expired" => &c.tcp.ts_recent_expired,
+        "tcp.tx_flush_bursts" => &c.tcp.tx_flush_bursts,
+        "tcp.tx_flush_batched_pkts" => &c.tcp.tx_flush_batched_pkts,
+        "tcp.rx_iovec_segs_total" => &c.tcp.rx_iovec_segs_total,
+        "tcp.rx_multi_seg_events" => &c.tcp.rx_multi_seg_events,
+        "tcp.rx_partial_read_splits" => &c.tcp.rx_partial_read_splits,
+        // --- poll ---
+        "poll.iters" => &c.poll.iters,
+        "poll.iters_with_rx" => &c.poll.iters_with_rx,
+        "poll.iters_with_tx" => &c.poll.iters_with_tx,
+        "poll.iters_idle" => &c.poll.iters_idle,
+        "poll.iters_with_rx_burst_max" => &c.poll.iters_with_rx_burst_max,
+        // --- obs ---
+        "obs.events_dropped" => &c.obs.events_dropped,
+        "obs.events_queue_high_water" => &c.obs.events_queue_high_water,
+        "fault_injector.drops" => &c.fault_injector.drops,
+        "fault_injector.dups" => &c.fault_injector.dups,
+        "fault_injector.reorders" => &c.fault_injector.reorders,
+        "fault_injector.corrupts" => &c.fault_injector.corrupts,
+        _ => return None,
+    })
 }
 
 impl Default for Counters {
@@ -364,6 +723,32 @@ impl Default for PollCounters {
 impl Default for ObsCounters {
     fn default() -> Self {
         unsafe { std::mem::zeroed() }
+    }
+}
+
+/// A9 fault-injector counter group. Slow-path per §9.1.1 — one `fetch_add`
+/// per fault-decision branch (drop / dup / reorder / corrupt). Struct is
+/// ALWAYS present on the C ABI (the `fault-injector` cargo feature only
+/// gates whether the FaultInjector middleware runs and populates these;
+/// release builds with the feature off carry zero-valued counters, same
+/// pattern as the A5 deferred tx_retrans / tx_rto / tx_tlp counters).
+#[repr(C, align(64))]
+#[derive(Default)]
+pub struct FaultInjectorCounters {
+    pub drops: AtomicU64,
+    pub dups: AtomicU64,
+    pub reorders: AtomicU64,
+    pub corrupts: AtomicU64,
+}
+
+impl FaultInjectorCounters {
+    pub const fn new() -> Self {
+        Self {
+            drops: AtomicU64::new(0),
+            dups: AtomicU64::new(0),
+            reorders: AtomicU64::new(0),
+            corrupts: AtomicU64::new(0),
+        }
     }
 }
 
@@ -513,7 +898,9 @@ mod tests {
     }
 
     /// Every named AtomicU64 on PollCounters is zero at construction.
-    /// `iters_with_tx` is declared but not incremented until A6.
+    /// `iters_with_tx` wired in A8 T3.5 follow-up (engine.rs poll_once
+    /// end-of-iteration bump, snapshot-vs-post-drain compare on
+    /// `eth.tx_pkts`). Starts at zero until the first TX fires.
     #[test]
     fn all_poll_counters_zero_at_construction() {
         let c = Counters::new();
@@ -529,7 +916,6 @@ mod tests {
     #[test]
     fn tx_retrans_counters_zero_at_construction() {
         let c = Counters::new();
-        assert_eq!(c.tcp.rx_out_of_order.load(Ordering::Relaxed), 0);
         assert_eq!(c.tcp.tx_retrans.load(Ordering::Relaxed), 0);
         assert_eq!(c.tcp.tx_rto.load(Ordering::Relaxed), 0);
         assert_eq!(c.tcp.tx_tlp.load(Ordering::Relaxed), 0);
@@ -563,6 +949,19 @@ mod tests {
         assert_eq!(c.tcp.tx_window_update.load(Ordering::Relaxed), 0);
         assert_eq!(c.tcp.conn_table_full.load(Ordering::Relaxed), 0);
         assert_eq!(c.tcp.conn_time_wait_reaped.load(Ordering::Relaxed), 0);
+    }
+
+    /// A9 fault-injector counter group is zero at construction.
+    /// Struct is always present on the C ABI (feature only gates
+    /// population). Guards the per-group size+align asserts in
+    /// dpdk-net/src/api.rs from drifting silently.
+    #[test]
+    fn fault_injector_counters_zero_at_construction() {
+        let c = Counters::new();
+        assert_eq!(c.fault_injector.drops.load(Ordering::Relaxed), 0);
+        assert_eq!(c.fault_injector.dups.load(Ordering::Relaxed), 0);
+        assert_eq!(c.fault_injector.reorders.load(Ordering::Relaxed), 0);
+        assert_eq!(c.fault_injector.corrupts.load(Ordering::Relaxed), 0);
     }
 
     /// A5 pre-declared slow-path fields. Task 13 wires
@@ -611,5 +1010,52 @@ mod a5_5_tests {
         assert_eq!(c.tcp.ts_recent_expired.load(Ordering::Relaxed), 0);
         assert_eq!(c.tcp.tx_flush_bursts.load(Ordering::Relaxed), 0);
         assert_eq!(c.tcp.tx_flush_batched_pkts.load(Ordering::Relaxed), 0);
+    }
+}
+
+#[cfg(test)]
+mod a8_tests {
+    use super::*;
+    use std::sync::atomic::Ordering;
+
+    /// Every name in ALL_COUNTER_NAMES resolves to a valid counter path.
+    #[test]
+    fn all_counter_names_lookup_valid() {
+        let c = Counters::new();
+        for name in ALL_COUNTER_NAMES {
+            let atomic = lookup_counter(&c, name)
+                .unwrap_or_else(|| panic!("name {name} does not resolve"));
+            assert_eq!(atomic.load(Ordering::Relaxed), 0);
+        }
+    }
+
+    /// Pinned count: drifts whenever a counter is added or removed.
+    /// Update this number when adding/removing counters + update the
+    /// ALL_COUNTER_NAMES list + update lookup_counter. A mismatch
+    /// means one of the three is out of sync.
+    #[test]
+    fn all_counter_names_count_pinned() {
+        assert_eq!(
+            ALL_COUNTER_NAMES.len(),
+            KNOWN_COUNTER_COUNT,
+            "ALL_COUNTER_NAMES count drifted; update KNOWN_COUNTER_COUNT if intentional"
+        );
+    }
+
+    /// Sanity: nonexistent names return None, not a spurious reference.
+    /// Protects against a future refactor replacing the `_ => return None`
+    /// arm with a default-resolving arm. Also re-asserts the architectural
+    /// decision (documented on `lookup_counter`) that state_trans cells
+    /// are NOT addressable via this flat grammar — callers index the
+    /// matrix directly.
+    #[test]
+    fn lookup_counter_unknown_returns_none() {
+        let c = Counters::new();
+        assert!(lookup_counter(&c, "nonexistent.counter").is_none());
+        assert!(lookup_counter(&c, "").is_none());
+        assert!(
+            lookup_counter(&c, "tcp.state_trans[0][0]").is_none(),
+            "state_trans cells are NOT addressable via lookup_counter — see doc comment"
+        );
     }
 }

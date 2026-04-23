@@ -1,0 +1,175 @@
+# A8 T16 shivansh-tcp-ip-regression classifier.
+#
+# Rules evaluated in order. First match wins. Each rule:
+#   - matches_regex: applied to the path relative to
+#     third_party/shivansh-tcp-ip-regression/
+#   - verdict: "runnable" | "skipped-untranslatable" | "skipped-out-of-scope"
+#   - reason: short string; appears in SKIPPED.md when skipped.
+#
+# ------------------------------------------------------------------
+# A8 T16 CLASSIFICATION NOTES
+# ------------------------------------------------------------------
+# The shivansh TCP-IP regression suite is a 47-script subset borrowed
+# from Google packetdrill and ligurio, stand-alone (no defaults.sh
+# dependency), SPDX/MIT-licensed per-script. Since the scripts are
+# near-copies of ligurio's, the same A8 T15 S2 shim unlock applies:
+# 4 listen/ scripts + 1 close/simultaneous-close run end-to-end,
+# 42 hit engine/shim gaps identical to the ligurio skip buckets.
+#
+# Empirically verified on the A8 T15 S2 shim binary:
+#   5/47 exit 0 end-to-end (pinned as runnable)
+#   42/47 skipped against the bucket reasons below
+#
+# A8+ work will move scripts out of skip buckets as the underlying gap
+# closes (same gaps as ligurio: shutdown wiring, scripts/defaults.sh
+# host-env needs, option-order drift, engine CC/recovery plumbing).
+# ------------------------------------------------------------------
+
+# --- (1) Runnable allow-list — empirically verified on A8 T15 S2 shim.
+#
+# Each of these exits 0 end-to-end under the current shim binary.
+# Directory-mates stay skipped because they hit distinct engine-side
+# gaps (FreeBSD silent-drop, blocking-accept EAGAIN, shutdown() wiring,
+# server-side accept-path dependency) that remain on the A8+ backlog.
+
+[[rule]]
+matches_regex = "socket-api/listen/listen-incoming-syn-ack\\.pkt"
+verdict = "runnable"
+reason = "A8 T16: listener rejects SYN-ACK with RST, then accepts retry SYN"
+
+[[rule]]
+matches_regex = "socket-api/listen/listen-incoming-ack\\.pkt"
+verdict = "runnable"
+reason = "A8 T16: listener rejects bare ACK with RST, then accepts retry SYN"
+
+[[rule]]
+matches_regex = "socket-api/listen/listen-incoming-rst\\.pkt"
+verdict = "runnable"
+reason = "A8 T16: listener drops unsolicited RST then accepts retry SYN"
+
+[[rule]]
+matches_regex = "socket-api/listen/listen-incoming-syn-rst\\.pkt"
+verdict = "runnable"
+reason = "A8 T16: listener drops SYN|RST combo then accepts retry SYN"
+
+[[rule]]
+matches_regex = "socket-api/close/simultaneous-close\\.pkt"
+verdict = "runnable"
+reason = "A8 T16: simultaneous-close FIN exchange after accept"
+
+# --- (2) Server-side lifecycle — directory-mate skips ---
+
+[[rule]]
+matches_regex = "socket-api/listen/listen-incoming-no-tcp-flags\\.pkt"
+verdict = "skipped-untranslatable"
+reason = "server-side edge behavior (FreeBSD silent-drop on no-flags) needs engine parity (A8+)"
+
+[[rule]]
+matches_regex = "socket-api/blocking/.*\\.pkt"
+verdict = "skipped-untranslatable"
+reason = "blocking-accept EAGAIN vs shim scheduling; accept-timing deltas (A8+)"
+
+[[rule]]
+matches_regex = "socket-api/close/.*\\.pkt"
+verdict = "skipped-untranslatable"
+reason = "close() tests all require server-side accept path (A8+)"
+
+[[rule]]
+matches_regex = "socket-api/shutdown/.*\\.pkt"
+verdict = "skipped-untranslatable"
+reason = "shutdown() tests all require server-side accept path (A8+)"
+
+[[rule]]
+matches_regex = "socket-api/connect/.*\\.pkt"
+verdict = "skipped-untranslatable"
+reason = "fcntl(O_NONBLOCK) flag-shape drift; also option-order drift"
+
+[[rule]]
+matches_regex = "socket-api/init_rto/.*\\.pkt"
+verdict = "skipped-untranslatable"
+reason = "Initial-RTO server-side timing not exercised via shim yet"
+
+[[rule]]
+matches_regex = "tcp-fsm/reset/.*\\.pkt"
+verdict = "skipped-untranslatable"
+reason = "RST tests depend on server-side accept path or wire-option parity"
+
+# --- (3) MSS / option-order drift (client-side) ---
+
+[[rule]]
+matches_regex = "tcp-fsm/mss/.*\\.pkt"
+verdict = "skipped-untranslatable"
+reason = "SYN option-order drift vs script expectation; engine/shim fix is A8+"
+
+# --- (4) Unimplemented engine behavior ---
+
+[[rule]]
+matches_regex = "tcp-fsm/initial_window/.*\\.pkt"
+verdict = "skipped-untranslatable"
+reason = "Initial-window IW10 sizing not modeled"
+
+[[rule]]
+matches_regex = "tcp-mechanisms/early_retransmit/.*\\.pkt"
+verdict = "skipped-untranslatable"
+reason = "Early-retransmit (RFC 5827) not in engine"
+
+[[rule]]
+matches_regex = "tcp-mechanisms/fast_recovery/.*\\.pkt"
+verdict = "skipped-untranslatable"
+reason = "Fast-recovery state machine (RFC 6582) not in engine"
+
+[[rule]]
+matches_regex = "tcp-mechanisms/fast_retransmit/.*\\.pkt"
+verdict = "skipped-untranslatable"
+reason = "Fast-retransmit dupACK heuristic not in engine"
+
+[[rule]]
+matches_regex = "tcp-mechanisms/fr-undo/.*\\.pkt"
+verdict = "skipped-untranslatable"
+reason = "Loss-undo logic (RFC 5682 / DSACK undo) not modeled"
+
+[[rule]]
+matches_regex = "tcp-mechanisms/paws/.*\\.pkt"
+verdict = "skipped-untranslatable"
+reason = "PAWS / ts_recent handling depends on timestamp-option parity"
+
+[[rule]]
+matches_regex = "tcp-mechanisms/pmtu_discovery/.*\\.pkt"
+verdict = "skipped-untranslatable"
+reason = "PMTU discovery semantics not modeled"
+
+[[rule]]
+matches_regex = "tcp-mechanisms/receiver_rtt/.*\\.pkt"
+verdict = "skipped-untranslatable"
+reason = "Receiver-side RTT sample extraction not modeled"
+
+[[rule]]
+matches_regex = "tcp-mechanisms/rto/.*\\.pkt"
+verdict = "skipped-untranslatable"
+reason = "RTO retransmit cadence not exercised via shim yet"
+
+[[rule]]
+matches_regex = "tcp-mechanisms/slow_read_attack/.*\\.pkt"
+verdict = "skipped-untranslatable"
+reason = "Slow-read-attack scenario needs receive-window-squeeze engine plumbing (A8+)"
+
+[[rule]]
+matches_regex = "tcp-mechanisms/slow_start/.*\\.pkt"
+verdict = "skipped-untranslatable"
+reason = "Slow-start exponential growth observability not modeled"
+
+# --- (5) Other (wire shape / middleware-layer behavior) ---
+
+[[rule]]
+matches_regex = "icmp/.*\\.pkt"
+verdict = "skipped-untranslatable"
+reason = "ICMP ingress/error delivery not modeled"
+
+# --- Default fall-through ---
+# Anything new gets skipped under "awaiting further triage" so the gate
+# fails loudly on a path that doesn't match any earlier rule.
+
+[[rule]]
+matches_regex = ".*\\.pkt"
+verdict = "skipped-untranslatable"
+reason = "awaiting further triage (new shivansh corpus entry; classify in A8+)"

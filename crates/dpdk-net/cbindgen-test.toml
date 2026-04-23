@@ -1,0 +1,110 @@
+language = "C"
+include_guard = "DPDK_NET_TEST_H"
+pragma_once = true
+autogen_warning = "/* DO NOT EDIT: generated from Rust via cbindgen (test-server feature) */"
+no_includes = false
+sys_includes = ["stdint.h", "stdbool.h", "stddef.h", "arpa/inet.h", "sys/types.h"]
+# The test-FFI surface references the production types (dpdk_net_engine,
+# dpdk_net_conn_t, dpdk_net_connect_opts_t, dpdk_net_event_*) which live
+# in dpdk_net.h — pull that header in so dpdk_net_test.h compiles on its
+# own AND so callers that `#include "dpdk_net_test.h"` don't need to
+# separately include the production header.
+#
+# The production header uses `style = "tag"` (bare struct tags, no
+# typedef), so function signatures in dpdk_net.h refer to e.g.
+# `struct dpdk_net_engine *`. When a type is on our `exclude` list
+# below, cbindgen emits test-FFI signatures that reference the type
+# WITHOUT a `struct` prefix (it can't tell tag vs. typedef for an
+# excluded type). We inject a small set of typedef bridges after the
+# `#include "dpdk_net.h"` so `dpdk_net_engine` and friends resolve in
+# the test header's signatures without requiring a `struct ` keyword.
+after_includes = """
+
+#include \"dpdk_net.h\"
+
+/* Typedef bridges: the production header uses struct tags (style = \"tag\");
+ * the test header references these types without the `struct` keyword
+ * because they are on our cbindgen exclude list (cbindgen can't tell
+ * \"tag\" from \"typedef\" for excluded types). Declaring typedefs here
+ * with the same name as the tag is legal ISO C and lets both spellings
+ * resolve. */
+typedef struct dpdk_net_engine dpdk_net_engine;
+typedef struct dpdk_net_connect_opts_t dpdk_net_connect_opts_t;
+"""
+style = "tag"
+
+[parse]
+parse_deps = false
+
+[export]
+# Force-emit the two test-FFI types. cbindgen's reachability scan picks
+# up these types through the `test_ffi` extern "C" signatures, but
+# listing them explicitly is belt-and-suspenders against future
+# re-factoring that might drop them from a function signature.
+include = [
+    "dpdk_net_test_frame_t",
+    "dpdk_net_listen_handle_t",
+]
+# Skip every production symbol — they live in dpdk_net.h (re-declared
+# here via after_includes). The test header's job is to emit ONLY the
+# test-FFI surface on top of the production header; re-emitting
+# production declarations would produce C-side duplicate-declaration
+# errors when both headers are included together.
+#
+# The list below mirrors every symbol currently emitted into
+# dpdk_net.h (discovered via `grep -oE 'dpdk_net_[a-zA-Z_]+'` on the
+# generated file). If dpdk_net.h grows a new production symbol, add
+# it here too; the `test_header_excluded::test_header_present_when_feature_on`
+# integration test verifies the 10 test functions remain emitted.
+exclude = [
+    "EngineConfigRustOnly",
+    "dpdk_net_panic_for_test",
+    # Production functions
+    "dpdk_net_eal_init",
+    "dpdk_net_engine_create",
+    "dpdk_net_engine_destroy",
+    "dpdk_net_engine_add_local_ip",
+    "dpdk_net_poll",
+    "dpdk_net_flush",
+    "dpdk_net_now_ns",
+    "dpdk_net_counters",
+    "dpdk_net_rx_mempool_size",
+    "dpdk_net_scrape_xstats",
+    "dpdk_net_recommended_ena_devargs",
+    "dpdk_net_conn_stats",
+    "dpdk_net_conn_rtt_histogram",
+    "dpdk_net_resolve_gateway_mac",
+    "dpdk_net_connect",
+    "dpdk_net_send",
+    "dpdk_net_close",
+    "dpdk_net_timer_add",
+    "dpdk_net_timer_cancel",
+    # Production types + typedefs
+    "dpdk_net_engine",
+    "dpdk_net_engine_config_t",
+    "dpdk_net_connect_opts_t",
+    "dpdk_net_event_kind_t",
+    "dpdk_net_iovec_t",
+    "dpdk_net_event_readable_t",
+    "dpdk_net_event_error_t",
+    "dpdk_net_event_timer_t",
+    "dpdk_net_event_tcp_retrans_t",
+    "dpdk_net_event_tcp_loss_t",
+    "dpdk_net_event_tcp_state_t",
+    "dpdk_net_event_payload_t",
+    "dpdk_net_event_t",
+    "dpdk_net_eth_counters_t",
+    "dpdk_net_ip_counters_t",
+    "dpdk_net_tcp_counters_t",
+    "dpdk_net_poll_counters_t",
+    "dpdk_net_counters_t",
+    "dpdk_net_conn_stats_t",
+    "dpdk_net_conn_t",
+    "dpdk_net_timer_id_t",
+    "dpdk_net_tcp_rtt_histogram_t",
+    # Production preset / close-flag macros (cbindgen emits `pub const`
+    # as `#define`)
+    "DPDK_NET_PRESET_LATENCY",
+    "DPDK_NET_PRESET_RFC_COMPLIANCE",
+    "DPDK_NET_CLOSE_FORCE_TW_SKIP",
+]

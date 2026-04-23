@@ -6,7 +6,13 @@ members = [
     "crates/dpdk-net",
     "tests/ffi-test",
     "tools/bench-rx-zero-copy",
+    "tools/packetdrill-shim-runner",
+    "tools/scapy-fuzz-runner",
+    "tools/tcpreq-runner",
 ]
+# fuzz/ is a sibling sub-Cargo-project pinned to nightly; kept out of the
+# stable main workspace. See crates/dpdk-net-core/fuzz/rust-toolchain.toml.
+exclude = ["crates/dpdk-net-core/fuzz"]
 
 [workspace.package]
 version = "0.1.0"

@@ -1,0 +1,60 @@
+From 7e26841c675902b05dc4a7699ef8148389cc43f8 Mon Sep 17 00:00:00 2001
+From: A7 Shim <a7-shim@local>
+Date: Tue, 21 Apr 2026 16:33:57 +0000
+Subject: [PATCH 5/5] shim: route socket teardown close through so_instance
+
+socket_close() historically calls libc close(2) on fd->live_fd when
+packetdrill shuts a connection down at state_free / close_all_fds
+time. Under the A7 shim, live_fd is a synthetic fd (SHIM_FD_BASE=1000
+and up) backed by dpdk_net_shim's fd table, not a real kernel fd. The
+direct libc close() therefore returns -1/EBADF, which packetdrill
+treats as fatal via die_perror("close") -> exit(EXIT_FAILURE), turning
+a clean script completion into a spurious non-zero exit and the
+"close: Bad file descriptor" stderr line.
+
+Fix: when state->so_instance is populated (i.e. the shim is active),
+route the teardown close through so_instance->ifc.close the same way
+syscall_close already does in run_system_call.c around line 2510.
+This lets dpdk_net_shim's shim_close handler free the fd slot (and
+dpdk_net_test_close the underlying connection handle, if any) using
+the same path that explicit close() syscalls in the script take.
+
+No behaviour change when so_instance is NULL (classic libc path).
+---
+ gtests/net/packetdrill/socket.c | 16 +++++++++++++++-
+ 1 file changed, 15 insertions(+), 1 deletion(-)
+
+diff --git a/gtests/net/packetdrill/socket.c b/gtests/net/packetdrill/socket.c
+index c661c5a..de4d427 100644
+--- a/gtests/net/packetdrill/socket.c
++++ b/gtests/net/packetdrill/socket.c
+@@ -33,11 +33,25 @@ void socket_close(struct state *state, struct fd_state *fd)
+ 	struct socket *socket = fd_to_socket(fd);
+ 
+ 	if (fd->live_fd >= 0 && !socket->fd.is_closed) {
++		int rc;
+ 		assert(fd->script_fd >= 0);
+ 		DEBUGP("closing struct state socket "
+ 		       "live.fd:%d script.fd:%d\n",
+ 		       fd->live_fd, fd->script_fd);
+-		if (close(fd->live_fd))
++		/* A7 shim: route live-fd teardown through the so_instance
++		 * interface when present, so synthetic fds (e.g. the
++		 * dpdk_net_shim fd-table rooted at SHIM_FD_BASE) go through
++		 * the shim's close handler instead of libc's close(2) --
++		 * calling libc close() on a synthetic fd returns EBADF and
++		 * trips die_perror at teardown. Mirrors run_system_call.c
++		 * syscall_close (circa line 2510). */
++		if (state->so_instance)
++			rc = state->so_instance->ifc.close(
++				state->so_instance->ifc.userdata,
++				fd->live_fd);
++		else
++			rc = close(fd->live_fd);
++		if (rc)
+ 			die_perror("close");
+ 	}
+ 	if (socket->protocol == IPPROTO_TCP &&
+-- 
+2.34.1
+

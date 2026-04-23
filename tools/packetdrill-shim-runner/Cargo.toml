@@ -1,0 +1,41 @@
+[package]
+name = "packetdrill-shim-runner"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[features]
+default = []
+# Pass-through; enables dpdk-net's test-server which enables
+# dpdk-net-core's test-server.
+test-server = ["dpdk-net/test-server"]
+
+[dependencies]
+dpdk-net = { path = "../../crates/dpdk-net", default-features = false }
+regex = "1"
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+walkdir = "2"
+
+[dev-dependencies]
+# A7 Task 12: the two shim direct self-tests (shim_inject_drain_roundtrip
+# and shim_virt_time_rto) exercise the test-FFI at the Rust level by
+# calling `Engine::inject_rx_frame` / `drain_tx_frames` / `pump_timers`
+# directly. They need dpdk-net-core's public surface (Engine, EngineConfig,
+# clock::set_virt_ns, test_tx_intercept, test_server::test_packet); the
+# runner crate otherwise only depends on the `dpdk-net` C-ABI facade.
+dpdk-net-core = { path = "../../crates/dpdk-net-core" }
+
+[[bin]]
+name = "pdshim-run-one"
+path = "src/main.rs"
+
+# A7 Task 15: inventory tools to classify + dry-run the corpus.
+[[bin]]
+name = "dry-classify"
+path = "src/bin/dry-classify.rs"
+
+[[bin]]
+name = "dry-run"
+path = "src/bin/dry-run.rs"
