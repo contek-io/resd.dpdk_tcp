@@ -1,0 +1,3 @@
+# Build artefact — produced by `make -C tools/bench-vs-linux/peer` or by
+# bench-nightly.sh's pre-provision build step.
+linux-tcp-sink
