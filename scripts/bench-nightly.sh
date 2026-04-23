@@ -141,7 +141,12 @@ elif [ -f "$RESD_INFRA_DIR/cdk.json" ]; then
   fi
 fi
 
-STACK_JSON="$(
+# Capture the full CLI output — includes CDK deploy progress (stderr
+# would be cleaner but the CLI merges both into stdout today) plus the
+# `Outputs:` block at the end. The `--json` flag is passed through but
+# the current CLI doesn't honour it for setup; extract each output by
+# name from the `bench-pair.KEY = VALUE` lines instead.
+CLI_STDOUT="$(
   cd "$RESD_INFRA_DIR" && \
   resd-aws-infra setup bench-pair \
       --operator-ssh-cidr "$OPERATOR_CIDR" "${AMI_ID_ARG[@]}" --json
@@ -157,19 +162,34 @@ teardown_fleet() {
 }
 trap teardown_fleet EXIT
 
-DUT_SSH="$(jq -r .DutSshEndpoint <<<"$STACK_JSON")"
-PEER_SSH="$(jq -r .PeerSshEndpoint <<<"$STACK_JSON")"
-DUT_INSTANCE_ID="$(jq -r .DutInstanceId <<<"$STACK_JSON")"
-PEER_INSTANCE_ID="$(jq -r .PeerInstanceId <<<"$STACK_JSON")"
-DUT_IP="$(jq -r .DutDataEniIp <<<"$STACK_JSON")"
-PEER_IP="$(jq -r .PeerDataEniIp <<<"$STACK_JSON")"
-AMI_ID="$(jq -r .AmiId <<<"$STACK_JSON")"
+# Extract one stack output by key from the CDK `Outputs:` block. Matches
+# lines of the form `bench-pair.KEY = VALUE` (any amount of whitespace
+# around `=`). Empty string if the key is absent.
+extract_output() {
+  awk -v key="bench-pair.$1" '
+    $1 == key {
+      # Everything after the first "=" (trim leading whitespace).
+      sub(/^[^=]*=[[:space:]]*/, "")
+      print
+      exit
+    }
+  ' <<<"$CLI_STDOUT"
+}
+
+DUT_SSH="$(extract_output DutSshEndpoint)"
+PEER_SSH="$(extract_output PeerSshEndpoint)"
+DUT_INSTANCE_ID="$(extract_output DutInstanceId)"
+PEER_INSTANCE_ID="$(extract_output PeerInstanceId)"
+DUT_IP="$(extract_output DutDataEniIp)"
+PEER_IP="$(extract_output PeerDataEniIp)"
+AMI_ID="$(extract_output AmiId)"
 
 for var in DUT_SSH PEER_SSH DUT_INSTANCE_ID PEER_INSTANCE_ID DUT_IP PEER_IP AMI_ID; do
   val="${!var}"
-  if [ -z "$val" ] || [ "$val" = "null" ]; then
-    log "resd-aws-infra setup bench-pair --json missing $var"
-    log "got: $STACK_JSON"
+  if [ -z "$val" ]; then
+    log "resd-aws-infra setup bench-pair missing output '$var'"
+    log "CLI output tail:"
+    echo "$CLI_STDOUT" | tail -25 | sed 's/^/  /' >&2
     exit 3
   fi
 done
