@@ -23,13 +23,21 @@ done
 git submodule update --init --recursive \
   third_party/packetdrill third_party/packetdrill-testcases
 
-# 2. Apply the patch stack idempotently. We probe for a patch-applied
-#    file that only exists after 0001 lands (dpdk_net_shim.c), so the
-#    marker survives `git submodule update` wiping the worktree. The
-#    glob loop picks up all patches/*.patch in order, including 0007
-#    (A8.5 T6 env-stubs); the submodule pin in the outer repo already
-#    has them baked in as commits, so normal rebuilds skip this block.
+# 2. Apply the patch stack. Two regimes:
+#    - Patches 0001-0006 are baked into the committed submodule pin
+#      (the current outer-repo pin `6464376` already has those 6
+#      "shim:" commits). Probe: `dpdk_net_shim.c` exists → 0001-0006
+#      already there, skip the baseline-missing fallback.
+#    - Patches 0007+ are A8.5 additions kept as apply-at-build-time so
+#      their commits don't need to be pushed to `github.com/google/packetdrill`
+#      (which we don't control). Apply each via `git apply` with a
+#      `--check` probe so re-runs are idempotent.
 cd third_party/packetdrill
+
+# Fallback: if the submodule is at pristine google upstream (no
+# shim commits baked in), apply every patch in order via `git am`.
+# This path is for disaster-recovery / fresh-fork scenarios, not the
+# committed state.
 if ! [ -f gtests/net/packetdrill/dpdk_net_shim.c ]; then
   shopt -s nullglob
   patches=("$REPO_ROOT"/tools/packetdrill-shim/patches/*.patch)
@@ -40,6 +48,18 @@ if ! [ -f gtests/net/packetdrill/dpdk_net_shim.c ]; then
     done
   fi
 fi
+
+# A8.5 patches (apply-at-build; NOT baked into submodule pin). For each,
+# probe with `git apply --check`: success means the patch would apply
+# cleanly (i.e. not yet applied); non-zero means it's already applied
+# (or would conflict). We apply only on the success branch.
+for p in \
+  "$REPO_ROOT/tools/packetdrill-shim/patches/0007-google-env-stubs.patch" \
+  "$REPO_ROOT/tools/packetdrill-shim/patches/0008-shutdown-syscall-route.patch"; do
+  if [ -f "$p" ] && git apply --check "$p" 2>/dev/null; then
+    git apply "$p"
+  fi
+done
 
 # 3. Build libdpdk_net.a (staticlib) with --features test-server.
 cd "$REPO_ROOT"
