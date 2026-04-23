@@ -221,7 +221,7 @@ impl TcpOpts {
             }
         }
         debug_assert_eq!(i, need, "emitted byte count must match encoded_len");
-        Some(need)
+        Some(i)
     }
 }
 
