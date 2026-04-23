@@ -363,6 +363,7 @@ fn resolve_nic_max_bps(flag: Option<u64>) -> Option<u64> {
 /// at the call sites.
 fn resolve_peer_rwnd_bytes(
     peer_ssh: Option<&str>,
+    dut_ip: std::net::Ipv4Addr,
     peer_port: u16,
     placebo_rwnd: u64,
 ) -> u64 {
@@ -373,7 +374,7 @@ fn resolve_peer_rwnd_bytes(
         );
         return placebo_rwnd;
     };
-    match bench_vs_mtcp::peer_introspect::fetch_peer_rwnd_bytes(ssh, peer_port) {
+    match bench_vs_mtcp::peer_introspect::fetch_peer_rwnd_bytes(ssh, dut_ip, peer_port) {
         Ok(v) => v as u64,
         Err(e) => {
             eprintln!(
@@ -411,6 +412,16 @@ fn run_burst_grid_dpdk<W: std::io::Write>(
     );
     let conn = dpdk_burst::open_persistent_connection(engine, peer_ip, peer_port)?;
 
+    // T15-B I-2: parse the DUT's local IP once for the `ss -ti`
+    // filter. `validate_dpdk_args` already bailed if `local_ip` was
+    // empty, so the parse only fails on truly invalid input — we want
+    // the whole run to abort in that case rather than silently fall
+    // back to the placebo bucket-after-bucket.
+    let dut_ip: std::net::Ipv4Addr = args
+        .local_ip
+        .parse()
+        .with_context(|| format!("parsing --local-ip `{}` for peer rwnd probe", args.local_ip))?;
+
     // Pre-allocate one payload buffer per K (reused across bursts
     // within a bucket to keep the inner loop allocation-free).
     let mut payload_cache: std::collections::HashMap<u64, Vec<u8>> = std::collections::HashMap::new();
@@ -442,6 +453,7 @@ fn run_burst_grid_dpdk<W: std::io::Write>(
         // rather than silently passing.
         let peer_rwnd = resolve_peer_rwnd_bytes(
             args.peer_ssh.as_deref(),
+            dut_ip,
             peer_port,
             bucket.burst_bytes,
         );
@@ -659,6 +671,14 @@ fn run_maxtp_grid_dpdk<W: std::io::Write>(
     // Pre-allocate one payload buffer per W (reused across the bucket).
     let mut payload_cache: std::collections::HashMap<u64, Vec<u8>> = std::collections::HashMap::new();
 
+    // T15-B I-2: same `dut_ip` derivation as the burst driver — see
+    // `run_burst_grid_dpdk` above for rationale. Bail here rather
+    // than per-bucket.
+    let dut_ip: std::net::Ipv4Addr = args
+        .local_ip
+        .parse()
+        .with_context(|| format!("parsing --local-ip `{}` for peer rwnd probe", args.local_ip))?;
+
     for bucket in grid {
         eprintln!("bench-vs-mtcp: running dpdk_net maxtp bucket {}", bucket.label());
 
@@ -675,6 +695,7 @@ fn run_maxtp_grid_dpdk<W: std::io::Write>(
         // call in `run_burst_grid_dpdk` above for the contract.
         let peer_rwnd = resolve_peer_rwnd_bytes(
             args.peer_ssh.as_deref(),
+            dut_ip,
             peer_port,
             bucket.write_bytes,
         );

@@ -269,6 +269,44 @@ pub fn canonicalize_pcap(
     Ok(out_buf)
 }
 
+/// A per-tuple pass-1 final instance-counter readout. `endpoints` is
+/// the sorted 4-tuple `(low_ip, low_port, high_ip, high_port)` as
+/// pass-1 key-builds it; `final_instance` is the `syn_count[tuple]`
+/// value after pass-1 walks the whole capture.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Pass1InstanceCount {
+    /// Sorted 4-tuple endpoints, lex-smaller endpoint first.
+    pub endpoints: (Ipv4Addr, u16, Ipv4Addr, u16),
+    /// Final value of `syn_count[tuple]` after pass-1 completes — the
+    /// number of distinct SYN openings that pass-1 counted.
+    pub final_instance: u32,
+}
+
+/// Test-only probe: run pass-1 and return the per-tuple final SYN
+/// instance counter. Used by the `normalize_roundtrip` suite to pin
+/// the invariant "SYN retransmits do not bump the instance counter"
+/// (I-1). Returns sorted endpoints as a plain tuple so tests don't
+/// need visibility on the private `ConnTuple`/`FlowState` internals.
+pub fn probe_pass1_instance_counts(
+    pcap_bytes: &[u8],
+) -> Result<Vec<Pass1InstanceCount>, CanonError> {
+    let mut state = FlowState::default();
+    let cursor = Cursor::new(pcap_bytes);
+    let mut reader = PcapReader::new(cursor)?;
+    while let Some(pkt) = reader.next_packet() {
+        let pkt = pkt?;
+        discover_pins(&pkt.data, &mut state)?;
+    }
+    Ok(state
+        .syn_count
+        .into_iter()
+        .map(|(t, n)| Pass1InstanceCount {
+            endpoints: (t.low_ip, t.low_port, t.high_ip, t.high_port),
+            final_instance: n,
+        })
+        .collect())
+}
+
 /// Pass 1 walker: note the ISS (first seq seen per direction +
 /// connection instance) and TS base (first TSval seen per direction)
 /// without rewriting.
@@ -298,13 +336,28 @@ fn discover_pins(data: &[u8], state: &mut FlowState) -> Result<(), CanonError> {
     );
 
     // SYN observations bump the per-tuple instance counter *before*
-    // recording the ISS, so each SYN lands in its own slot.
+    // recording the ISS, so each SYN lands in its own slot. A pure
+    // SYN that repeats the current instance's ISS (i.e. a SYN
+    // retransmit) MUST NOT bump — otherwise every retransmit wastes a
+    // state slot and, worse, pass-1 and pass-2 desync because pass-2
+    // replays the walk and would land on a different instance for the
+    // retransmit vs. the original SYN.
     if (frame.flags & TCP_FLAG_SYN) != 0 && (frame.flags & TCP_FLAG_ACK) == 0 {
         // A pure SYN opens a new connection instance. Bump for every
-        // active-opener SYN; passive-side SYN-ACKs do NOT bump (they
-        // belong to the opener's existing instance).
-        let counter = state.syn_count.entry(tuple).or_insert(0);
-        *counter += 1;
+        // active-opener SYN with a *new* ISS; passive-side SYN-ACKs do
+        // NOT bump (they belong to the opener's existing instance),
+        // and SYN retransmits with the same ISS as the current
+        // instance do NOT bump either.
+        let current_instance = state.syn_count.get(&tuple).copied().unwrap_or(0);
+        let current_key = FlowKey {
+            tuple,
+            instance: current_instance,
+            is_low,
+        };
+        let existing_iss = state.iss.get(&current_key).copied();
+        if existing_iss != Some(frame.seq) {
+            *state.syn_count.entry(tuple).or_insert(0) += 1;
+        }
     }
     let instance = state.syn_count.get(&tuple).copied().unwrap_or(0);
 
@@ -580,11 +633,21 @@ fn rewrite_frame(
 
     // Replay the per-SYN instance bump the same way pass-1 did. A
     // pure SYN opens a new instance; a SYN+ACK (or any other flag
-    // combination) does not. This keeps pass-2's FlowKey lookups
-    // aligned with pass-1's stored pins.
+    // combination) does not. A SYN retransmit of the current
+    // instance's ISS MUST NOT bump — mirrors pass-1 so (tuple,
+    // instance) FlowKey lookups resolve to the same pin rows as
+    // pass-1 recorded.
     if (flags & TCP_FLAG_SYN) != 0 && (flags & TCP_FLAG_ACK) == 0 {
-        let counter = instance_counter.entry(tuple).or_insert(0);
-        *counter += 1;
+        let current_instance = instance_counter.get(&tuple).copied().unwrap_or(0);
+        let current_key = FlowKey {
+            tuple,
+            instance: current_instance,
+            is_low,
+        };
+        let existing_iss = state.iss.get(&current_key).copied();
+        if existing_iss != Some(seq) {
+            *instance_counter.entry(tuple).or_insert(0) += 1;
+        }
     }
     let instance = instance_counter.get(&tuple).copied().unwrap_or(0);
 

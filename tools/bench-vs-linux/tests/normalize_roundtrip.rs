@@ -31,7 +31,9 @@
 
 use std::io::Cursor;
 
-use bench_vs_linux::normalize::{byte_diff_count, canonicalize_pcap, CanonicalizationOptions};
+use bench_vs_linux::normalize::{
+    byte_diff_count, canonicalize_pcap, probe_pass1_instance_counts, CanonicalizationOptions,
+};
 use pcap_file::pcap::PcapWriter;
 
 mod common;
@@ -635,6 +637,134 @@ fn canonicalize_port_reuse_preserves_per_instance_iss() {
     assert_eq!(
         can_a, can_b,
         "port-reuse flows must canonicalise identically under per-instance keying"
+    );
+}
+
+#[test]
+fn canonicalize_syn_retransmit_does_not_bump_instance() {
+    // T15-B I-1: a SYN retransmit (pure SYN re-sending the same ISS
+    // on the same 4-tuple) MUST NOT bump the per-tuple instance
+    // counter. If it did, the retransmit would land on a fresh
+    // instance slot that (a) wastes a state row and (b) desyncs
+    // pass-1/pass-2 on port-reuse scenarios because pass-2 replays
+    // the same walk order.
+    //
+    // Scenario: SYN at seq=X (instance=1), SYN at seq=X retransmit
+    // (still instance=1), SYN-ACK, data. Assertions:
+    //   1. Canonicalised first-direction segments all rewrite the
+    //      same observed ISS (X) to the canonical ISS — so three
+    //      segments (two SYNs + one data) whose seq is `a_iss + k`
+    //      canonicalise to `canonical_iss + k` across both pcaps.
+    //   2. The per-tuple final instance count is 1 after pass-1 (a
+    //      single connection), not 2.
+    let make = |a_iss: u32, b_iss: u32, a_mac: [u8; 6], b_mac: [u8; 6]| -> Vec<u8> {
+        let a_ip = [10, 0, 0, 1];
+        let b_ip = [10, 0, 0, 2];
+        let a_port: u16 = 40000;
+        let b_port: u16 = 10001;
+        let mk_syn = |seq: u32| SynthPacket {
+            eth_src: a_mac,
+            eth_dst: b_mac,
+            ethertype: 0x0800,
+            ipv4: Some(SynthIpv4 {
+                src_ip: a_ip,
+                dst_ip: b_ip,
+                ip_id: 0,
+                proto: 6,
+                tcp: Some(SynthTcp {
+                    src_port: a_port,
+                    dst_port: b_port,
+                    seq,
+                    ack: 0,
+                    data_offset: 20,
+                    flags: TCP_FLAG_SYN,
+                    window: 64240,
+                    options: Vec::new(),
+                    payload: Vec::new(),
+                }),
+            }),
+            raw_payload: Vec::new(),
+        };
+        let syn1 = mk_syn(a_iss);
+        // Retransmit: same seq (= ISS), same tuple, same flags.
+        let syn2 = mk_syn(a_iss);
+        let synack = SynthPacket {
+            eth_src: b_mac,
+            eth_dst: a_mac,
+            ethertype: 0x0800,
+            ipv4: Some(SynthIpv4 {
+                src_ip: b_ip,
+                dst_ip: a_ip,
+                ip_id: 0,
+                proto: 6,
+                tcp: Some(SynthTcp {
+                    src_port: b_port,
+                    dst_port: a_port,
+                    seq: b_iss,
+                    ack: a_iss.wrapping_add(1),
+                    data_offset: 20,
+                    flags: TCP_FLAG_SYN | TCP_FLAG_ACK,
+                    window: 64240,
+                    options: Vec::new(),
+                    payload: Vec::new(),
+                }),
+            }),
+            raw_payload: Vec::new(),
+        };
+        // Data segment from the opener side: seq = a_iss + 1.
+        let data = SynthPacket {
+            eth_src: a_mac,
+            eth_dst: b_mac,
+            ethertype: 0x0800,
+            ipv4: Some(SynthIpv4 {
+                src_ip: a_ip,
+                dst_ip: b_ip,
+                ip_id: 0,
+                proto: 6,
+                tcp: Some(SynthTcp {
+                    src_port: a_port,
+                    dst_port: b_port,
+                    seq: a_iss.wrapping_add(1),
+                    ack: b_iss.wrapping_add(1),
+                    data_offset: 20,
+                    flags: TCP_FLAG_ACK,
+                    window: 64240,
+                    options: Vec::new(),
+                    payload: b"hi".to_vec(),
+                }),
+            }),
+            raw_payload: Vec::new(),
+        };
+        build_pcap(&[syn1, syn2, synack, data])
+    };
+    // Two pcaps with different ISS. Under the correct (no-bump)
+    // behaviour they canonicalise byte-identical; under the buggy
+    // (always-bump) behaviour they diverge on the second SYN and
+    // the post-SYN data segment.
+    let pcap_a = make(0xDEAD_BEEF, 0xFACE_F00D, mac(0x01), mac(0x02));
+    let pcap_b = make(0x0000_0007, 0x9000_0000, mac(0xAA), mac(0xBB));
+    let opts = CanonicalizationOptions::default();
+    let can_a = canonicalize_pcap(&pcap_a, &opts).expect("canonicalise A");
+    let can_b = canonicalize_pcap(&pcap_b, &opts).expect("canonicalise B");
+    assert_eq!(
+        can_a, can_b,
+        "SYN retransmit must not perturb per-direction ISS rewrite"
+    );
+    // Confirm the per-tuple instance count is 1, not 2. Only one
+    // tuple in this capture.
+    let counts_a = probe_pass1_instance_counts(&pcap_a).expect("probe A");
+    let counts_b = probe_pass1_instance_counts(&pcap_b).expect("probe B");
+    assert_eq!(counts_a.len(), 1, "exactly one tuple expected in capture A");
+    assert_eq!(counts_b.len(), 1, "exactly one tuple expected in capture B");
+    assert_eq!(
+        counts_a[0].final_instance, 1,
+        "SYN retransmit must NOT bump syn_count (got {} for tuple {:?})",
+        counts_a[0].final_instance, counts_a[0].endpoints
+    );
+    assert_eq!(
+        counts_b[0].final_instance, 1,
+        "SYN retransmit must NOT bump syn_count (got {} for tuple {:?})",
+        counts_b[0].final_instance, counts_b[0].endpoints
     );
 }
 

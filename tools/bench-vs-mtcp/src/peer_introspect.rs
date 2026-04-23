@@ -6,8 +6,12 @@
 //!
 //! # Transport choice
 //!
-//! We shell out to `ssh <peer> "ss -ti state established '( dport = :<N>
-//! )'"` and parse the textual output. `ss`'s kernel interface (netlink
+//! We shell out to `ssh <peer> "ss -ti state established '( sport = :<N>
+//! and dst = <dut_ip> )'"` and parse the textual output. The filter
+//! uses `sport` (the peer's source port is the listen port our DUT
+//! connected to) and pins on `dst = <dut_ip>` so a side-channel
+//! socket bound to the same listen port on the peer cannot confuse
+//! the scrape (I-2). `ss`'s kernel interface (netlink
 //! INET_DIAG) is not exposed through a stable Rust binding at the
 //! moment, and pulling a new crate (`netlink-packet-*` or `tokio-diag`)
 //! into the benchmark harness would bloat the DPDK build closure. The
@@ -49,13 +53,14 @@
 //! backoff, which empirically covers the connection-setup window on
 //! c6in.metal.
 
+use std::net::Ipv4Addr;
 use std::process::Command;
 use std::time::Duration;
 
 use anyhow::{anyhow, Context};
 
 /// Fetch the peer-side advertised receive window for the single
-/// established connection matching `peer_port`.
+/// established connection matching `peer_port` and our DUT's IP.
 ///
 /// Returns the clamped window `min(rcv_space, rcv_ssthresh)` if both
 /// fields are parseable. If only `rcv_space` is available, returns
@@ -64,21 +69,29 @@ use anyhow::{anyhow, Context};
 /// # Arguments
 ///
 /// - `peer_ssh` — SSH target (e.g. `ubuntu@10.0.0.2`).
-/// - `peer_port` — the TCP dest-port on the peer side (the peer's
-///   listen port). Used to filter `ss` output down to our connection.
+/// - `dut_ip` — the DUT's IPv4 address. Used as `dst = <dut_ip>` in
+///   the `ss` filter so side-channel sockets bound to the same listen
+///   port on the peer cannot confuse the rwnd scrape (T15-B I-2).
+/// - `peer_port` — the TCP source-port on the peer side (the peer's
+///   listen port, i.e. the DUT's dest port). Used to filter `ss`
+///   output down to our connection.
 ///
 /// # Retries
 ///
 /// Retries up to 3 times with 500 ms sleep between attempts on
 /// SSH-process-level failure or empty `ss` output (connection not yet
 /// visible).
-pub fn fetch_peer_rwnd_bytes(peer_ssh: &str, peer_port: u16) -> anyhow::Result<u32> {
+pub fn fetch_peer_rwnd_bytes(
+    peer_ssh: &str,
+    dut_ip: Ipv4Addr,
+    peer_port: u16,
+) -> anyhow::Result<u32> {
     const MAX_ATTEMPTS: usize = 3;
     const BACKOFF: Duration = Duration::from_millis(500);
 
     let mut last_err: Option<anyhow::Error> = None;
     for attempt in 1..=MAX_ATTEMPTS {
-        match fetch_peer_rwnd_bytes_once(peer_ssh, peer_port) {
+        match fetch_peer_rwnd_bytes_once(peer_ssh, dut_ip, peer_port) {
             Ok(v) => return Ok(v),
             Err(e) => {
                 last_err = Some(e);
@@ -93,9 +106,12 @@ pub fn fetch_peer_rwnd_bytes(peer_ssh: &str, peer_port: u16) -> anyhow::Result<u
 
 /// One-shot (no retry) SSH round-trip. Split out of the retry loop so
 /// the retry policy is testable in isolation of the parser.
-fn fetch_peer_rwnd_bytes_once(peer_ssh: &str, peer_port: u16) -> anyhow::Result<u32> {
-    let filter = format!("sport = :{peer_port}");
-    let cmd = format!("ss -tni state established '( {filter} )'");
+fn fetch_peer_rwnd_bytes_once(
+    peer_ssh: &str,
+    dut_ip: Ipv4Addr,
+    peer_port: u16,
+) -> anyhow::Result<u32> {
+    let cmd = build_ss_command(dut_ip, peer_port);
     let out = Command::new("ssh")
         .args(["-o", "StrictHostKeyChecking=no", peer_ssh, &cmd])
         .output()
@@ -109,6 +125,15 @@ fn fetch_peer_rwnd_bytes_once(peer_ssh: &str, peer_port: u16) -> anyhow::Result<
     }
     let stdout = String::from_utf8_lossy(&out.stdout);
     parse_rcv_window(&stdout)
+}
+
+/// Build the `ss -ti` filter string. Extracted for unit-test
+/// visibility: the filter body is the load-bearing I-2 fix and the
+/// test suite pins it end-to-end (sport + dst, both required).
+fn build_ss_command(dut_ip: Ipv4Addr, peer_port: u16) -> String {
+    format!(
+        "ss -tni state established '( sport = :{peer_port} and dst = {dut_ip} )'",
+    )
 }
 
 /// Parse the `rcv_space` (and optionally `rcv_ssthresh`) numeric field
@@ -229,5 +254,30 @@ mod tests {
     fn extract_numeric_field_terminates_at_eof() {
         let v = extract_numeric_field("rcv_space:7777", "rcv_space:").expect("extract");
         assert_eq!(v, 7777);
+    }
+
+    #[test]
+    fn ss_command_includes_sport_and_dst_filter() {
+        // T15-B I-2: the filter MUST pin both `sport = :<peer_port>`
+        // AND `dst = <dut_ip>`. If a side-channel socket on the peer
+        // happens to share the listen port but talks to a different
+        // peer, the `dst` clause forces `ss` to show only the
+        // DUT-originated connection we care about.
+        let dut_ip: Ipv4Addr = "10.0.0.1".parse().unwrap();
+        let cmd = build_ss_command(dut_ip, 10_001);
+        assert!(
+            cmd.contains("sport = :10001"),
+            "expected sport filter, got `{cmd}`"
+        );
+        assert!(
+            cmd.contains("dst = 10.0.0.1"),
+            "expected dst-IP filter, got `{cmd}`"
+        );
+        // Also confirm the `and` conjunction is present — a stray
+        // comma or OR would defeat the purpose of the pinning.
+        assert!(
+            cmd.contains(" and "),
+            "expected `and` between filters, got `{cmd}`"
+        );
     }
 }
