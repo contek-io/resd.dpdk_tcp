@@ -237,17 +237,29 @@ refresh_ec2_ic_grants
 # instance starts running, but sshd may still be initialising (kex +
 # host-key generation + auth stack). We refresh the EC2IC grant on
 # every retry so the 60 s auth window never closes during a slow boot.
+#
+# Require REQUIRED_CONSECUTIVE successful handshakes in a row with a
+# gap between each — a single success can race a transient sshd restart
+# (cloud-init finalisation) and cause the immediately-following scp to
+# hit "kex_exchange_identification: Connection closed by remote host".
 wait_for_ssh() {
   local host="$1"
   local instance_id="$2"
   local attempt=0
+  local consecutive=0
+  local required_consecutive=3
   local max_attempts=30  # 30 * 5 s = 150 s ceiling
   while (( attempt < max_attempts )); do
     push_operator_pubkey "$instance_id"
     if ssh "${SSH_OPTS[@]}" -o BatchMode=yes -o ConnectTimeout=5 \
          "ubuntu@${host}" exit 2>/dev/null; then
-      log "  sshd ready on $host (attempt $((attempt+1)))"
-      return 0
+      consecutive=$((consecutive + 1))
+      if (( consecutive >= required_consecutive )); then
+        log "  sshd ready on $host (after ${consecutive} consecutive ok probes, attempt $((attempt+1)))"
+        return 0
+      fi
+    else
+      consecutive=0
     fi
     attempt=$((attempt + 1))
     sleep 5
