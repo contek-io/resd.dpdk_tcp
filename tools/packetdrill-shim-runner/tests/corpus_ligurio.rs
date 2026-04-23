@@ -93,3 +93,59 @@ fn ligurio_runnable_subset_passes() {
     assert_eq!(skip_untrans.len(), counts::LIGURIO_SKIP_UNTRANSLATABLE);
     assert_eq!(skip_oos.len(),     counts::LIGURIO_SKIP_OUT_OF_SCOPE);
 }
+
+/// A8.5 T9: soak-test the crash-safety corpus under CI control.
+///
+/// The main `ligurio_runnable_subset_passes` test runs each no-crash
+/// script exactly once per `cargo test` invocation. That catches a
+/// deterministic SIGSEGV but not a low-rate flake. This `#[ignore]`
+/// test loops `LIGURIO_SOAK_ITERS` (env, default 100) per no-crash
+/// script and gates on signal-kill the same way. Run via:
+///
+///   LIGURIO_SOAK_ITERS=100 cargo test -p packetdrill-shim-runner \
+///     --features test-server --test corpus_ligurio -- --ignored \
+///     ligurio_no_crash_soak
+///
+/// Zero crashes across N × 6 iterations proves the invariant at a
+/// higher confidence than single-run CI.
+#[test]
+#[ignore]
+fn ligurio_no_crash_soak() {
+    let iters: usize = std::env::var("LIGURIO_SOAK_ITERS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(100);
+
+    let bin = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../target/packetdrill-shim/packetdrill");
+    let classifier = Classifier::load();
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(CORPUS_ROOT);
+
+    let mut no_crash: Vec<PathBuf> = vec![];
+    for entry in WalkDir::new(&root).into_iter().filter_map(Result::ok) {
+        let path = entry.into_path();
+        if path.extension().and_then(|e| e.to_str()) != Some("pkt") { continue; }
+        if let Verdict::RunnableNoCrash(_) = classifier.classify(&path) {
+            no_crash.push(path);
+        }
+    }
+    assert_eq!(no_crash.len(), counts::LIGURIO_NO_CRASH_COUNT);
+
+    let mut crashes: Vec<(PathBuf, usize, invoker::RunOutcome)> = vec![];
+    for script in &no_crash {
+        for i in 0..iters {
+            let out = invoker::run_script(&bin, script);
+            if out.exit > 128 || out.exit < 0 || out.timed_out {
+                crashes.push((script.clone(), i, out));
+                break;
+            }
+        }
+    }
+    assert!(crashes.is_empty(),
+        "{} crash(es) observed across {} × {} iterations. Examples:\n{}",
+        crashes.len(), no_crash.len(), iters,
+        crashes.iter().take(5).map(|(p, i, o)|
+            format!("- {} (iter {}): exit={} timed_out={} stderr={}",
+                p.display(), i, o.exit, o.timed_out, o.stderr)
+        ).collect::<Vec<_>>().join("\n"));
+}
