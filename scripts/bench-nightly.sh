@@ -432,11 +432,16 @@ run_dut_bench bench-e2e bench-e2e \
 # needs peer SSH + iface name).
 # ---------------------------------------------------------------------------
 log "[8/12] bench-stress"
+# Default matrix bundles multiple FaultInjector specs which can't coexist
+# (FI is singleton per Engine). Pick the 4 netem-only scenarios for a
+# single bench-stress pass that produces a usable sweep CSV. FI scenarios
+# can be run individually as a follow-up once the base nightly is green.
 run_dut_bench bench-stress bench-stress \
     "${DPDK_COMMON[@]}" \
     --peer-port 10001 \
     --peer-ssh "ubuntu@$PEER_SSH" \
     --peer-iface ens6 \
+    --scenarios random_loss_01pct_10ms,correlated_burst_loss_1pct,reorder_depth_3,duplication_2x \
     --tool bench-stress \
     --feature-set trading-latency \
     || log "  [8/12] bench-stress exited non-zero — continuing"
@@ -532,15 +537,20 @@ diff may still be meaningful"
 
   # Pull pcaps back. SCP's -C compresses on the wire; useful over the
   # operator-to-AWS link when captures are large. `sudo chown ubuntu`
-  # fixes perms so the scp user can read.
+  # fixes perms so the scp user can read. Each step tolerates a missing
+  # file (e.g., if the capture workload above bailed at handshake before
+  # tcpdump saw any traffic) so the pcap-harvest failure doesn't kill
+  # the rest of the nightly pipeline.
   ssh "${SSH_OPTS[@]}" "ubuntu@$DUT_SSH" \
-      "sudo chown ubuntu:ubuntu /tmp/mode-b-local.pcap"
+      "sudo chown ubuntu:ubuntu /tmp/mode-b-local.pcap 2>/dev/null || true"
   ssh "${SSH_OPTS[@]}" "ubuntu@$PEER_SSH" \
-      "sudo chown ubuntu:ubuntu /tmp/mode-b-peer.pcap"
+      "sudo chown ubuntu:ubuntu /tmp/mode-b-peer.pcap 2>/dev/null || true"
   scp "${SCP_OPTS[@]}" "ubuntu@$DUT_SSH:/tmp/mode-b-local.pcap" \
-      "$OUT_DIR/pcaps/local.pcap"
+      "$OUT_DIR/pcaps/local.pcap" \
+      || log "        WARN local pcap missing or empty — wire-diff will skip"
   scp "${SCP_OPTS[@]}" "ubuntu@$PEER_SSH:/tmp/mode-b-peer.pcap" \
-      "$OUT_DIR/pcaps/peer.pcap"
+      "$OUT_DIR/pcaps/peer.pcap" \
+      || log "        WARN peer pcap missing or empty — wire-diff will skip"
 fi
 
 # Invoke the wire-diff mode locally. Mode B runs locally (no EAL
@@ -548,16 +558,20 @@ fi
 # and is the expected signal for operator attention; we don't `exit`
 # on it here because the rest of the nightly pipeline (bench-report)
 # still needs to run.
-if ! ./target/release/bench-vs-linux \
-    --mode wire-diff \
-    --peer-ip "$PEER_IP" \
-    --local-pcap "$OUT_DIR/pcaps/local.pcap" \
-    --peer-pcap "$OUT_DIR/pcaps/peer.pcap" \
-    --output-csv "$OUT_DIR/bench-vs-linux-wire-diff.csv" \
-    --feature-set rfc-compliance \
-    --precondition-mode lenient; then
-  log "        WARN wire-diff found divergence or failed; see \
+if [ -s "$OUT_DIR/pcaps/local.pcap" ] && [ -s "$OUT_DIR/pcaps/peer.pcap" ]; then
+  if ! ./target/release/bench-vs-linux \
+      --mode wire-diff \
+      --peer-ip "$PEER_IP" \
+      --local-pcap "$OUT_DIR/pcaps/local.pcap" \
+      --peer-pcap "$OUT_DIR/pcaps/peer.pcap" \
+      --output-csv "$OUT_DIR/bench-vs-linux-wire-diff.csv" \
+      --feature-set rfc-compliance \
+      --precondition-mode lenient; then
+    log "        WARN wire-diff found divergence or failed; see \
 $OUT_DIR/bench-vs-linux-wire-diff.csv"
+  fi
+else
+  log "        SKIP wire-diff: one or both pcaps missing/empty"
 fi
 
 # ---------------------------------------------------------------------------
