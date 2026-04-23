@@ -23,6 +23,11 @@
 //! invariant that each RST is accounted for once, and that the RST+URG
 //! path doesn't accidentally bump the counter twice via a stray URG
 //! handler.
+//!
+//! The plan's third scenario (RST in SYN_SENT) is deliberately skipped —
+//! already covered by Layer A: `counter-coverage::scen_syn_sent_to_closed_rst`
+//! and `tcp_input::syn_sent_rst_matching_our_ack_closes` (per A8.5 spec
+//! §1.1 "don't duplicate Layer A" principle).
 
 use std::sync::atomic::Ordering;
 
@@ -41,12 +46,12 @@ use dpdk_net_core::test_tx_intercept::drain_tx_frames;
 const PORT_A: u16 = 5571;
 /// Scenario B listen port.
 const PORT_B: u16 = 5572;
-/// Peer source port for both scenarios (distinct from listen ports
+/// Peer source ports — one per scenario (distinct from listen ports
 /// above; no semantic significance beyond "some free ephemeral port").
 const PEER_PORT_A: u16 = 40_001;
 const PEER_PORT_B: u16 = 40_002;
 /// Peer ISS seed for both scenarios. Fixed; the `+1` convention in the
-/// final-ACK / data-segment `seq` mirrors every other 3WHS in this crate.
+/// final-ACK `seq` mirrors every other 3WHS in this crate.
 const PEER_ISS: u32 = 0x10_00_00_00;
 const PEER_MSS: u16 = 1460;
 
