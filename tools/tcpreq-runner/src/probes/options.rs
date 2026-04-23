@@ -29,7 +29,7 @@
 
 use crate::{
     recompute_ip_csum, recompute_tcp_csum, ProbeResult, ProbeStatus, TcpreqHarness, OUR_IP,
-    PEER_IP,
+    PEER_IP, TCP_HDR_OFFSET,
 };
 
 use dpdk_net_core::clock::set_virt_ns;
@@ -43,10 +43,6 @@ const PEER_PORT: u16 = 40_000;
 const PEER_ISS: u32 = 0x10_00_00_00;
 const PEER_MSS: u16 = 1460;
 
-/// L2 Ethernet header (14) + IPv4 header (20, no IP options) — the
-/// test-server `build_segment` always emits this exact layout. TCP
-/// header starts at byte 34. Options start at TCP + 20 = 54.
-const TCP_HDR_OFFSET: usize = 14 + 20;
 /// Byte 12 of the TCP header holds the DataOffset nibble in its high
 /// four bits (low nibble is reserved, which is always 0 on our TX path).
 const DO_BYTE_OFFSET: usize = TCP_HDR_OFFSET + 12;
