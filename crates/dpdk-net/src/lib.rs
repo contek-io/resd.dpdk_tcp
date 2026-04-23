@@ -1025,6 +1025,39 @@ pub unsafe extern "C" fn dpdk_net_close(
     }
 }
 
+/// A8.5 T7 (spec §4 + §6.4 `AD-A8.5-shutdown-no-half-close`): POSIX
+/// `shutdown(2)` subset — full-close only.
+///
+/// `how` values:
+/// * `DPDK_NET_SHUT_RDWR` (2) — full close; dispatches to
+///   `dpdk_net_close(engine, conn, 0)` and returns its result. Use the
+///   `dpdk_net_close` path directly when callers need
+///   `DPDK_NET_CLOSE_FORCE_TW_SKIP` (`dpdk_net_shutdown` always passes
+///   `flags=0`).
+/// * `DPDK_NET_SHUT_RD` (0) and `DPDK_NET_SHUT_WR` (1) — return
+///   `-EOPNOTSUPP` without touching the connection. Half-close is not
+///   implemented: the RX-side deliver-after-SHUT_RD semantics and the
+///   TX-side retransmit-after-half-closed-write timing carry TCB edge
+///   cases that Stage 1's byte-stream REST/WS client workload never
+///   needs. See spec §6.4 row `AD-A8.5-shutdown-no-half-close` for the
+///   full promotion gate (HTTP/1.1 pipelining in Stage 3 and WebSocket
+///   close-frame handling in Stage 5 reopen this row).
+/// * Any other `how` — return `-EINVAL`.
+///
+/// Returns 0 on successful close initiation, or a negative errno.
+#[no_mangle]
+pub unsafe extern "C" fn dpdk_net_shutdown(
+    p: *mut dpdk_net_engine,
+    conn: dpdk_net_conn_t,
+    how: i32,
+) -> i32 {
+    match how {
+        DPDK_NET_SHUT_RDWR => dpdk_net_close(p, conn, 0),
+        DPDK_NET_SHUT_RD | DPDK_NET_SHUT_WR => -libc::EOPNOTSUPP,
+        _ => -libc::EINVAL,
+    }
+}
+
 /// A6 (spec §5.3): schedule a one-shot timer. `deadline_ns` is in the
 /// engine's monotonic clock domain (see `dpdk_net_now_ns`). Rounded up
 /// to the next 10 µs wheel tick; past deadlines fire on the next poll.

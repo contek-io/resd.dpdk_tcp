@@ -35,6 +35,7 @@ Source RFCs: `docs/rfcs/rfc9293.txt` (TCP 793bis),
 | Reserved | Reserved bits ignored on RX + zero on TX | RFC 9293 §3.1 | `tools/tcpreq-runner/src/probes/reserved.rs::reserved_rx` (Layer C) | **PASS** (tcpreq) |
 | Reset-Processing | RST processed independently of other flags; RST responses to invalid segments | RFC 9293 §3.10.7 | A3 RST-path unit tests in `tcp_input.rs` (`#[cfg(test)]` mod) + A8 S1 AD-A7 fixes `tests/ad_a7_rst_relisten.rs` + `tests/ad_a7_dup_syn_retrans_synack.rs` + counter-coverage `cover_tcp_rx_rst` (:848), `cover_tcp_tx_rst` (:931), `cover_tcp_conn_rst` (:717) | **PASS** |
 | Blind-data-mitigation | Challenge-ACK on out-of-window sequence numbers | RFC 9293 §3.10.7 / RFC 5961 | A3 challenge-ACK path in `tcp_input.rs` (off-window seq → challenge-ACK emission); obs_smoke + counter-coverage dynamically exercise the edge | **PASS** |
+| Shutdown-API | POSIX `shutdown(2)` subset (full-close only) — SHUT_RDWR dispatches to the normal active-close FIN handshake; SHUT_RD / SHUT_WR return `-EOPNOTSUPP`; invalid `how` returns `-EINVAL` | RFC 9293 §3.10.7.3 close processing + POSIX `shutdown(2)` | `crates/dpdk-net/tests/api_shutdown.rs::shutdown_rdwr_full_closes_conn` (SHUT_RDWR = `dpdk_net_close(h, 0)` dispatch) + `shutdown_rd_returns_eopnotsupp` + `shutdown_wr_returns_eopnotsupp` + `shutdown_invalid_how_returns_einval`; SHUT_RDWR FIN-emission / TIME_WAIT path covered end-to-end by `crates/dpdk-net-core/tests/test_server_active_close.rs` (the same core-crate `close_conn` path SHUT_RDWR dispatches to) | **DEVIATION** — `AD-A8.5-shutdown-no-half-close` (master spec §6.4): half-close (SHUT_RD / SHUT_WR) intentionally returns `-EOPNOTSUPP`; full-close (SHUT_RDWR) is RFC-default exact |
 
 ## DEFERRED / not-in-Stage-1-scope clauses
 
@@ -78,3 +79,9 @@ MUST-relevant code path.
   `phase-a8`. Every DEVIATION row cites the master-spec §6.4 AD-* row
   that documents the rationale. Every DEFERRED row cites master spec
   §1 non-goals, §6.3 compliance matrix row, or Stage 2+ scope.
+- **2026-04-23 (A8.5 T7)**: added `Shutdown-API` row (DEVIATION:
+  `AD-A8.5-shutdown-no-half-close`). Matrix now 16 in-scope rows
+  (13 PASS, 3 DEVIATION). Cites `crates/dpdk-net/tests/api_shutdown.rs`
+  (4 tests covering SHUT_RDWR dispatch + SHUT_RD / SHUT_WR / invalid-how
+  errno returns) + the existing `test_server_active_close.rs` for the
+  FIN-emission / TIME_WAIT end-to-end coverage that SHUT_RDWR rides.
