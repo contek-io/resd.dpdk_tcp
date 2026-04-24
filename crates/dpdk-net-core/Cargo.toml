@@ -102,6 +102,10 @@ fault-injector = ["dep:arrayvec", "dep:rand"]
 # tools/bench-obs-overhead A/B runner to measure the zero-observability
 # floor. See docs/superpowers/specs/2026-04-21-stage1-phase-a10-benchmark-harness-design.md D4.
 obs-none = []
+# Additive feature: exposes TimerWheel + EngineNoEalHarness for tools/bench-micro.
+# Off by default. Production builds see no difference.
+# See docs/superpowers/specs/2026-04-23-a10-microbench-perf-and-dpdk24-adopt-design.md §4.3
+bench-internals = []
 
 [dev-dependencies]
 proptest = "1"
