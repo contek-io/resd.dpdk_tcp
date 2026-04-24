@@ -77,6 +77,132 @@ pub fn align_up_to_tick_ns(deadline_ns: u64) -> u64 {
     deadline_ns.div_ceil(T).saturating_mul(T)
 }
 
+// a10-perf-23.11 T2.3: feature-gated, no-EAL surrogate for tools/bench-micro.
+// Walks the pure-compute subset of Engine::poll_once (flow-table conn-scratch
+// clear + timer-wheel advance + event-queue inspection) without any DPDK EAL,
+// port, queue, or mempool. Not a production Engine — no RX/TX burst path.
+#[cfg(feature = "bench-internals")]
+pub mod test_support {
+    use crate::flow_table::{ConnHandle, FlowTable, FourTuple};
+    use crate::tcp_conn::TcpConn;
+    use crate::tcp_events::EventQueue;
+    use crate::tcp_timer_wheel::{TimerId, TimerKind, TimerNode, TimerWheel};
+
+    /// Owner-handle sentinel stamped on harness-origin timers — matches the
+    /// `INVALID_HANDLE` / "no conn" convention used elsewhere in the crate.
+    const HARNESS_OWNER: u32 = 0;
+
+    /// No-EAL engine surrogate for micro-benches. Holds the three hot-path
+    /// data structures `Engine::poll_once` touches and a monotonic `now_ns`
+    /// cursor. All three fields are `pub` so bench code (and T2.4 unit tests)
+    /// can reach real-type APIs directly without thin wrappers.
+    pub struct EngineNoEalHarness {
+        pub flow_table: FlowTable,
+        pub timer_wheel: TimerWheel,
+        pub event_queue: EventQueue,
+        now_ns: u64,
+    }
+
+    impl EngineNoEalHarness {
+        /// `flow_capacity` sizes `FlowTable`; `timer_tick_ns` is the wheel's
+        /// tick granularity (informational — `TimerWheel` itself uses the
+        /// module-level `TICK_NS` constant, but the harness stashes the
+        /// caller's intent for observability). No EAL, no mempool, no port.
+        pub fn new(flow_capacity: usize, timer_tick_ns: u64) -> Self {
+            let _ = timer_tick_ns;
+            Self {
+                flow_table: FlowTable::new(flow_capacity as u32),
+                timer_wheel: TimerWheel::new(flow_capacity.max(64)),
+                event_queue: EventQueue::new(),
+                now_ns: 0,
+            }
+        }
+
+        /// One iteration of the pure-compute subset of `Engine::poll_once`:
+        /// snapshot clock, clear each conn's per-poll scratch (mirrors the
+        /// A6.6 T8 prelude), advance the timer wheel, drain any pending
+        /// events. No RX/TX burst — harness has no DPDK port.
+        pub fn poll_once(&mut self) {
+            self.now_ns = crate::clock::now_ns();
+
+            // Mirror Engine::poll_once's conn-scratch clear. Collect handles
+            // first (iter borrows &FlowTable); then mutate via get_mut.
+            let handles: smallvec::SmallVec<[ConnHandle; 16]> =
+                self.flow_table.iter_handles().collect();
+            for h in handles {
+                if let Some(c) = self.flow_table.get_mut(h) {
+                    c.delivered_segments.clear();
+                    c.readable_scratch_iovecs.clear();
+                }
+            }
+
+            // Timer-wheel advance — equivalent to `Engine::advance_timer_wheel`.
+            // Fired timers are dropped on the floor: the harness has no
+            // dispatch path, only the walk cost is measured.
+            let _fired = self.timer_wheel.advance(self.now_ns);
+
+            // Event-queue drain — `EventQueue` exposes `pop` (no closure
+            // sink). Drain into oblivion so the underlying VecDeque walks
+            // but doesn't grow unbounded across successive `poll_once`
+            // invocations.
+            while self.event_queue.pop().is_some() {}
+        }
+
+        /// Pre-populate the wheel with `count` non-firing timers scheduled
+        /// for `when_ns`. Returns the TimerIds so callers can selectively
+        /// cancel/inspect. Used by idle-poll benches to ensure `advance`
+        /// walks a real bucket chain, not an empty wheel.
+        pub fn pre_populate_timers(&mut self, count: usize, when_ns: u64) -> Vec<TimerId> {
+            let mut ids = Vec::with_capacity(count);
+            for i in 0..count {
+                ids.push(self.timer_add(when_ns, i as u64));
+            }
+            ids
+        }
+
+        /// Pass-through to `TimerWheel::add`. Packs `payload` into the
+        /// `TimerNode::user_data` slot; `kind = ApiPublic` (mirrors the
+        /// public `dpdk_net_timer_add` path); `owner_handle = HARNESS_OWNER`.
+        /// `generation` + `cancelled` are overwritten by `TimerWheel::add`.
+        pub fn timer_add(&mut self, when_ns: u64, payload: u64) -> TimerId {
+            let node = TimerNode {
+                fire_at_ns: when_ns,
+                owner_handle: HARNESS_OWNER,
+                kind: TimerKind::ApiPublic,
+                user_data: payload,
+                generation: 0,
+                cancelled: false,
+            };
+            self.timer_wheel.add(self.now_ns, node)
+        }
+
+        /// Pass-through to `TimerWheel::cancel`.
+        pub fn timer_cancel(&mut self, id: TimerId) -> bool {
+            self.timer_wheel.cancel(id)
+        }
+
+        /// Insert a pre-built `TcpConn` into the flow table. Returns `true`
+        /// on success, `false` if the table is full or the 4-tuple already
+        /// exists (mirrors `FlowTable::insert`'s `Option<ConnHandle>`).
+        pub fn insert_conn(&mut self, conn: TcpConn) -> bool {
+            self.flow_table.insert(conn).is_some()
+        }
+
+        /// Pass-through to `FlowTable::lookup_by_tuple`. Returns the
+        /// `ConnHandle` (1-based) as a `usize` for bench-code convenience;
+        /// the spec surface says `Option<usize>`.
+        pub fn tuple_lookup(&self, t: &FourTuple) -> Option<usize> {
+            self.flow_table.lookup_by_tuple(t).map(|h| h as usize)
+        }
+
+        /// Current `now_ns` snapshot — set by the most recent `poll_once`.
+        /// Used by T2.4 unit tests to assert the clock-read side effect.
+        pub fn now_ns(&self) -> u64 {
+            self.now_ns
+        }
+    }
+}
+
 /// RFC 7323 §2.3: pick the Window Scale shift so that `(u16::MAX << ws)`
 /// covers our full recv buffer. Bounded at 14 per the RFC's cap. Called
 /// once at `Engine::connect` time to advertise WS in our SYN; the same

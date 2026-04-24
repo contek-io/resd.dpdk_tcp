@@ -56,6 +56,12 @@ pub mod test_tx_intercept;
 
 pub use error::Error;
 
+// a10-perf-23.11 T2.3: feature-gated convenience re-export so
+// `tools/bench-micro` (and T2.4 unit tests) can `use dpdk_net_core::EngineNoEalHarness`
+// without poking through the `engine::test_support::` path.
+#[cfg(feature = "bench-internals")]
+pub use engine::test_support::EngineNoEalHarness;
+
 /// Helper exposed for unit tests and the poll loop.
 /// Returns the byte slice backing the mbuf's first (and in Stage A2, only)
 /// segment. The caller must not outlive the mbuf.
