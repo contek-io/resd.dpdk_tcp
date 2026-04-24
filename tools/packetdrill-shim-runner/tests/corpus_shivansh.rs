@@ -42,6 +42,9 @@ fn shivansh_runnable_subset_passes() {
         if path.extension().and_then(|e| e.to_str()) != Some("pkt") { continue; }
         match classifier.classify(&path) {
             Verdict::Runnable => runnable.push(path),
+            Verdict::RunnableNoCrash(_) => panic!(
+                "shivansh.toml does not use runnable-no-crash verdict: {}",
+                path.display()),
             Verdict::SkippedUntranslatable(r) =>
                 skip_untrans.push((path, r)),
             Verdict::SkippedOutOfScope(r) =>

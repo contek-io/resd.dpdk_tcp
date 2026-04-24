@@ -27,6 +27,15 @@ struct Rule { re: Regex, verdict: Verdict }
 #[derive(Debug, Clone)]
 pub enum Verdict {
     Runnable,
+    /// A8.5 T9 (G): crash-safety-only corpus. Script exercises an
+    /// engine-crash-safety invariant ("no SIGSEGV / SIGABRT / signal
+    /// kill on unexpected peer behavior"). The engine is not expected
+    /// to reproduce the scripted wire shape (because the behavior
+    /// under test — ICMP, bad syscall args, PMTU — isn't modeled), so
+    /// the script reliably exits 1 on assertion failure but never
+    /// crashes. The test gate accepts any exit code 0..=128 and fails
+    /// only on signal kills (exit > 128) or timeouts.
+    RunnableNoCrash(String),
     SkippedUntranslatable(String),
     SkippedOutOfScope(String),
 }
@@ -54,6 +63,8 @@ impl Classifier {
         let rules = cfg.rule.into_iter().map(|r| {
             let v = match r.verdict.as_str() {
                 "runnable" => Verdict::Runnable,
+                "runnable-no-crash" =>
+                    Verdict::RunnableNoCrash(r.reason),
                 "skipped-untranslatable" =>
                     Verdict::SkippedUntranslatable(r.reason),
                 "skipped-out-of-scope" =>

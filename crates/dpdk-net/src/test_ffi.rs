@@ -288,6 +288,24 @@ pub unsafe extern "C" fn dpdk_net_test_close(
     rc
 }
 
+/// A8.5 T8: thin re-wrapper around `dpdk_net_shutdown` that pumps on
+/// success. The packetdrill shim calls this so the FIN emitted by a
+/// `SHUT_RDWR` request is flushed into the TX intercept ring before
+/// the script's next `> F.` expectation is matched. `SHUT_RD` /
+/// `SHUT_WR` bypass the pump (no state change).
+#[no_mangle]
+pub unsafe extern "C" fn dpdk_net_test_shutdown(
+    engine: *mut dpdk_net_engine,
+    h: dpdk_net_conn_t,
+    how: i32,
+) -> i32 {
+    let rc = super::dpdk_net_shutdown(engine, h, how);
+    if rc == 0 {
+        super::pump_until_quiescent_raw(engine);
+    }
+    rc
+}
+
 /// A8 T15 (S2): look up a connection's peer IP and port by handle. Host
 /// byte order for both (same convention as `EngineConfig::local_ip`).
 /// Writes into the caller's out-params on success and returns `0`;

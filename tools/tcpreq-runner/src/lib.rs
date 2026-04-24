@@ -13,6 +13,90 @@
 
 pub mod probes;
 
+// -------------------------------------------------------------------------
+// Shared frame-mutation helpers. Two checksum recompute helpers + a
+// constant for the test-server wire layout. Used by probes that splice
+// bytes into the TCP options region (options.rs) and/or mutate the TCP
+// header (reserved.rs, urgent.rs). Kept here so probes don't duplicate
+// the pseudo-header fold; the logic is identical across every
+// `test_packet::build_tcp_frame`-derived frame because the L2+L3
+// layout is fixed (14-byte Ethernet + 20-byte IPv4, no IP options).
+// -------------------------------------------------------------------------
+
+/// L2 Ethernet header (14) + IPv4 header (20, no IP options) — the
+/// test-server `build_segment` always emits this exact layout. TCP
+/// header starts at this byte offset within any frame built via
+/// `test_packet::build_tcp_frame` or `build_tcp_syn`.
+pub const TCP_HDR_OFFSET: usize = 14 + 20;
+
+/// Recompute the IPv4 header checksum in place after mutating any
+/// field in the 20-byte IPv4 header (typically `total_length` after
+/// growing the TCP option region). Standard RFC 1071 one's-complement
+/// fold over the 20 header bytes with the checksum field zeroed.
+///
+/// Layout assumed: `frame[0..14]` = Ethernet header, `frame[14..34]` =
+/// IPv4 header (no IP options). Callers MUST have written the updated
+/// IPv4 fields before this call; this helper only zeros+folds the
+/// checksum.
+pub fn recompute_ip_csum(frame: &mut [u8]) {
+    let ip_off = 14usize;
+    frame[ip_off + 10] = 0;
+    frame[ip_off + 11] = 0;
+    let mut sum: u32 = 0;
+    for i in (0..20).step_by(2) {
+        sum += ((frame[ip_off + i] as u32) << 8) | (frame[ip_off + i + 1] as u32);
+    }
+    while sum >> 16 != 0 {
+        sum = (sum & 0xFFFF) + (sum >> 16);
+    }
+    let csum = !(sum as u16);
+    frame[ip_off + 10] = (csum >> 8) as u8;
+    frame[ip_off + 11] = (csum & 0xFF) as u8;
+}
+
+/// Recompute the TCP checksum in place after mutating any byte within
+/// the TCP header or payload (including the options region) of an
+/// Ethernet-framed IPv4/TCP packet produced by
+/// `test_packet::build_tcp_frame`.
+///
+/// Re-uses `dpdk_net_core::l3_ip::internet_checksum` for the
+/// pseudo-header fold so the byte-for-byte result matches what
+/// `build_segment` would have produced had the mutation been present
+/// from the start.
+///
+/// * `tcp_hdr_offset` MUST equal the byte offset of the TCP header —
+///   always `TCP_HDR_OFFSET` (34) for test-server frames; parameterized
+///   so probes that need to recompute against an unusual layout can do
+///   so explicitly.
+pub fn recompute_tcp_csum(frame: &mut [u8], tcp_hdr_offset: usize) {
+    use dpdk_net_core::l3_ip::{internet_checksum, IPPROTO_TCP};
+
+    // Zero the csum field (TCP offset 16..18) before folding.
+    frame[tcp_hdr_offset + 16] = 0;
+    frame[tcp_hdr_offset + 17] = 0;
+
+    // Extract src/dst IPs from the IPv4 header at bytes [14..34].
+    let mut src_ip_bytes = [0u8; 4];
+    src_ip_bytes.copy_from_slice(&frame[14 + 12..14 + 16]);
+    let mut dst_ip_bytes = [0u8; 4];
+    dst_ip_bytes.copy_from_slice(&frame[14 + 16..14 + 20]);
+
+    let tcp_seg_len = (frame.len() - tcp_hdr_offset) as u16;
+
+    // Pseudo-header: src_ip(4) + dst_ip(4) + zero(1) + proto(1) + tcp_len(2).
+    let mut pseudo = [0u8; 12];
+    pseudo[0..4].copy_from_slice(&src_ip_bytes);
+    pseudo[4..8].copy_from_slice(&dst_ip_bytes);
+    pseudo[8] = 0;
+    pseudo[9] = IPPROTO_TCP;
+    pseudo[10..12].copy_from_slice(&tcp_seg_len.to_be_bytes());
+
+    let tcp_body = &frame[tcp_hdr_offset..];
+    let csum = internet_checksum(&[&pseudo, tcp_body]);
+    frame[tcp_hdr_offset + 16] = (csum >> 8) as u8;
+    frame[tcp_hdr_offset + 17] = (csum & 0xff) as u8;
+}
+
 /// Probe result — one row per RFC clause id.
 #[derive(Debug)]
 pub struct ProbeResult {
@@ -38,6 +122,12 @@ pub fn run_all_probes() -> Vec<ProbeResult> {
         probes::mss::late_option(),
         probes::reserved::reserved_rx(),
         probes::urgent::urgent_dropped(),
+        probes::checksum::zero_checksum(),  // A8.5 T1
+        probes::options::option_support(),  // A8.5 T2
+        probes::options::unknown_option(),  // A8.5 T2
+        probes::options::illegal_length(),  // A8.5 T2
+        probes::mss::mss_support(),         // A8.5 T3
+        probes::rst_ack::rst_ack_processing(),  // A8.5 T4
     ]
 }
 

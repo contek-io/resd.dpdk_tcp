@@ -30,6 +30,7 @@ fn main() {
         Err(_) => Classifier::load(),
     };
     let mut runnable = Vec::new();
+    let mut no_crash: Vec<(String, String)> = Vec::new();
     let mut skip_u: Vec<(String, String)> = Vec::new();
     let mut skip_o: Vec<(String, String)> = Vec::new();
     for entry in WalkDir::new(&corpus).into_iter().filter_map(Result::ok) {
@@ -44,13 +45,15 @@ fn main() {
             .into_owned();
         match c.classify(p) {
             Verdict::Runnable => runnable.push(rel),
+            Verdict::RunnableNoCrash(r) => no_crash.push((rel, r)),
             Verdict::SkippedUntranslatable(r) => skip_u.push((rel, r)),
             Verdict::SkippedOutOfScope(r) => skip_o.push((rel, r)),
         }
     }
     println!(
-        "runnable={} skip_untrans={} skip_oos={}",
+        "runnable={} no_crash={} skip_untrans={} skip_oos={}",
         runnable.len(),
+        no_crash.len(),
         skip_u.len(),
         skip_o.len()
     );
@@ -58,6 +61,10 @@ fn main() {
         println!("# RUNNABLE");
         for r in &runnable {
             println!("R\t{}", r);
+        }
+        println!("# RUNNABLE-NO-CRASH");
+        for (r, why) in &no_crash {
+            println!("N\t{}\t{}", r, why);
         }
         println!("# SKIP-UNTRANS");
         for (r, why) in &skip_u {

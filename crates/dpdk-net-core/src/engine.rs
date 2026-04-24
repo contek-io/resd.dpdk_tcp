@@ -5760,6 +5760,18 @@ impl Engine {
             std::ptr::copy_nonoverlapping(frame.as_ptr(), dst as *mut u8, frame.len());
         }
 
+        // Mirror poll_once's per-burst per-mbuf RX counter bump on the
+        // injection path. `dispatch_one_rx_mbuf` below already bumps
+        // `eth.rx_bytes` (engine.rs:3264), so we only need `eth.rx_pkts`
+        // here — otherwise `obs_smoke_scripted_scenario` sees a 2x
+        // over-count for rx_bytes. Without this bump, consumers that
+        // enable the `test-inject` feature (e.g. `scapy-fuzz-runner`,
+        // which forces workspace-wide feature unification in
+        // `cargo test --workspace`) silently skip `eth.rx_pkts` and
+        // break `cover_eth_rx_pkts` counter-coverage (A8.5 T10
+        // follow-up regression).
+        crate::counters::inc(&self.counters.eth.rx_pkts);
+
         // Dispatch through the same per-mbuf RX path `poll_once` uses;
         // `dispatch_one_rx_mbuf` frees the mbuf before returning.
         let _accepted = self.dispatch_one_rx_mbuf(mbuf);

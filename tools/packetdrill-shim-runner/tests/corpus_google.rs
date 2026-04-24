@@ -51,6 +51,9 @@ fn google_runnable_subset_passes() {
         if !rel.starts_with("gtests/") { continue; }
         match classifier.classify(&path) {
             Verdict::Runnable => runnable.push(path),
+            Verdict::RunnableNoCrash(_) => panic!(
+                "google.toml does not use runnable-no-crash verdict: {}",
+                path.display()),
             Verdict::SkippedUntranslatable(r) =>
                 skip_untrans.push((path, r)),
             Verdict::SkippedOutOfScope(r) =>

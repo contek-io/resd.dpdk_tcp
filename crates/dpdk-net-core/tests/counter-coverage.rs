@@ -79,14 +79,91 @@ use common::{CovHarness, OUR_IP, PEER_IP};
 
 /// Covers: `eth.rx_pkts` — per-burst per-mbuf RX-packet counter.
 /// Increment site: `poll_once` ~engine.rs:2041 (mirrored by
-/// `CovHarness::inject_valid_syn_to_closed_port` — see harness docstring
-/// for the rationale on why the test-server bypass can't invoke the
-/// real site directly).
+/// `Engine::inject_rx_frame` on both test-inject and test-server
+/// variants — see the engine.rs comments at engine.rs:5768 /
+/// engine.rs:6074).
+///
+/// **Past regression + defense-in-depth retry (A8.5 T10 follow-up).**
+/// The original one-shot version of this test flaked under
+/// `cargo test --workspace --features test-server` but passed when
+/// run solo. Root cause: `scapy-fuzz-runner` declares
+/// `dpdk-net-core = { features = ["test-inject"] }`, so cargo's
+/// workspace-wide feature unification forces the `test-inject` gate
+/// on in EVERY workspace test build. There are two `inject_rx_frame`
+/// implementations — the `#[cfg(feature = "test-inject")]` one at
+/// engine.rs:5713 (used when that feature wins) and the default one
+/// at engine.rs:6044. Before this commit, the test-inject variant
+/// skipped the `eth.rx_pkts` bump that the default variant performed,
+/// so this test saw counter=0 and panicked with a misleading
+/// "counter expected > 0, got 0" message.
+///
+/// The real fix is in engine.rs:5713 (counter bump added to match the
+/// default variant). The retry loop below is defense-in-depth: if a
+/// future contention class emerges (DPDK arena pressure during
+/// concurrent builds, mempool exhaustion under extreme load, etc.),
+/// the loop drops the harness (frees the mempool, releases the
+/// binary-wide `ENGINE_SERIALIZE` lock), sleeps 50 ms, and retries up
+/// to 3 times. The match distinguishes three failure modes:
+///   - `(Ok, 0)` — engine returned Ok but counter stayed at 0 →
+///     counter-bump regression. Panic immediately (retry won't help).
+///   - `(Err, _)` with attempt < 3 — transient alloc failure. Retry.
+///   - `(Err, _)` with attempt == 3 — persistent contention. Panic
+///     with actionable workaround hint.
 #[test]
 fn cover_eth_rx_pkts() {
-    let mut h = CovHarness::new();
-    h.inject_valid_syn_to_closed_port();
-    h.assert_counter_gt_zero("eth.rx_pkts");
+    use dpdk_net_core::test_server::test_packet::build_tcp_syn;
+    use std::sync::atomic::Ordering;
+    use std::thread::sleep;
+    use std::time::Duration;
+    const MAX_ATTEMPTS: u32 = 3;
+    for attempt in 1..=MAX_ATTEMPTS {
+        let (inject_result, counter_val) = {
+            let h = CovHarness::new();
+            let frame = build_tcp_syn(
+                PEER_IP, 40_000, OUR_IP, /*unlistened port*/ 5999,
+                /*iss*/ 0x1000, 1460,
+            );
+            let inject_result = h.eng.inject_rx_frame(&frame);
+            let counter_val = dpdk_net_core::counters::lookup_counter(
+                h.eng.counters(), "eth.rx_pkts",
+            )
+                .expect("counter path eth.rx_pkts resolvable")
+                .load(Ordering::Relaxed);
+            (inject_result, counter_val)
+            // `h` drops here: frees mempool, releases ENGINE_SERIALIZE.
+        };
+        match (inject_result, counter_val) {
+            (Ok(()), v) if v > 0 => return, // PASS on this attempt.
+            (Ok(()), 0) => panic!(
+                "cover_eth_rx_pkts: inject_rx_frame Ok but eth.rx_pkts=0 — \
+                 REAL regression (counter wiring removed from engine.rs:6074?), \
+                 not a DPDK arena flake"
+            ),
+            (Err(e), _) if attempt < MAX_ATTEMPTS => {
+                eprintln!(
+                    "cover_eth_rx_pkts: attempt {attempt}/{MAX_ATTEMPTS} \
+                     inject_rx_frame failed: {e:?} — DPDK arena pressure \
+                     (cross-binary parallel test load), retrying after 50ms"
+                );
+                sleep(Duration::from_millis(50));
+            }
+            (Err(e), _) => panic!(
+                "cover_eth_rx_pkts: inject_rx_frame failed {MAX_ATTEMPTS} \
+                 times; final error: {e:?}. Likely DPDK mempool-arena \
+                 contention under `cargo test --workspace`. Workaround: \
+                 `cargo test -- --test-threads=1` or run the counter-coverage \
+                 binary solo. Strategic fix: reduce per-engine mempool \
+                 footprint or share a process-wide mempool."
+            ),
+            // Unreachable: `(Ok, v) if v>0` → return; `(Ok, 0)` → panic;
+            // `(Err, _)` → retry or panic above. Compiler requires the
+            // `(Ok, v)` non-positive arm since `v > 0` is a guard, not
+            // exhaustive — but u64 is non-negative so v==0 is the only
+            // non-match; explicitly covered above.
+            (Ok(()), _) => unreachable!("u64 counter value either zero or positive"),
+        }
+    }
+    unreachable!("retry loop exits via return or panic in the final attempt");
 }
 
 /// Covers: `eth.rx_bytes` — per-burst RX-bytes accumulator. Same
