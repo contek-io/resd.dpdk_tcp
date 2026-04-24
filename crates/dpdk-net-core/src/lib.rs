@@ -36,7 +36,16 @@ pub mod tcp_rtt;
 pub mod tcp_sack;
 pub mod tcp_seq;
 pub mod tcp_state;
+// a10-perf-23.11 T2.2: module is `pub(crate)` by default; `bench-internals`
+// promotes it to `pub` so tools/bench-micro (external crate) can reach
+// `TimerWheel`, `TimerId`, `TimerNode`, `TimerKind`, and the `TICK_NS` /
+// `LEVELS` / `BUCKETS` constants. Every item inside is already `pub`;
+// only the module's outer visibility changes. Production builds (default
+// features) continue to see `pub(crate)` — identical compiled output.
+#[cfg(not(feature = "bench-internals"))]
 pub(crate) mod tcp_timer_wheel;
+#[cfg(feature = "bench-internals")]
+pub mod tcp_timer_wheel;
 pub mod tcp_tlp;
 #[cfg(feature = "test-inject")]
 pub mod test_fixtures;
