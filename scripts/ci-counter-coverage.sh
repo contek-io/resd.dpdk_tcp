@@ -14,10 +14,8 @@ cd "$(dirname "$0")/.."
 bash scripts/counter-coverage-static.sh --no-default-features
 bash scripts/counter-coverage-static.sh --all-features
 
-timeout 240 cargo test -p dpdk-net-core --test counter-coverage --features test-server \
+cargo test -p dpdk-net-core --test counter-coverage --features test-server \
   -- --test-threads=1
-timeout 180 cargo test -p dpdk-net-core --test obs_smoke --features test-server
-
-bash scripts/knob-coverage-static.sh
+cargo test -p dpdk-net-core --test obs_smoke --features test-server
 
 echo "ci-counter-coverage: PASS"

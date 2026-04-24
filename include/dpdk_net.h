@@ -219,9 +219,7 @@ struct dpdk_net_event_t {
  * Cross-platform atomic-load contract: C/C++ readers MUST use the
  * helper in `dpdk_net_counters_load.h`:
  *
- * ```text
- * uint64_t rx = dpdk_net_load_u64(&counters->eth.rx_pkts);
- * ```
+ *     uint64_t rx = dpdk_net_load_u64(&counters->eth.rx_pkts);
  *
  * Plain dereference is only atomic on x86_64 with aligned uint64_t.
  * On ARM32 a plain read may tear; ARM64 has weaker ordering semantics

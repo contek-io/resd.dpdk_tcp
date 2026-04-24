@@ -1,0 +1,44 @@
+# A9 CI smoke: per-merge gates for fuzz, Scapy corpus replay, and
+# fault-injector compile. The 72h stage-cut fuzz run lives in
+# scripts/fuzz-long-run.sh and is invoked out-of-band.
+name: a9-fuzz
+
+on:
+  push:
+    branches: [main, phase-a9]
+  pull_request:
+
+jobs:
+  fuzz-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - run: cargo install cargo-fuzz
+      - run: scripts/fuzz-smoke.sh
+        env:
+          TIME: "30"
+
+  scapy-corpus-replay:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: pip install --user scapy
+      - run: scripts/scapy-corpus.sh
+      - run: cargo run --release -p scapy-fuzz-runner -- --corpus tools/scapy-corpus/out/
+
+  fault-injector-compile:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      # Default-build compile.
+      - run: cargo check -p dpdk-net-core --features fault-injector
+      # The fault-injector + test-inject combination is the surface that
+      # exercises `inject_rx_chain` against `FaultInjector::process`
+      # (covered by tests/fault_injector_chain_uaf_smoke.rs). UAF
+      # detection in those tests requires running under a sanitizer on a
+      # TAP-capable host (DPDK_NET_TEST_TAP=1 + sudo + hugepages); this
+      # gate only catches compile-time regressions, not runtime UAFs.
+      - run: cargo check -p dpdk-net-core --tests --features "fault-injector test-inject"
