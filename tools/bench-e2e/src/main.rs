@@ -546,6 +546,13 @@ fn emit_csv(args: &Args, meta: &RunMetadata, samples: &[f64]) -> anyhow::Result<
             metric_unit: "ns".to_string(),
             metric_value: value,
             metric_aggregation: agg,
+            // Task 2.8 host/dpdk/worktree identification — blank for
+            // non-bench-micro tools (spec §3 / §4.4).
+            cpu_family: None,
+            cpu_model_name: None,
+            dpdk_version_pkgconfig: None,
+            worktree_branch: None,
+            uprof_session_id: None,
         };
         wtr.serialize(&row)?;
     }

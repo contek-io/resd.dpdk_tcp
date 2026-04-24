@@ -81,6 +81,11 @@ fn row_for_tool(tool: &str) -> CsvRow {
         metric_unit: "ns".into(),
         metric_value: 100.0 + TOOLS.iter().position(|t| *t == tool).unwrap() as f64,
         metric_aggregation: MetricAggregation::P99,
+        cpu_family: None,
+        cpu_model_name: None,
+        dpdk_version_pkgconfig: None,
+        worktree_branch: None,
+        uprof_session_id: None,
     }
 }
 

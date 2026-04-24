@@ -299,6 +299,15 @@ pub fn emit_bucket_rows<W: std::io::Write>(
                 metric_unit: "bits_per_sec".to_string(),
                 metric_value: sample.goodput_bps,
                 metric_aggregation: MetricAggregation::Mean,
+                // Task 2.8 host/dpdk/worktree identification columns — only
+                // the bench-micro summariser currently populates these; the
+                // macrobench tools emit blank cells for now (spec §3 / §4.4
+                // cross-worktree rejection is keyed on bench-micro rows).
+                cpu_family: None,
+                cpu_model_name: None,
+                dpdk_version_pkgconfig: None,
+                worktree_branch: None,
+                uprof_session_id: None,
             };
             writer.serialize(&row)?;
 
@@ -313,6 +322,11 @@ pub fn emit_bucket_rows<W: std::io::Write>(
                 metric_unit: "pps".to_string(),
                 metric_value: sample.pps,
                 metric_aggregation: MetricAggregation::Mean,
+                cpu_family: None,
+                cpu_model_name: None,
+                dpdk_version_pkgconfig: None,
+                worktree_branch: None,
+                uprof_session_id: None,
             };
             writer.serialize(&row)?;
         }
@@ -331,6 +345,11 @@ pub fn emit_bucket_rows<W: std::io::Write>(
                 metric_unit: "bits_per_sec".to_string(),
                 metric_value: 0.0,
                 metric_aggregation: MetricAggregation::Mean,
+                cpu_family: None,
+                cpu_model_name: None,
+                dpdk_version_pkgconfig: None,
+                worktree_branch: None,
+                uprof_session_id: None,
             };
             writer.serialize(&row)?;
         }

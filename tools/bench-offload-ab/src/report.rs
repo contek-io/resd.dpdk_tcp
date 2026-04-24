@@ -459,6 +459,11 @@ mod tests {
             metric_unit: "ns".into(),
             metric_value: value,
             metric_aggregation: agg,
+            cpu_family: None,
+            cpu_model_name: None,
+            dpdk_version_pkgconfig: None,
+            worktree_branch: None,
+            uprof_session_id: None,
         }
     }
 

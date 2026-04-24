@@ -49,6 +49,97 @@ use bench_common::percentile::summarize;
 use bench_common::preconditions::{PreconditionMode, PreconditionValue, Preconditions};
 use bench_common::run_metadata::RunMetadata;
 
+/// Host / DPDK / worktree identification — captured once per `summarize`
+/// run and stamped onto every emitted `CsvRow`. Task 2.8 columns:
+/// `cpu_family`, `cpu_model_name`, `dpdk_version_pkgconfig`,
+/// `worktree_branch`, `uprof_session_id`. Every field is `Option` because
+/// any of the probes (reading `/proc/cpuinfo`, spawning `pkg-config`, etc.)
+/// can fail on a minimal CI box — in which case the CSV emits the empty
+/// cell per spec §3 / §4.4.
+#[derive(Debug, Clone)]
+struct HostMetadata {
+    cpu_family: Option<u32>,
+    cpu_model_name: Option<String>,
+    dpdk_version_pkgconfig: Option<String>,
+    worktree_branch: Option<String>,
+    uprof_session_id: Option<String>,
+}
+
+impl HostMetadata {
+    fn capture() -> Self {
+        let (cpu_family, cpu_model_name) = cpu_family_model();
+        Self {
+            cpu_family,
+            cpu_model_name,
+            dpdk_version_pkgconfig: dpdk_version_pkgconfig(),
+            worktree_branch: worktree_branch(),
+            uprof_session_id: uprof_session_id(),
+        }
+    }
+}
+
+/// Parse `/proc/cpuinfo` to extract the numeric `cpu family` and the
+/// `model name` marketing string. Both fields are present on Linux/x86 and
+/// absent on other platforms — a returned `(None, None)` is a valid
+/// outcome (e.g. ARM64, or a container without `/proc` mounted).
+fn cpu_family_model() -> (Option<u32>, Option<String>) {
+    let text = std::fs::read_to_string("/proc/cpuinfo").unwrap_or_default();
+    let family = text
+        .lines()
+        .find_map(|l| l.strip_prefix("cpu family\t: "))
+        .and_then(|s| s.trim().parse().ok());
+    let name = text
+        .lines()
+        .find_map(|l| l.strip_prefix("model name\t: "))
+        .map(|s| s.trim().to_string());
+    (family, name)
+}
+
+/// Shell out to `pkg-config --modversion libdpdk` and return the version
+/// string (e.g. `23.11.2`). Returns `None` if `pkg-config` is absent, fails
+/// (non-zero exit), or emits empty output.
+fn dpdk_version_pkgconfig() -> Option<String> {
+    let out = std::process::Command::new("pkg-config")
+        .args(["--modversion", "libdpdk"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let v = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if v.is_empty() {
+        None
+    } else {
+        Some(v)
+    }
+}
+
+/// `git rev-parse --abbrev-ref HEAD` — current branch name. Returns `None`
+/// when the tool is run outside a git checkout (e.g. from an extracted
+/// tarball) or git is absent.
+fn worktree_branch() -> Option<String> {
+    let out = std::process::Command::new("git")
+        .args(["rev-parse", "--abbrev-ref", "HEAD"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let v = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if v.is_empty() {
+        None
+    } else {
+        Some(v)
+    }
+}
+
+/// Read the `UPROF_SESSION_ID` env var if the operator set one. Used to
+/// correlate a CSV row to a concurrent AMD uProf profiling session so
+/// downstream analysis can join counter data against the profile.
+fn uprof_session_id() -> Option<String> {
+    std::env::var("UPROF_SESSION_ID").ok().filter(|s| !s.is_empty())
+}
+
 /// Targets that still proxy with a pure-Rust stub instead of exercising
 /// the real Engine code-path (EAL init / public API gaps). Tagging these
 /// with `feature_set = "stub"` prevents phantom regression diffs when
@@ -84,6 +175,11 @@ fn main() -> anyhow::Result<()> {
     }
 
     let metadata = build_run_metadata()?;
+    // Task 2.8: capture host / DPDK / worktree identification once up front so
+    // every emitted row carries the same snapshot. Doing this per-row would
+    // shell out 5× count times — wasteful and produces flicker if the
+    // operator happens to switch branches mid-run.
+    let host_meta = HostMetadata::capture();
 
     let mut wtr = csv::Writer::from_path(&output_path)?;
     let mut count = 0usize;
@@ -170,6 +266,11 @@ fn main() -> anyhow::Result<()> {
                     metric_unit: "ns".into(),
                     metric_value: value,
                     metric_aggregation: agg,
+                    cpu_family: host_meta.cpu_family,
+                    cpu_model_name: host_meta.cpu_model_name.clone(),
+                    dpdk_version_pkgconfig: host_meta.dpdk_version_pkgconfig.clone(),
+                    worktree_branch: host_meta.worktree_branch.clone(),
+                    uprof_session_id: host_meta.uprof_session_id.clone(),
                 };
                 wtr.serialize(&row)?;
                 count += 1;

@@ -344,6 +344,13 @@ fn emit_summary_rows<W: std::io::Write>(
             metric_unit: metric_unit.to_string(),
             metric_value: value,
             metric_aggregation: agg,
+            // Task 2.8 host/dpdk/worktree identification — only bench-micro's
+            // summariser populates these for now. Blank cells here.
+            cpu_family: None,
+            cpu_model_name: None,
+            dpdk_version_pkgconfig: None,
+            worktree_branch: None,
+            uprof_session_id: None,
         };
         writer.serialize(&row)?;
     }
@@ -395,6 +402,11 @@ pub fn emit_bucket_rows<W: std::io::Write>(
                 metric_unit: "bits_per_sec".to_string(),
                 metric_value: 0.0,
                 metric_aggregation: MetricAggregation::Mean,
+                cpu_family: None,
+                cpu_model_name: None,
+                dpdk_version_pkgconfig: None,
+                worktree_branch: None,
+                uprof_session_id: None,
             };
             writer.serialize(&row)?;
             return Ok(());

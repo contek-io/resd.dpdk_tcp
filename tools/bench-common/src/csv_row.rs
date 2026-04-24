@@ -2,7 +2,9 @@
 //!
 //! Layout: the run-invariant fields from `RunMetadata` come first, followed by
 //! the per-row fields `tool`, `test_case`, `feature_set`, `dimensions_json`,
-//! `metric_name`, `metric_unit`, `metric_value`, `metric_aggregation`.
+//! `metric_name`, `metric_unit`, `metric_value`, `metric_aggregation`, and
+//! finally the optional host/dpdk/worktree identification fields used by
+//! cross-worktree A/B analysis (§3 / §4.4).
 //!
 //! # Why a hand-written `Serialize`/`Deserialize`
 //!
@@ -17,12 +19,18 @@
 //! - Keep `RunMetadata` and `Preconditions` as ergonomic nested structs for
 //!   callers populating a row — they stay strongly typed and easy to build.
 //! - Implement `Serialize` on `CsvRow` by hand, writing one `SerializeStruct`
-//!   with all 35 columns as flat scalar fields. The breakdown is
+//!   with all 40 columns as flat scalar fields. The breakdown is
 //!   13 run-metadata columns (12 scalars + `precondition_mode`) +
-//!   14 precondition-value columns + 8 per-row columns = 35. That shape is
-//!   exactly what csv expects.
+//!   14 precondition-value columns + 8 per-row columns + 5 host/dpdk/worktree
+//!   identification columns = 40. That shape is exactly what csv expects.
 //! - Implement `Deserialize` on `CsvRow` via a `Visitor` that walks the
 //!   matching set of field keys and rebuilds the nested structs.
+//!
+//! The 5 appended identification columns are `Option`-typed and tolerated as
+//! absent at deserialisation time so older CSVs written before these columns
+//! existed still round-trip. They land at the END of the row so an older
+//! `bench-report` binary reading a newer CSV sees them as "unknown column —
+//! skip" via the visitor's `IgnoredAny` fallthrough.
 //!
 //! `metric_value` is a raw `f64`. Values chosen in the round-trip test are
 //! exactly representable so bit-exact `PartialEq` compares work. Real runs
@@ -136,9 +144,27 @@ pub const COLUMNS: &[&str] = &[
     "metric_unit",
     "metric_value",
     "metric_aggregation",
+    // Host / DPDK / worktree identification columns (Task 2.8, spec §3 / §4.4).
+    // Appended at the end so older `bench-report` binaries that don't know
+    // about them skip via the visitor's `IgnoredAny` fallthrough. Every column
+    // is `Option` and tolerated as absent at deserialisation time so older
+    // CSVs still round-trip cleanly.
+    "cpu_family",
+    "cpu_model_name",
+    "dpdk_version_pkgconfig",
+    "worktree_branch",
+    "uprof_session_id",
 ];
 
 /// One row in the unified benchmark CSV. Spec §14.1.
+///
+/// The five `Option`-typed fields at the end carry host / DPDK / worktree
+/// identification (Task 2.8, spec §3 / §4.4). They let cross-worktree A/B
+/// analysis reject mismatched-host rows. Populated by the summariser tool
+/// from `/proc/cpuinfo`, `pkg-config --modversion libdpdk`, `git rev-parse
+/// --abbrev-ref HEAD`, and the `UPROF_SESSION_ID` env var respectively — any
+/// of which may fail on a minimal CI box, in which case `None` is emitted as
+/// an empty cell.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CsvRow {
     pub run_metadata: RunMetadata,
@@ -150,6 +176,26 @@ pub struct CsvRow {
     pub metric_unit: String,
     pub metric_value: f64,
     pub metric_aggregation: MetricAggregation,
+    /// `cpu family` field from `/proc/cpuinfo` — integer CPU family id
+    /// (e.g. `25` for AMD Zen 3 EPYC). `None` if the file is absent or the
+    /// line is missing / unparseable (e.g. a non-x86 host).
+    pub cpu_family: Option<u32>,
+    /// `model name` field from `/proc/cpuinfo` — the full marketing string
+    /// (e.g. `AMD EPYC 7R13 Processor`). `None` if the file is absent or the
+    /// line is missing.
+    pub cpu_model_name: Option<String>,
+    /// DPDK version reported by `pkg-config --modversion libdpdk`. `None` if
+    /// `pkg-config` is not installed or the `libdpdk` module is not on the
+    /// pkg-config path (CI boxes that don't link DPDK).
+    pub dpdk_version_pkgconfig: Option<String>,
+    /// Current git worktree branch (`git rev-parse --abbrev-ref HEAD`). `None`
+    /// if not inside a git checkout. Used to identify which worktree a row
+    /// originated from when comparing A vs. B baselines.
+    pub worktree_branch: Option<String>,
+    /// `UPROF_SESSION_ID` environment variable if set — correlates a CSV row
+    /// to an AMD uProf profiling session so the same run produces aligned
+    /// counter + profile data.
+    pub uprof_session_id: Option<String>,
 }
 
 impl CsvRow {
@@ -207,6 +253,15 @@ impl Serialize for CsvRow {
         st.serialize_field("metric_unit", &self.metric_unit)?;
         st.serialize_field("metric_value", &self.metric_value)?;
         st.serialize_field("metric_aggregation", &self.metric_aggregation)?;
+        // Host / DPDK / worktree identification columns (Task 2.8). Options emit
+        // as the empty cell when `None` — csv's Serialize derive handles that
+        // via `Serialize::serialize` on the inner `Option<T>`, which writes no
+        // characters for `None`.
+        st.serialize_field("cpu_family", &self.cpu_family)?;
+        st.serialize_field("cpu_model_name", &self.cpu_model_name)?;
+        st.serialize_field("dpdk_version_pkgconfig", &self.dpdk_version_pkgconfig)?;
+        st.serialize_field("worktree_branch", &self.worktree_branch)?;
+        st.serialize_field("uprof_session_id", &self.uprof_session_id)?;
         st.end()
     }
 }
@@ -273,6 +328,18 @@ impl<'de> Visitor<'de> for CsvRowVisitor {
         let mut metric_value: Option<f64> = None;
         let mut metric_aggregation: Option<MetricAggregation> = None;
 
+        // Task 2.8 host / DPDK / worktree identification columns. Unlike the
+        // required columns above, these default to `None` if the CSV does not
+        // contain the column at all — older CSVs written before Task 2.8 still
+        // round-trip. An explicitly-empty cell also deserialises to `None`
+        // because `Option::<String>::deserialize` via the csv crate treats an
+        // empty field as `None`.
+        let mut cpu_family: Option<Option<u32>> = None;
+        let mut cpu_model_name: Option<Option<String>> = None;
+        let mut dpdk_version_pkgconfig: Option<Option<String>> = None;
+        let mut worktree_branch: Option<Option<String>> = None;
+        let mut uprof_session_id: Option<Option<String>> = None;
+
         while let Some(key) = map.next_key::<String>()? {
             match key.as_str() {
                 "run_id" => run_id = Some(map.next_value()?),
@@ -310,6 +377,11 @@ impl<'de> Visitor<'de> for CsvRowVisitor {
                 "metric_unit" => metric_unit = Some(map.next_value()?),
                 "metric_value" => metric_value = Some(map.next_value()?),
                 "metric_aggregation" => metric_aggregation = Some(map.next_value()?),
+                "cpu_family" => cpu_family = Some(map.next_value()?),
+                "cpu_model_name" => cpu_model_name = Some(map.next_value()?),
+                "dpdk_version_pkgconfig" => dpdk_version_pkgconfig = Some(map.next_value()?),
+                "worktree_branch" => worktree_branch = Some(map.next_value()?),
+                "uprof_session_id" => uprof_session_id = Some(map.next_value()?),
                 _ => {
                     // Unknown column — skip. Forward-compat with future
                     // schema additions that older tools don't know about.
@@ -366,6 +438,14 @@ impl<'de> Visitor<'de> for CsvRowVisitor {
             metric_unit: require(metric_unit, "metric_unit")?,
             metric_value: require(metric_value, "metric_value")?,
             metric_aggregation: require(metric_aggregation, "metric_aggregation")?,
+            // Task 2.8 identification columns — tolerated as absent. The
+            // `unwrap_or(None)` collapses both "column never seen" and
+            // "column present but empty" into `None`.
+            cpu_family: cpu_family.unwrap_or(None),
+            cpu_model_name: cpu_model_name.unwrap_or(None),
+            dpdk_version_pkgconfig: dpdk_version_pkgconfig.unwrap_or(None),
+            worktree_branch: worktree_branch.unwrap_or(None),
+            uprof_session_id: uprof_session_id.unwrap_or(None),
         })
     }
 }
@@ -403,6 +483,11 @@ mod tests {
             metric_unit: "unit".into(),
             metric_value: 1.0,
             metric_aggregation: MetricAggregation::P99,
+            cpu_family: Some(25),
+            cpu_model_name: Some("AMD EPYC 7R13 Processor".into()),
+            dpdk_version_pkgconfig: Some("23.11.2".into()),
+            worktree_branch: Some("a10-perf-23.11".into()),
+            uprof_session_id: None,
         }
     }
 
@@ -424,12 +509,13 @@ mod tests {
     }
 
     /// Invariance guard: the column count must match the spec. Breakdown:
-    /// 13 run-metadata, 14 precondition, 8 per-row — 35 total. If this fires,
-    /// a column was added/removed without updating the companion tests and
-    /// the Serialize impl.
+    /// 13 run-metadata, 14 precondition, 8 per-row, 5 host/dpdk/worktree
+    /// identification (Task 2.8) — 40 total. If this fires, a column was
+    /// added/removed without updating the companion tests and the Serialize
+    /// impl.
     #[test]
     fn columns_len_is_expected() {
-        assert_eq!(COLUMNS.len(), 35);
+        assert_eq!(COLUMNS.len(), 40);
     }
 
     /// Invariance guard: the header row that csv::Writer emits when it

@@ -31,6 +31,11 @@ fn sample_row() -> CsvRow {
         metric_unit: "bytes_per_sec".into(),
         metric_value: 8.7e9,
         metric_aggregation: MetricAggregation::P99,
+        cpu_family: Some(25),
+        cpu_model_name: Some("AMD EPYC 7R13 Processor".into()),
+        dpdk_version_pkgconfig: Some("23.11.2".into()),
+        worktree_branch: Some("a10-perf-23.11".into()),
+        uprof_session_id: None,
     }
 }
 
@@ -175,6 +180,108 @@ fn csv_row_deserialize_errors_on_missing_precondition_column() {
         msg.contains(dropped_col),
         "error message should mention the missing column {dropped_col}, got: {msg}"
     );
+}
+
+/// Task 2.8 backwards-compat guard. An older CSV that was written before
+/// the 5 host/dpdk/worktree identification columns were added must still
+/// deserialise — the new columns default to `None`. Constructs a drifted
+/// header+data row with the 5 new columns stripped and asserts the round
+/// trip recovers every other field unchanged.
+///
+/// Uses the csv crate's `Reader`/`Writer` to strip the columns (rather than
+/// hand-rolled `split(',')`) because `sample_row`'s `dimensions_json` cell
+/// contains commas and the csv writer quotes it — a naive split would shred
+/// the JSON fragment into multiple pseudo-columns.
+#[test]
+fn csv_row_deserialize_tolerates_missing_task_2_8_columns() {
+    let mut row = sample_row();
+    row.cpu_family = None;
+    row.cpu_model_name = None;
+    row.dpdk_version_pkgconfig = None;
+    row.worktree_branch = None;
+    row.uprof_session_id = None;
+
+    // Serialise `row` (40 columns) and strip the 5 trailing identification
+    // columns from both header and data rows using a CSV-aware reader.
+    let mut buf = Vec::new();
+    {
+        let mut wtr = csv::Writer::from_writer(&mut buf);
+        row.write_with_header(&mut wtr).unwrap();
+    }
+
+    let legacy_columns = [
+        "cpu_family",
+        "cpu_model_name",
+        "dpdk_version_pkgconfig",
+        "worktree_branch",
+        "uprof_session_id",
+    ];
+
+    let mut rdr = csv::ReaderBuilder::new()
+        .has_headers(false)
+        .from_reader(&buf[..]);
+    let mut records = rdr.records();
+    let header_record = records.next().unwrap().unwrap();
+    let data_record = records.next().unwrap().unwrap();
+    let mut header_fields: Vec<String> = header_record.iter().map(String::from).collect();
+    let mut data_fields: Vec<String> = data_record.iter().map(String::from).collect();
+    assert_eq!(header_fields.len(), COLUMNS.len());
+    assert_eq!(data_fields.len(), COLUMNS.len());
+    for col in legacy_columns {
+        let idx = header_fields
+            .iter()
+            .position(|c| c == col)
+            .unwrap_or_else(|| panic!("column {col} missing from live header"));
+        header_fields.remove(idx);
+        data_fields.remove(idx);
+    }
+    assert_eq!(header_fields.len(), COLUMNS.len() - 5);
+
+    let mut drifted_buf = Vec::new();
+    {
+        let mut wtr = csv::Writer::from_writer(&mut drifted_buf);
+        wtr.write_record(&header_fields).unwrap();
+        wtr.write_record(&data_fields).unwrap();
+        wtr.flush().unwrap();
+    }
+
+    let mut rdr = csv::Reader::from_reader(&drifted_buf[..]);
+    let parsed: CsvRow = rdr
+        .deserialize()
+        .next()
+        .unwrap()
+        .expect("older CSV without Task 2.8 columns must still parse");
+    assert_eq!(parsed, row);
+    assert!(parsed.cpu_family.is_none());
+    assert!(parsed.cpu_model_name.is_none());
+    assert!(parsed.dpdk_version_pkgconfig.is_none());
+    assert!(parsed.worktree_branch.is_none());
+    assert!(parsed.uprof_session_id.is_none());
+}
+
+/// Task 2.8 round-trip guard: populated identification columns survive
+/// write-then-read through the CSV reader, including the numeric
+/// `cpu_family` (u32) and the mixed-populated `uprof_session_id` case
+/// (None emits empty and reads back as None).
+#[test]
+fn csv_row_round_trip_task_2_8_identification_fields() {
+    let row = sample_row();
+    let mut buf = Vec::new();
+    {
+        let mut wtr = csv::Writer::from_writer(&mut buf);
+        row.write_with_header(&mut wtr).unwrap();
+    }
+    let text = std::str::from_utf8(&buf).unwrap();
+    // Sanity: header and data row both contain the new columns.
+    let header = text.lines().next().unwrap();
+    assert!(header.ends_with(",cpu_family,cpu_model_name,dpdk_version_pkgconfig,worktree_branch,uprof_session_id"));
+    // Data row ends with a trailing empty cell for the `None` uprof_session_id.
+    let data = text.lines().nth(1).unwrap();
+    assert!(data.ends_with(","), "last cell should be empty for None: got {data}");
+
+    let mut rdr = csv::Reader::from_reader(&buf[..]);
+    let parsed: CsvRow = rdr.deserialize().next().unwrap().unwrap();
+    assert_eq!(parsed, row);
 }
 
 /// I3 (T14 code-quality review): the single-column drift-guard above covers
