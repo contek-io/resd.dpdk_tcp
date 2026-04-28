@@ -5642,12 +5642,58 @@ impl Engine {
 
 impl Drop for Engine {
     fn drop(&mut self) {
-        // Safety: we previously started the port; stop and close on drop.
+        // CRITICAL ORDERING: every Rust-side mbuf owner must be released
+        // BEFORE the mempool fields drop. Mempools are declared early
+        // in the Engine struct (engine.rs:415-422), so Rust's
+        // struct-field forward drop order would free their memzones
+        // first; the subsequent `MbufHandle::Drop` refcount-update
+        // calls fired by flow_table / tx_pending_data / fault_injector
+        // teardown would then touch deleted memory and segfault inside
+        // `shim_rte_mbuf_refcnt_update`. Confirmed by gdb backtrace
+        // from bench-ab-runner run br32yx9a7 (2026-04-28): the crash
+        // walked exactly the chain MbufHandle → InOrderSegment →
+        // SmallVec → TcpConn → FlowTable → Engine, dereffing an mbuf
+        // address inside a memzone marked `(deleted)` in /proc/maps.
+        //
+        // Step 1: clear FlowTable. Drops every TcpConn, which drops
+        // recv-segment + reorder + snd_retrans + delivered_segments
+        // mbufs back into still-alive mempools.
+        self.flow_table.get_mut().clear_all();
+
+        // Step 2: free any mbufs queued in the engine-scope TX batch
+        // ring. We don't try to send them (the port is about to close);
+        // just return them to the mempool.
+        {
+            let mut ring = self.tx_pending_data.borrow_mut();
+            for ptr in ring.drain(..) {
+                // Safety: the ring is populated by `send_bytes` from
+                // mbuf pointers we own. Each ptr was alloc'd from
+                // `tx_data_mempool` (still alive at this point);
+                // `rte_pktmbuf_free` decs refcount and returns the
+                // mbuf to its pool.
+                unsafe { sys::shim_rte_pktmbuf_free(ptr.as_ptr()) };
+            }
+        }
+
+        // Step 3: take the optional FaultInjector so its own Drop runs
+        // here (releasing any mbufs held in its reorder ring) instead
+        // of after the mempools drop.
+        #[cfg(feature = "fault-injector")]
+        {
+            let _ = self.fault_injector.borrow_mut().take();
+        }
+
+        // Step 4: stop + close port. PMD queue-release callbacks fire
+        // here; queue rings are empty by now (all mbufs returned in
+        // steps 1-3) so the PMD has nothing dangling.
         unsafe {
             sys::rte_eth_dev_stop(self.cfg.port_id);
             sys::rte_eth_dev_close(self.cfg.port_id);
         }
-        // Mempools drop via their own Drop impl.
+
+        // Step 5: mempools drop next via Rust struct-field forward
+        // order. All refcounts already decremented; rte_mempool_free
+        // walks an empty pool and unmaps the memzone cleanly.
     }
 }
 
