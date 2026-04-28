@@ -276,7 +276,16 @@ wait_for_ssh "$PEER_SSH" "$PEER_INSTANCE_ID"
 # miss_txc_to=3) on PCI slot 0000:00:06.0 (c6in.metal default). The
 # script takes EAL_ARGS from env if the operator wants to override for
 # a different instance type or PCI slot.
-EAL_ARGS="${EAL_ARGS:--l 2-3 -n 4 -a 0000:00:06.0,large_llq_hdr=1,miss_txc_to=3}"
+#
+# `--in-memory` keeps DPDK metadata out of /var/run/dpdk/rte/, and
+# `--huge-unlink` removes /dev/hugepages/rtemap_* backing files at mmap
+# time so they don't survive a half-completed rte_eal_cleanup. Without
+# these flags, residual hugepage state from a prior bench-ab-runner
+# leaks into the next process and rte_eal_cleanup walks a corrupted
+# memzone (observed: bench-obs-overhead obs-none SIGSEGV in run
+# bl16x36lb). Same flags as tests/ffi-test/tests/ffi_smoke.rs:48 uses
+# for the same reason.
+EAL_ARGS="${EAL_ARGS:--l 2-3 -n 4 --in-memory --huge-unlink -a 0000:00:06.0,large_llq_hdr=1,miss_txc_to=3}"
 
 # ---------------------------------------------------------------------------
 # [5/12] SCP binaries + scripts to DUT and peer hosts.
