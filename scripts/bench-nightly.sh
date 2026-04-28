@@ -631,7 +631,7 @@ ssh "${SSH_OPTS[@]}" "ubuntu@$DUT_SSH" \
         --warmup $BENCH_WARMUP \
         --output-dir /tmp/bench-offload-ab-out \
         --report-path /tmp/bench-offload-ab-out/offload-ab.md \
-        --runner-bin /tmp/bench-ab-runner-gdb.sh \
+        --runner-bin /tmp/bench-ab-runner \
         --skip-rebuild" \
     || log "  [10/12] bench-offload-ab exited non-zero — continuing"
 refresh_ec2_ic_grants
@@ -655,7 +655,7 @@ ssh "${SSH_OPTS[@]}" "ubuntu@$DUT_SSH" \
         --warmup $BENCH_WARMUP \
         --output-dir /tmp/bench-obs-overhead-out \
         --report-path /tmp/bench-obs-overhead-out/obs-overhead.md \
-        --runner-bin /tmp/bench-ab-runner-gdb.sh \
+        --runner-bin /tmp/bench-ab-runner \
         --skip-rebuild" \
     || log "  [10b/12] bench-obs-overhead exited non-zero — continuing"
 refresh_ec2_ic_grants
