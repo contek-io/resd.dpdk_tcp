@@ -101,6 +101,16 @@ pub mod test_support {
         pub timer_wheel: TimerWheel,
         pub event_queue: EventQueue,
         now_ns: u64,
+        /// a10-perf-23.11 T3.1 H1: pre-allocated, reused per-poll scratch
+        /// of conn handles — mirrors the real `Engine::conn_handles_scratch`
+        /// `RefCell<SmallVec<[ConnHandle; 8]>>` (engine.rs ~line 609). The
+        /// previous implementation `.collect()`ed into a fresh `SmallVec`
+        /// every `poll_once`, which heap-allocated whenever the inline
+        /// capacity (16) was exceeded; even when not exceeded, the freshly
+        /// constructed SmallVec drained per-iter. Reusing a `Vec<ConnHandle>`
+        /// here is `clear()`+`extend` per call — same shape as the real
+        /// engine prelude.
+        conn_handles_scratch: Vec<ConnHandle>,
     }
 
     impl EngineNoEalHarness {
@@ -115,6 +125,7 @@ pub mod test_support {
                 timer_wheel: TimerWheel::new(flow_capacity.max(64)),
                 event_queue: EventQueue::new(),
                 now_ns: 0,
+                conn_handles_scratch: Vec::with_capacity(flow_capacity),
             }
         }
 
@@ -125,11 +136,15 @@ pub mod test_support {
         pub fn poll_once(&mut self) {
             self.now_ns = crate::clock::now_ns();
 
-            // Mirror Engine::poll_once's conn-scratch clear. Collect handles
-            // first (iter borrows &FlowTable); then mutate via get_mut.
-            let handles: smallvec::SmallVec<[ConnHandle; 16]> =
-                self.flow_table.iter_handles().collect();
-            for h in handles {
+            // a10-perf-23.11 T3.1 H1: mirror Engine::poll_once's prelude
+            // shape — clear+extend the pre-allocated `conn_handles_scratch`
+            // rather than `.collect()`ing into a fresh SmallVec each call.
+            // The `Vec` is owned by the harness, so no per-call allocation
+            // happens once `flow_capacity` cushion is reached at `new()`.
+            self.conn_handles_scratch.clear();
+            self.conn_handles_scratch
+                .extend(self.flow_table.iter_handles());
+            for &h in &self.conn_handles_scratch {
                 if let Some(c) = self.flow_table.get_mut(h) {
                     c.delivered_segments.clear();
                     c.readable_scratch_iovecs.clear();
