@@ -305,7 +305,7 @@ PEER_BINS=(
   tools/bench-e2e/peer/echo-server
   tools/bench-vs-linux/peer/linux-tcp-sink
 )
-SHARED_SCRIPTS=(scripts/check-bench-preconditions.sh)
+SHARED_SCRIPTS=(scripts/check-bench-preconditions.sh scripts/bench-ab-runner-gdb.sh)
 
 for bin in "${DUT_BINS[@]}" "${PEER_BINS[@]}" "${SHARED_SCRIPTS[@]}"; do
   if [ ! -f "$bin" ]; then
@@ -319,12 +319,18 @@ log "  -> DUT ($DUT_SSH)"
 scp "${SCP_OPTS[@]}" \
     "${DUT_BINS[@]}" "${SHARED_SCRIPTS[@]}" \
     "ubuntu@${DUT_SSH}:/tmp/"
+# scp drops the +x bit on shell scripts; restore it for the gdb wrapper
+# so bench-offload-ab / bench-obs-overhead can exec it as --runner-bin.
+ssh "${SSH_OPTS[@]}" "ubuntu@$DUT_SSH" \
+    "chmod +x /tmp/bench-ab-runner-gdb.sh /tmp/check-bench-preconditions.sh"
 
 refresh_ec2_ic_grants
 log "  -> peer ($PEER_SSH)"
 scp "${SCP_OPTS[@]}" \
     "${PEER_BINS[@]}" "${SHARED_SCRIPTS[@]}" \
     "ubuntu@${PEER_SSH}:/tmp/"
+ssh "${SSH_OPTS[@]}" "ubuntu@$PEER_SSH" \
+    "chmod +x /tmp/check-bench-preconditions.sh"
 
 # ---------------------------------------------------------------------------
 # [6/12] Start peer services (echo-server for bench-e2e/stress/vs-mtcp;
@@ -625,7 +631,7 @@ ssh "${SSH_OPTS[@]}" "ubuntu@$DUT_SSH" \
         --warmup $BENCH_WARMUP \
         --output-dir /tmp/bench-offload-ab-out \
         --report-path /tmp/bench-offload-ab-out/offload-ab.md \
-        --runner-bin /tmp/bench-ab-runner \
+        --runner-bin /tmp/bench-ab-runner-gdb.sh \
         --skip-rebuild" \
     || log "  [10/12] bench-offload-ab exited non-zero — continuing"
 refresh_ec2_ic_grants
@@ -649,13 +655,22 @@ ssh "${SSH_OPTS[@]}" "ubuntu@$DUT_SSH" \
         --warmup $BENCH_WARMUP \
         --output-dir /tmp/bench-obs-overhead-out \
         --report-path /tmp/bench-obs-overhead-out/obs-overhead.md \
-        --runner-bin /tmp/bench-ab-runner \
+        --runner-bin /tmp/bench-ab-runner-gdb.sh \
         --skip-rebuild" \
     || log "  [10b/12] bench-obs-overhead exited non-zero — continuing"
 refresh_ec2_ic_grants
 scp -r "${SCP_OPTS[@]}" \
     "ubuntu@$DUT_SSH:/tmp/bench-obs-overhead-out" "$OUT_DIR/bench-obs-overhead" \
     || log "  [10b/12] scp of bench-obs-overhead failed — continuing"
+
+# Pull the gdb wrapper's diagnostic log back for offline analysis. The
+# wrapper writes stack traces from any SIGSEGV that hit bench-ab-runner
+# during [10/12]+[10b/12], plus the gdb-version banner and any apt-install
+# output if gdb was bootstrapped at first invocation.
+refresh_ec2_ic_grants
+scp "${SCP_OPTS[@]}" \
+    "ubuntu@$DUT_SSH:/tmp/bench-ab-runner-gdb.log" "$OUT_DIR/" \
+    || log "  gdb log scp failed — continuing"
 
 # ---------------------------------------------------------------------------
 # [11/12] bench-vs-mtcp burst + maxtp grids.
