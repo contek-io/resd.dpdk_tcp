@@ -20,16 +20,41 @@
 // `clock::now_ns` (pure Rust, no FFI boundary) as the closest proxy.
 
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+// Batching factor for `iter_custom`. At sub-10ns workloads, criterion's
+// per-iter closure-call + sample-bookkeeping overhead can dominate the
+// measured cost. Calling the workload BATCH times inside one closure
+// invocation, then dividing the total elapsed by BATCH before returning,
+// amortizes that fixed cost. With BATCH=128 the per-call accuracy is
+// limited only by Instant::now() resolution (~1-3 ns on this host) +
+// loop-overhead (~1 cycle), both << 10 ns observed cost.
+const BATCH: u64 = 128;
 
 fn bench_tsc_read_ffi(c: &mut Criterion) {
     c.bench_function("bench_tsc_read_ffi", |b| {
         // `dpdk_net_now_ns` accepts a nullable `*mut dpdk_net_engine` and
         // ignores it (the clock is process-global). Passing null exercises
         // the full FFI call overhead without any Engine state.
-        b.iter(|| {
-            let ns = unsafe { dpdk_net::dpdk_net_now_ns(black_box(std::ptr::null_mut())) };
-            black_box(ns);
+        //
+        // `iter_custom`: we measure BATCH calls per closure invocation and
+        // return `elapsed / BATCH`. Criterion treats the returned Duration
+        // as the "per-iter" cost, so the reported median IS per-call cost.
+        // XOR-fold the results into a single accumulator and `black_box`
+        // it once at end-of-batch so the per-call cost is the FFI hop +
+        // rdtsc + scaled-multiply, not BATCH stack roundtrips.
+        b.iter_custom(|iters| {
+            let start = Instant::now();
+            for _ in 0..iters {
+                let mut acc: u64 = 0;
+                for _ in 0..BATCH {
+                    acc ^= unsafe {
+                        dpdk_net::dpdk_net_now_ns(black_box(std::ptr::null_mut()))
+                    };
+                }
+                black_box(acc);
+            }
+            start.elapsed() / (BATCH as u32)
         });
     });
 }
@@ -40,9 +65,22 @@ fn bench_tsc_read_inline(c: &mut Criterion) {
         // function-pointer indirection. rustc with LTO may inline
         // rdtsc + the scaled-multiply conversion. This is the
         // closest analog to a future header-inline FFI variant.
-        b.iter(|| {
-            let ns = dpdk_net_core::clock::now_ns();
-            black_box(ns);
+        //
+        // `iter_custom`: see `bench_tsc_read_ffi` for batching rationale.
+        // To probe H2 (black_box stack roundtrip overhead), accumulate the
+        // results into a single XOR-folded sum and consume it with a single
+        // `black_box` at the end of the batch. This eliminates BATCH-1 of
+        // the per-call store/load pairs.
+        b.iter_custom(|iters| {
+            let start = Instant::now();
+            for _ in 0..iters {
+                let mut acc: u64 = 0;
+                for _ in 0..BATCH {
+                    acc ^= dpdk_net_core::clock::now_ns();
+                }
+                black_box(acc);
+            }
+            start.elapsed() / (BATCH as u32)
         });
     });
 }
