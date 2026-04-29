@@ -752,7 +752,6 @@ run_dut_bench bench-vs-mtcp bench-vs-mtcp-burst \
     "${DPDK_COMMON[@]}" \
     --workload burst \
     --peer-port 10001 \
-    --peer-ssh "ubuntu@$PEER_SSH" \
     --stacks dpdk \
     --tool bench-vs-mtcp \
     --feature-set trading-latency \
@@ -764,7 +763,6 @@ run_dut_bench bench-vs-mtcp bench-vs-mtcp-maxtp \
     "${DPDK_COMMON[@]}" \
     --workload maxtp \
     --peer-port 10001 \
-    --peer-ssh "ubuntu@$PEER_SSH" \
     --stacks dpdk \
     --tool bench-vs-mtcp \
     --feature-set trading-latency \
