@@ -414,16 +414,20 @@ run_dut_bench() {
   # interleave the two streams; we want stderr preserved in its own
   # file because the binaries log structured progress to stdout and
   # diagnostics to stderr.
-  if ! ssh "${SSH_OPTS[@]}" "ubuntu@$DUT_SSH" "$cmd" \
-      >"$stdout_log" 2>"$stderr_log"; then
-    local rc=$?
+  local rc=0
+  ssh "${SSH_OPTS[@]}" "ubuntu@$DUT_SSH" "$cmd" \
+      >"$stdout_log" 2>"$stderr_log" || rc=$?
+  if [ $rc -ne 0 ]; then
     log "  $bench exited rc=$rc; tailing stderr:"
     tail -n 40 "$stderr_log" | sed 's/^/    /' | tee -a /dev/stderr
-    return $rc
   fi
+  # Always attempt to scp the CSV, even on bench failure: a partial CSV
+  # written before the cliff / abort is forensically valuable for
+  # iteration-cliff diagnosis. scp failure here is non-fatal.
   refresh_ec2_ic_grants
   scp "${SCP_OPTS[@]}" "ubuntu@$DUT_SSH:/tmp/${csv_name}.csv" "$OUT_DIR/" \
     || log "  scp ${csv_name}.csv failed (bench may have exited before write)"
+  return $rc
 }
 
 # Common args shared across bench-e2e / bench-stress / bench-vs-linux /
@@ -486,6 +490,16 @@ declare -A NETEM_SPECS=(
 )
 
 NETEM_SCENARIOS=(random_loss_01pct_10ms correlated_burst_loss_1pct reorder_depth_3 duplication_2x)
+
+# Defensive cleanup: if a previous run crashed mid-scenario, the peer
+# may still have a netem qdisc installed. The next `tc qdisc add` would
+# return EEXIST and skip ALL subsequent scenarios via the apply-fail
+# branch — fail loud and silent. One pre-loop `del` puts the peer in a
+# known clean state; `|| true` covers the no-orphan case.
+log "  [8/12] pre-loop netem cleanup (defensive)"
+ssh "${SSH_OPTS[@]}" "ubuntu@$PEER_SSH" \
+  "sudo tc qdisc del dev ens6 root || true" \
+  || log "    pre-loop cleanup ssh failed (peer unreachable?); continuing"
 
 bench_stress_csvs=()
 
