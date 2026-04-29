@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 /// Per-lcore counter struct. Cacheline-grouped.
 /// Hot-path increments use Relaxed stores on the owning lcore;
@@ -269,6 +269,26 @@ pub struct TcpCounters {
     /// consumer is draining non-segment-aligned byte counts, which is
     /// the common case for byte-stream protocols.
     pub rx_partial_read_splits: AtomicU64,
+    // --- A10 deferred-fix Stage A: RX-side leak diagnostics (slow-path) ---
+    // Forensic-only: intentionally NOT mirrored in `dpdk_net_tcp_counters_t`
+    // (crates/dpdk-net/src/api.rs). Consumed by the Rust-side bench-stress
+    // counters_snapshot table + MbufHandle::Drop hook only. The size_of
+    // const assertion at api.rs:503 holds because the 12 new bytes fit
+    // inside the existing tail-padding of the #[repr(C, align(64))] struct;
+    // mirroring these on the C side would break that invariant silently.
+    /// Most-recently-sampled value of `rte_mempool_avail_count(rx_mp)`.
+    /// Sampled at most once per second inside `poll_once`. A monotonically
+    /// decreasing trend across a long run is the leading indicator of an
+    /// RX mempool leak (root-cause hypothesis for the iteration-7050
+    /// retransmit cliff documented in
+    /// `docs/superpowers/reports/a10-ab-driver-debug.md` §3).
+    pub rx_mempool_avail: AtomicU32,
+    /// Cumulative count of `MbufHandle::Drop` invocations that observed
+    /// a post-decrement refcount above the legitimate-handle threshold.
+    /// Threshold rationale: no production path holds more than 32 handles
+    /// to one mbuf concurrently (max in-flight conns × max simultaneous
+    /// READABLE pins); a higher post-dec count is unequivocally a leak.
+    pub mbuf_refcnt_drop_unexpected: AtomicU64,
 }
 
 #[repr(C, align(64))]
@@ -661,5 +681,23 @@ mod a5_5_tests {
         assert_eq!(c.tcp.ts_recent_expired.load(Ordering::Relaxed), 0);
         assert_eq!(c.tcp.tx_flush_bursts.load(Ordering::Relaxed), 0);
         assert_eq!(c.tcp.tx_flush_batched_pkts.load(Ordering::Relaxed), 0);
+    }
+}
+
+#[cfg(test)]
+mod a10_diagnostic_counter_tests {
+    use super::*;
+    use std::sync::atomic::Ordering;
+
+    #[test]
+    fn rx_mempool_avail_default_is_zero() {
+        let c = Counters::new();
+        assert_eq!(c.tcp.rx_mempool_avail.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn mbuf_refcnt_drop_unexpected_default_is_zero() {
+        let c = Counters::new();
+        assert_eq!(c.tcp.mbuf_refcnt_drop_unexpected.load(Ordering::Relaxed), 0);
     }
 }
