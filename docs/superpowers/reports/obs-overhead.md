@@ -1,31 +1,33 @@
 # Observability Overhead Report
 
-Run: ff55b46d-47ac-4f4c-9361-11843a9517ff
-Date: 2026-04-28T14:32:25.968382505+00:00
+Run: d5fb7b85-55d8-4e31-8dea-17a40b1386e6
+Date: 2026-04-29T13:58:38.063936493+00:00
 Commit: 
-Workload: 128 B / 128 B request-response, N=5000 per config, warmup=500
+Workload: 128 B / 128 B request-response, N=100000 per config, warmup=1000
 
 ## Summary Table
 
 | Config | Features | p50 (ns) | p99 (ns) | p999 (ns) | delta_p99 vs obs-none | Decision | Default | Action (if fail) |
 |---|---|---|---|---|---|---|---|---|
-| obs-none | obs-none | 35829.00 | 43240.00 | 48240.00 | — | — | OFF | — |
-| poll-saturation-only | obs-poll-saturation | 35929.00 | 43669.00 | 49789.00 | 429.00 ns | NoSignal | ON | — |
-| byte-counters-only | obs-byte-counters | 35440.00 | 42290.00 | 50949.00 | -950.00 ns | NoSignal | OFF | — |
-| obs-all-no-none | obs-all | 35830.00 | 43700.00 | 48849.00 | 460.00 ns | NoSignal | (composite) | — |
-| default | (prod default) | 35620.00 | 43120.00 | 48800.00 | -120.00 ns | NoSignal | N/A | — |
+| obs-none | obs-none | 34609.00 | 42260.00 | 47629.00 | — | — | OFF | — |
+| poll-saturation-only | obs-poll-saturation | 34360.00 | 40870.00 | 46840.00 | -1390.00 ns | NoSignal | ON | — |
+| byte-counters-only | obs-byte-counters | 34600.00 | 42030.00 | 47480.00 | -230.00 ns | NoSignal | OFF | — |
+| obs-all-no-none | obs-all | 34589.00 | 41520.00 | 46760.00 | -740.00 ns | NoSignal | (composite) | — |
+| default | (prod default) | 34160.00 | 40830.00 | 45980.00 | -1430.00 ns | NoSignal | N/A | — |
 
-Noise floor (2 back-to-back obs-none runs, |p99 delta|): 650.00 ns (raw); 650.00 ns (clamped)
-Decision threshold (3 × clamped noise floor): 1950.00 ns
+Noise floor (2 back-to-back obs-none runs, |p99 delta|): 380.00 ns (raw); 380.00 ns (clamped)
+Decision threshold (3 × clamped noise floor): 1140.00 ns
 
 ## Sanity Invariant
 
-Lowest p99 (obs-none): 43240.00 ns
-Any p99 < 43240.00 ns? YES -> VIOLATION (an observable is either dead code, a regression, or inside the noise floor)
-- byte-counters-only: p99 = 42290.00 ns
-- default: p99 = 43120.00 ns
+Lowest p99 (obs-none): 42260.00 ns
+Any p99 < 42260.00 ns? YES -> VIOLATION (an observable is either dead code, a regression, or inside the noise floor)
+- poll-saturation-only: p99 = 40870.00 ns
+- byte-counters-only: p99 = 42030.00 ns
+- obs-all-no-none: p99 = 41520.00 ns
+- default: p99 = 40830.00 ns
 
-Diagnostic: observability floor violated: config 'byte-counters-only' p99 42290 < obs-none p99 43240 (observability can only add cost; either the observable is dead code, the implementation regressed, or the delta is within measurement noise); observability floor violated: config 'default' p99 43120 < obs-none p99 43240 (observability can only add cost; either the observable is dead code, the implementation regressed, or the delta is within measurement noise)
+Diagnostic: observability floor violated: config 'poll-saturation-only' p99 40870 < obs-none p99 42260 (observability can only add cost; either the observable is dead code, the implementation regressed, or the delta is within measurement noise); observability floor violated: config 'byte-counters-only' p99 42030 < obs-none p99 42260 (observability can only add cost; either the observable is dead code, the implementation regressed, or the delta is within measurement noise); observability floor violated: config 'obs-all-no-none' p99 41520 < obs-none p99 42260 (observability can only add cost; either the observable is dead code, the implementation regressed, or the delta is within measurement noise); observability floor violated: config 'default' p99 40830 < obs-none p99 42260 (observability can only add cost; either the observable is dead code, the implementation regressed, or the delta is within measurement noise)
 
 ## Decision → Action Recommendations
 
@@ -44,4 +46,4 @@ No Signal + default=ON rows this run — no action required.
 
 ## Full CSV
 
-See `/tmp/bench-obs-overhead-out/ff55b46d-47ac-4f4c-9361-11843a9517ff.csv`.
+See `/tmp/bench-obs-overhead-out/d5fb7b85-55d8-4e31-8dea-17a40b1386e6.csv`.

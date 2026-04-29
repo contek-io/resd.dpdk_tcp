@@ -1,31 +1,31 @@
 # Offload A/B Report
 
-Run: 0f29aca3-63d9-4ad3-aaf9-dc44667cd442
-Date: 2026-04-28T14:31:52.192650643+00:00
+Run: e1a97f86-ce66-4c93-8566-3dcb06c2f7af
+Date: 2026-04-29T13:57:39.912463516+00:00
 Commit: 
-Workload: 128 B / 128 B request-response, N=5000 per config, warmup=500
+Workload: 128 B / 128 B request-response, N=100000 per config, warmup=1000
 
 ## Summary Table
 
 | Config | Features | p50 (ns) | p99 (ns) | p999 (ns) | delta_p99 vs baseline | Decision |
 |---|---|---|---|---|---|---|
-| baseline | (none) | 35589.00 | 41800.00 | 46189.00 | — | — |
-| tx-cksum-only | hw-offload-tx-cksum | 35810.00 | 43170.00 | 48590.00 | -1370.00 ns | NoSignal |
-| rx-cksum-only | hw-offload-rx-cksum | 35420.00 | 42140.00 | 47480.00 | -340.00 ns | NoSignal |
-| mbuf-fast-free-only | hw-offload-mbuf-fast-free | 36260.00 | 44140.00 | 49010.00 | -2340.00 ns | NoSignal |
-| rss-hash-only | hw-offload-rss-hash | 37580.00 | 46170.00 | 55890.00 | -4370.00 ns | NoSignal |
-| rx-timestamp-only | hw-offload-rx-timestamp | 37229.00 | 45290.00 | 54700.00 | -3490.00 ns | NoSignal |
-| llq-verify-only | hw-verify-llq | 35989.00 | 44370.00 | 50750.00 | -2570.00 ns | NoSignal |
-| full | hw-offloads-all | 35840.00 | 44500.00 | 51880.00 | -2700.00 ns | NoSignal |
+| baseline | (none) | 34449.00 | 41189.00 | 47640.00 | — | — |
+| tx-cksum-only | hw-offload-tx-cksum | 34590.00 | 42709.00 | 47260.00 | -1520.00 ns | NoSignal |
+| rx-cksum-only | hw-offload-rx-cksum | 35220.00 | 43969.00 | 49790.00 | -2780.00 ns | NoSignal |
+| mbuf-fast-free-only | hw-offload-mbuf-fast-free | 34380.00 | 40740.00 | 46669.00 | 449.00 ns | **Signal** |
+| rss-hash-only | hw-offload-rss-hash | 34630.00 | 42110.00 | 47049.00 | -921.00 ns | NoSignal |
+| rx-timestamp-only | hw-offload-rx-timestamp | 34780.00 | 43480.00 | 48129.00 | -2291.00 ns | NoSignal |
+| llq-verify-only | hw-verify-llq | 34600.00 | 42130.00 | 46849.00 | -941.00 ns | NoSignal |
+| full | hw-offloads-all | 34260.00 | 40170.00 | 45970.00 | 1019.00 ns | **Signal** |
 
-Noise floor (2 back-to-back baselines, |p99 delta|): 371.00 ns (raw); 371.00 ns (clamped)
-Decision threshold (3 × clamped noise floor): 1113.00 ns
+Noise floor (2 back-to-back baselines, |p99 delta|): 89.00 ns (raw); 89.00 ns (clamped)
+Decision threshold (3 × clamped noise floor): 267.00 ns
 
 ## Sanity Invariant
 
-full p99: 44500.00 ns
-Best individual p99: 42140.00 ns (rx-cksum-only)
--> VIOLATION: sanity invariant violated: full p99 44500 > best individual p99 42140 (offloads did not compose; investigate contention / false-sharing)
+full p99: 40170.00 ns
+Best individual p99: 40740.00 ns (mbuf-fast-free-only)
+-> OK
 
 ## Commit History
 
@@ -33,4 +33,4 @@ Best individual p99: 42140.00 ns (rx-cksum-only)
 
 ## Full CSV
 
-See `/tmp/bench-offload-ab-out/0f29aca3-63d9-4ad3-aaf9-dc44667cd442.csv`.
+See `/tmp/bench-offload-ab-out/e1a97f86-ce66-4c93-8566-3dcb06c2f7af.csv`.
