@@ -49,6 +49,10 @@ harness = false
 name = "counters"
 harness = false
 
+[[bench]]
+name = "throughput"
+harness = false
+
 [[bin]]
 name = "summarize"
 path = "src/bin/summarize.rs"
