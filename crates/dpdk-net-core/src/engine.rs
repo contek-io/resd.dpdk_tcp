@@ -932,6 +932,25 @@ impl Engine {
         // offload-miss counters on unsupported requested bits.
         let counters = Box::new(Counters::new());
 
+        // A10 Stage A: bind this engine's counters to the thread so
+        // MbufHandle::Drop can route leak-detect bumps to the right
+        // engine. The set is paired with a scope guard that clears the
+        // pointer on any `?` early return below; on the success path,
+        // we `mem::forget` the guard so Engine::drop owns the eventual
+        // clear (mempool.rs's THREAD_COUNTERS_PTR docs).
+        crate::mempool::THREAD_COUNTERS_PTR.with(|cell| {
+            cell.set(&*counters as *const _);
+        });
+        struct CounterPtrClearOnError;
+        impl Drop for CounterPtrClearOnError {
+            fn drop(&mut self) {
+                crate::mempool::THREAD_COUNTERS_PTR.with(|cell| {
+                    cell.set(std::ptr::null());
+                });
+            }
+        }
+        let counter_ptr_clear_on_error = CounterPtrClearOnError;
+
         // Port-config: dev_info query, offload AND, runtime-fallback
         // latches. Extracted into a helper so later A-HW tasks can add
         // feature-gated offload-bit branches in one place. See
@@ -1054,6 +1073,11 @@ impl Engine {
         // A-HW+ Task 5: resolve ENA xstat name→ID map once at
         // engine_create. Scraped later per-call via `scrape_xstats`.
         let xstat_map = crate::ena_xstats::resolve_xstat_ids(cfg.port_id);
+
+        // Engine constructed successfully — the pointer set at the top
+        // of Engine::new should remain bound until Engine::drop fires.
+        // Forget the scope guard so its Drop doesn't clear prematurely.
+        std::mem::forget(counter_ptr_clear_on_error);
 
         Ok(Self {
             counters,
@@ -5694,6 +5718,13 @@ impl Drop for Engine {
         // Step 5: mempools drop next via Rust struct-field forward
         // order. All refcounts already decremented; rte_mempool_free
         // walks an empty pool and unmaps the memzone cleanly.
+
+        // A10 Stage A: unbind the per-thread counters pointer so any
+        // post-engine drop in this thread doesn't write through a
+        // freed pointer. Pairs with Engine::new's set.
+        crate::mempool::THREAD_COUNTERS_PTR.with(|cell| {
+            cell.set(std::ptr::null());
+        });
     }
 }
 
