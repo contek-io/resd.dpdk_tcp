@@ -47,6 +47,10 @@ int shim_rte_pktmbuf_chain(struct rte_mbuf *head, struct rte_mbuf *tail);
  * fresh header mbuf in front. */
 char *shim_rte_pktmbuf_adj(struct rte_mbuf *m, uint16_t len);
 void shim_rte_mbuf_refcnt_update(struct rte_mbuf *m, int16_t v);
+/* Read mbuf refcount without modifying. Used by MbufHandle::Drop's
+ * leak-detection diagnostic — observes the post-dec count to flag
+ * mbufs that should have been freed but weren't. */
+uint16_t shim_rte_mbuf_refcnt_read(struct rte_mbuf *m);
 uint16_t shim_rte_pktmbuf_nb_segs(const struct rte_mbuf *m);
 /* A6.6 Task 5: next-segment accessor for multi-seg RX ingest chain walk.
  * Returns m->next or NULL if `m` is the last/only segment. */

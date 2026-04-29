@@ -97,6 +97,14 @@ void shim_rte_mbuf_refcnt_update(struct rte_mbuf *m, int16_t v) {
     rte_mbuf_refcnt_update(m, v);
 }
 
+/* rte_mbuf_refcnt_read is static inline; re-export. Returns the current
+ * refcount without modifying it. Used by MbufHandle::Drop's leak-detection
+ * diagnostic — observes the post-dec count to flag mbufs that should have
+ * been freed but weren't. */
+uint16_t shim_rte_mbuf_refcnt_read(struct rte_mbuf *m) {
+    return rte_mbuf_refcnt_read(m);
+}
+
 /* rte_pktmbuf_nb_segs — field accessor for test assertions + debug.
  * bindgen can't expose the rte_mbuf field layout directly. */
 uint16_t shim_rte_pktmbuf_nb_segs(const struct rte_mbuf *m) {
