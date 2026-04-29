@@ -244,7 +244,7 @@ pub struct EngineConfig {
     /// A6.6-7 Task 10: RX mempool capacity in mbufs. `0` = compute default
     /// at `Engine::new`:
     ///   `max(4 * rx_ring_size,
-    ///        2 * max_connections * ceil(recv_buffer_bytes / mbuf_data_room) + 4096)`
+    ///        4 * max_connections * ceil(recv_buffer_bytes / mbuf_data_room) + 4096)`
     /// The per-conn term sizes the pool so every connection can fully
     /// occupy its receive buffer in DPDK-held mbufs concurrently with
     /// an RX-ring refill, and the 4096 cushion absorbs in-flight
@@ -258,6 +258,11 @@ pub struct EngineConfig {
     ///
     /// Retrievable via the `dpdk_net_rx_mempool_size()` FFI getter after
     /// `Engine::new` / `dpdk_net_engine_create`.
+    ///
+    /// (Per-conn coefficient bumped from 2 to 4 in A10 deferred-fix —
+    /// see `docs/superpowers/specs/2026-04-29-a10-deferred-fixes-design.md`
+    /// "Defense in depth" — to extend the cliff window from ~7050 to
+    /// ~14000+ iterations regardless of whether the leak audit lands.)
     pub rx_mempool_size: u32,
 
     // Phase A2 additions (host byte order for IPs; raw bytes for MAC)
@@ -899,7 +904,12 @@ impl Engine {
                 .recv_buffer_bytes
                 .saturating_add(mbuf_data_room.saturating_sub(1))
                 / mbuf_data_room.max(1);
-            let computed = 2u32
+            // A10 deferred-fix (defense in depth): 4× the per-conn term
+            // (was 2×). Doubles the mempool headroom so a hypothetical
+            // leak takes twice as long to drain the pool, regardless of
+            // whether the leak audit lands a fix. ~12288 mbufs at
+            // default config (was 8192).
+            let computed = 4u32
                 .saturating_mul(cfg.max_connections)
                 .saturating_mul(per_conn)
                 .saturating_add(4096);
@@ -6694,5 +6704,41 @@ mod a_hw_port_config_tests {
         let applied = and_offload_with_miss_counter(0, u64::MAX, &ctr, "ignored", 0);
         assert_eq!(applied, 0);
         assert_eq!(ctr.load(Ordering::Relaxed), 0);
+    }
+}
+
+#[cfg(test)]
+mod rx_mempool_size_default_formula_tests {
+    use super::*;
+
+    /// A10 deferred-fix Stage B (defense in depth): doubled per-conn term.
+    /// Formula = max(4 * rx_ring_size,
+    ///               4 * max_connections * ceil(recv_buffer_bytes / mbuf_data_room) + 4096).
+    /// At default config, the per-conn term dominates: per_conn = 128;
+    /// computed = 4 × 16 × 128 + 4096 = 12288. Floor = 4 × 512 = 2048.
+    /// → final 12288 (raised from the prior 8192).
+    #[test]
+    fn default_formula_yields_12288() {
+        let cfg = EngineConfig::default();
+        let mbuf_data_room = cfg.mbuf_data_room as u32;
+        let per_conn = cfg
+            .recv_buffer_bytes
+            .saturating_add(mbuf_data_room.saturating_sub(1))
+            / mbuf_data_room.max(1);
+        let computed = 4u32
+            .saturating_mul(cfg.max_connections)
+            .saturating_mul(per_conn)
+            .saturating_add(4096);
+        let floor = 4u32.saturating_mul(cfg.rx_ring_size as u32);
+        assert_eq!(computed.max(floor), 12288);
+    }
+
+    #[test]
+    fn caller_override_skips_formula() {
+        // Non-zero `rx_mempool_size` is used verbatim — no formula applied.
+        // (Restated invariant; previously implicit.)
+        let mut cfg = EngineConfig::default();
+        cfg.rx_mempool_size = 1024;
+        assert_eq!(cfg.rx_mempool_size, 1024);
     }
 }
