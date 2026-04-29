@@ -466,25 +466,72 @@ run_dut_bench bench-e2e bench-e2e \
     || log "  [7/12] bench-e2e exited non-zero — continuing"
 
 # ---------------------------------------------------------------------------
-# [8/12] bench-stress — netem + FaultInjector matrix (peer-host netem
-# needs peer SSH + iface name).
+# [8/12] bench-stress — operator-side netem orchestration.
+# DUT cannot SSH from the data ENI to the peer's mgmt IP (different SG /
+# no route), so the previous in-process NetemGuard apply hangs on
+# OpenSSH's connect timeout. Operator workstation has working SSH to
+# the peer's mgmt IP; orchestrate netem here, run bench-stress with
+# --external-netem on the DUT.
 # ---------------------------------------------------------------------------
-log "[8/12] bench-stress"
-# Default matrix bundles multiple FaultInjector specs which can't coexist
-# (FI is singleton per Engine). Pick the 4 netem-only scenarios for a
-# single bench-stress pass that produces a usable sweep CSV. FI scenarios
-# can be run individually as a follow-up once the base nightly is green.
-run_dut_bench bench-stress bench-stress \
-    "${DPDK_COMMON[@]}" \
-    --peer-port 10001 \
-    --peer-ssh "ubuntu@$PEER_SSH" \
-    --peer-iface ens6 \
-    --scenarios random_loss_01pct_10ms,correlated_burst_loss_1pct,reorder_depth_3,duplication_2x \
-    --iterations "$BENCH_ITERATIONS" \
-    --warmup "$BENCH_WARMUP" \
-    --tool bench-stress \
-    --feature-set trading-latency \
-    || log "  [8/12] bench-stress exited non-zero — continuing"
+log "[8/12] bench-stress (operator-side netem orchestration)"
+
+# Spec→string map mirrors the literals in
+# `tools/bench-stress/src/scenarios.rs::MATRIX`. Adding a new netem
+# scenario requires a new entry here AND a row in scenarios.rs.
+declare -A NETEM_SPECS=(
+  [random_loss_01pct_10ms]="loss 0.1% delay 10ms"
+  [correlated_burst_loss_1pct]="loss 1% 25%"
+  [reorder_depth_3]="reorder 50% gap 3"
+  [duplication_2x]="duplicate 100%"
+)
+
+NETEM_SCENARIOS=(random_loss_01pct_10ms correlated_burst_loss_1pct reorder_depth_3 duplication_2x)
+
+bench_stress_csvs=()
+
+for scenario in "${NETEM_SCENARIOS[@]}"; do
+  spec="${NETEM_SPECS[$scenario]}"
+  log "  [8/12] $scenario — applying netem ($spec)"
+  ssh "${SSH_OPTS[@]}" "ubuntu@$PEER_SSH" \
+    "sudo tc qdisc add dev ens6 root netem $spec" \
+    || { log "    apply failed; skipping scenario"; continue; }
+
+  csv_name="bench-stress-$scenario"
+  if ! run_dut_bench bench-stress "$csv_name" \
+      "${DPDK_COMMON[@]}" \
+      --peer-port 10001 \
+      --peer-ssh "ubuntu@$PEER_SSH" \
+      --peer-iface ens6 \
+      --scenarios "$scenario" \
+      --external-netem \
+      --iterations "$BENCH_ITERATIONS" \
+      --warmup "$BENCH_WARMUP" \
+      --tool bench-stress \
+      --feature-set trading-latency; then
+    log "    $scenario bench-stress exited non-zero — continuing"
+  fi
+
+  log "  [8/12] $scenario — removing netem"
+  ssh "${SSH_OPTS[@]}" "ubuntu@$PEER_SSH" \
+    "sudo tc qdisc del dev ens6 root || true"
+
+  bench_stress_csvs+=("$OUT_DIR/${csv_name}.csv")
+done
+
+# Concatenate per-scenario CSVs into a single bench-stress.csv.
+# First file's header is preserved; subsequent files' headers are
+# stripped via `tail -n +2`. If no scenarios produced a CSV (every one
+# failed), emit an empty file so the downstream report sees the
+# expected name without erroring.
+log "[8/12] merging per-scenario CSVs into bench-stress.csv"
+{
+  if [ ${#bench_stress_csvs[@]} -gt 0 ] && [ -f "${bench_stress_csvs[0]}" ]; then
+    head -n 1 "${bench_stress_csvs[0]}"
+    for f in "${bench_stress_csvs[@]}"; do
+      [ -f "$f" ] && tail -n +2 "$f"
+    done
+  fi
+} > "$OUT_DIR/bench-stress.csv"
 
 # ---------------------------------------------------------------------------
 # [9/12] bench-vs-linux — mode A (RTT) + mode B (wire-diff).
