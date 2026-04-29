@@ -418,6 +418,11 @@ pub struct Engine {
     /// `dpdk_net_rx_mempool_size()` FFI getter so the application can
     /// report / log the actual pool size without re-deriving the formula.
     pub(crate) rx_mempool_size: u32,
+    /// A10 Stage A: TSC of the most-recent `rx_mempool_avail` sample.
+    /// `poll_once` re-samples when the current TSC has advanced ≥
+    /// `tsc_hz` cycles past this value (≈1 second of wall clock).
+    /// `Cell<u64>` because writes happen from the single engine lcore.
+    pub(crate) rx_mempool_avail_last_sample_tsc: Cell<u64>,
     tx_hdr_mempool: Mempool,
     tx_data_mempool: Mempool,
     our_mac: [u8; 6],
@@ -1083,6 +1088,7 @@ impl Engine {
             counters,
             _rx_mempool: rx_mempool,
             rx_mempool_size,
+            rx_mempool_avail_last_sample_tsc: Cell::new(0),
             tx_hdr_mempool,
             tx_data_mempool,
             our_mac,
@@ -1959,6 +1965,26 @@ impl Engine {
         use crate::counters::{add, inc};
         use std::sync::atomic::Ordering;
         inc(&self.counters.poll.iters);
+
+        // A10 Stage A: at most once per second, sample the RX mempool's
+        // free-mbuf count. Cliff hypothesis: a steady drain across many
+        // iterations would surface as a monotonically-decreasing series
+        // here while the workload is otherwise healthy.
+        {
+            let now_tsc = crate::clock::rdtsc();
+            let last = self.rx_mempool_avail_last_sample_tsc.get();
+            let tsc_hz = unsafe { sys::rte_get_tsc_hz() };
+            if tsc_hz > 0 && now_tsc.wrapping_sub(last) >= tsc_hz {
+                let avail = unsafe {
+                    sys::shim_rte_mempool_avail_count(self._rx_mempool.as_ptr())
+                };
+                self.counters
+                    .tcp
+                    .rx_mempool_avail
+                    .store(avail, std::sync::atomic::Ordering::Relaxed);
+                self.rx_mempool_avail_last_sample_tsc.set(now_tsc);
+            }
+        }
 
         // A6 (spec §3.6 Site 3): snapshot RX-mempool-drop counter at top
         // of poll so `check_and_emit_rx_enomem` at each exit path can
