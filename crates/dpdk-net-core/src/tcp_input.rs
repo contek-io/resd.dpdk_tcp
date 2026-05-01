@@ -1266,17 +1266,28 @@ fn handle_established(
             // remaining room (in-order-only, not reorder); the reorder
             // queue shares `recv_buffer_bytes` but accounts
             // independently, so the drain site enforces this cap here.
-            let bytes_before = conn.recv.bytes.len();
-            let cap_room = conn.recv.free_space();
-            let (drained_bytes, drained_cap_dropped) = conn
-                .recv
-                .reorder
-                .drain_contiguous_into(conn.rcv_nxt, cap_room, &mut conn.recv.bytes);
-            let drained_count = (conn.recv.bytes.len() - bytes_before) as u32;
-            conn.rcv_nxt = conn.rcv_nxt.wrapping_add(drained_bytes);
-            delivered += drained_bytes;
-            buf_full_drop += drained_cap_dropped;
-            reassembly_hole_filled = drained_count;
+            //
+            // T9 H5 (production-code throughput hunt): gate the drain
+            // on `reorder.is_empty()`. The empty-reorder case is the
+            // steady-state path for in-order data flow; skipping the
+            // outer call avoids the cap_room load + 3-arg call + tuple
+            // return + 3 stores when there is nothing to drain. The
+            // drained_bytes / drained_cap_dropped / reassembly_hole_filled
+            // contributions stay zero (their default), preserving the
+            // post-call accounting bit-for-bit.
+            if !conn.recv.reorder.is_empty() {
+                let bytes_before = conn.recv.bytes.len();
+                let cap_room = conn.recv.free_space();
+                let (drained_bytes, drained_cap_dropped) = conn
+                    .recv
+                    .reorder
+                    .drain_contiguous_into(conn.rcv_nxt, cap_room, &mut conn.recv.bytes);
+                let drained_count = (conn.recv.bytes.len() - bytes_before) as u32;
+                conn.rcv_nxt = conn.rcv_nxt.wrapping_add(drained_bytes);
+                delivered += drained_bytes;
+                buf_full_drop += drained_cap_dropped;
+                reassembly_hole_filled = drained_count;
+            }
         } else if seq_lt(conn.rcv_nxt, seg.seq) {
             // A6.6 Task 5: walk the rte_mbuf.next chain and call
             // `reorder.insert` once per link, transferring one refcount
