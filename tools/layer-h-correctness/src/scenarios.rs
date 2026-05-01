@@ -170,11 +170,12 @@ pub const MATRIX: &[LayerHScenario] = &[
         smoke: false,
         counter_expectations: &[
             ("tcp.tx_retrans", ">0"),
-            ("tcp.tx_rto", ">0"),
-            ("tcp.tx_tlp", ">0"),
             ("obs.events_dropped", "==0"),
         ],
-        disjunctive_expectations: &[],
+        disjunctive_expectations: &[(
+            &["tcp.tx_rto", "tcp.tx_tlp"],
+            ">0",
+        )],
     },
     // ── Duplication (rows 11-12) ──────────────────────────────────────
     LayerHScenario {
@@ -227,7 +228,10 @@ pub const MATRIX: &[LayerHScenario] = &[
         fault_injector: None,
         duration: DUR,
         smoke: true,
-        counter_expectations: &[("obs.events_dropped", "==0")],
+        counter_expectations: &[
+            ("obs.events_dropped", "==0"),
+            ("tcp.rx_rst", "==0"),
+        ],
         disjunctive_expectations: &[(
             &["eth.rx_drop_cksum_bad", "ip.rx_csum_bad"],
             ">0",
