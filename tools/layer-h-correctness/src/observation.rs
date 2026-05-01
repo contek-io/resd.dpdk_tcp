@@ -150,6 +150,18 @@ impl EventRing {
         self.next_seq = 0;
         self.buf.drain(..).collect()
     }
+
+    /// Snapshot the ring into a new owned ring with the same contents
+    /// and truncated flag. Used by the bundle writer so the original
+    /// `ScenarioResult` remains intact (the verdict still references
+    /// failures that mention `at_event_idx` into this window).
+    pub fn clone_for_bundle(&self) -> Self {
+        Self {
+            buf: self.buf.clone(),
+            next_seq: self.next_seq,
+            truncated: self.truncated,
+        }
+    }
 }
 
 fn record_from_event(ev: &InternalEvent, ord: usize) -> EventRecord {
