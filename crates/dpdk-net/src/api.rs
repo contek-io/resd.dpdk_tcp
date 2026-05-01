@@ -124,6 +124,7 @@ pub struct dpdk_net_connect_opts_t {
 }
 
 #[repr(u32)]
+#[derive(Copy, Clone)]
 pub enum dpdk_net_event_kind_t {
     DPDK_NET_EVT_CONNECTED = 1,
     DPDK_NET_EVT_READABLE = 2,
@@ -242,6 +243,19 @@ pub struct dpdk_net_event_t {
 /// Close flags — bitmask for dpdk_net_close.
 pub const DPDK_NET_CLOSE_FORCE_TW_SKIP: u32 = 1 << 0;
 
+/// POSIX `shutdown(2)` `how` constants. Values match `<sys/socket.h>`
+/// exactly so a C caller can pass `SHUT_RD` / `SHUT_WR` / `SHUT_RDWR`
+/// from the system header without remapping. Only `DPDK_NET_SHUT_RDWR`
+/// is functionally supported — half-close returns `-EOPNOTSUPP`. See
+/// spec §4 + §6.4 row `AD-A8.5-shutdown-no-half-close` for the
+/// rationale (Stage 1 byte-stream API has no half-close consumer; the
+/// untested RX-drop-after-SHUT_RD / TX-retransmit-after-SHUT_WR edge
+/// cases are net regression risk without a scenario that exercises
+/// them).
+pub const DPDK_NET_SHUT_RD: i32 = 0;
+pub const DPDK_NET_SHUT_WR: i32 = 1;
+pub const DPDK_NET_SHUT_RDWR: i32 = 2;
+
 /// A5.5 per-connection observable state snapshot (spec §5.3, §7.2.3–7.2.6).
 /// Slow-path projection mirroring `dpdk_net_core::tcp_conn::ConnStats`; all
 /// values are in application-useful units — bytes for the send-buffer
@@ -285,7 +299,9 @@ const _: () = {
 /// Cross-platform atomic-load contract: C/C++ readers MUST use the
 /// helper in `dpdk_net_counters_load.h`:
 ///
-///     uint64_t rx = dpdk_net_load_u64(&counters->eth.rx_pkts);
+/// ```text
+/// uint64_t rx = dpdk_net_load_u64(&counters->eth.rx_pkts);
+/// ```
 ///
 /// Plain dereference is only atomic on x86_64 with aligned uint64_t.
 /// On ARM32 a plain read may tear; ARM64 has weaker ordering semantics
@@ -367,7 +383,6 @@ pub struct dpdk_net_tcp_counters_t {
     pub rx_data: u64,
     pub rx_ack: u64,
     pub rx_rst: u64,
-    pub rx_out_of_order: u64,
     pub tx_retrans: u64,
     pub tx_rto: u64,
     pub tx_tlp: u64,

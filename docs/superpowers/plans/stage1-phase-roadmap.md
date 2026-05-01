@@ -20,14 +20,16 @@
 | A5.5 | Event-log forensics + in-flight introspection + TLP tuning (emission-time ts, queue overflow counter, stats getter, per-conn TLP knobs) | **Complete** ✓ | `2026-04-19-stage1-phase-a5-5-event-log-forensics-tlp-tuning.md` |
 | A-HW | ENA hardware offload enablement (LLQ verify + TX/RX checksum + MBUF_FAST_FREE + RSS-hash plumbing) | **Complete** ✓ | `2026-04-19-stage1-phase-a-hw-ena-offload.md` |
 | A-HW+ | ENA observability + tuning knobs (WC verify + ENI xstats + per-queue xstats + large_llq_hdr / miss_txc_to knobs) | **Complete** ✓ | `2026-04-20-stage1-phase-a-hw-plus-ena-obs-knobs.md` |
-| A6 | Public API surface completeness **+ per-connection RTT histogram** (merged from former A5.6) | Not started | — |
-| A6.5 | Hot-path allocation elimination (reusable scratch, streaming csum, SmallVec, zero-copy reassembly) | Complete | phase-a6-5-complete |
-| A6.6 | RX zero-copy (scatter-gather iovec API, in-order delivery-path mbuf-ref rework, LRO-compatible multi-segment, `rx_mempool_size` knob) | Complete[^a66fused] | phase-a6-6-7-complete |
-| A6.7 | FFI safety audit & hardening (miri, cbindgen header-drift CI, ABI snapshot, panic-firewall test, no-alloc-on-hot-path audit, C++ consumer under ASan/UBSan/LSan) | Complete | phase-a6-6-7-complete |
-| A7 | Loopback test server + packetdrill-shim | Not started | — |
-| A8 | tcpreq + observability gate | Not started | — |
-| A9 | Property + bespoke fuzzing + smoltcp FaultInjector | Complete | phase-a9-complete |
-| A10 | Benchmark harness (micro + e2e + stress) | Complete[^a10notes] | phase-a10-complete |
+| A6 | Public API surface completeness **+ per-connection RTT histogram** (merged from former A5.6) | **Complete** ✓ | `2026-04-19-stage1-phase-a6-public-api-completeness.md` |
+| A6.5 | Hot-path allocation elimination (reusable scratch, streaming csum, SmallVec, zero-copy reassembly) | **Complete** ✓ | `phase-a6-5-complete` |
+| A6.6 | RX zero-copy (scatter-gather iovec API, in-order delivery-path mbuf-ref rework, LRO-compatible multi-segment, `rx_mempool_size` knob) | **Complete** ✓[^a66fused] | `phase-a6-6-7-complete` |
+| A6.7 | FFI safety audit & hardening (miri, cbindgen header-drift CI, ABI snapshot, panic-firewall test, no-alloc-on-hot-path audit, C++ consumer under ASan/UBSan/LSan) | **Complete** ✓ | `phase-a6-6-7-complete` |
+| A7 | Loopback test server + packetdrill-shim | **Complete** ✓ | `2026-04-21-stage1-phase-a7-loopback-test-server-packetdrill-shim.md` |
+| A8 | tcpreq + observability gate | **Complete** ✓ | `2026-04-22-stage1-phase-a8-tcpreq-observability-gate.md` |
+| A8.5 | Test-coverage expansion (6 new tcpreq probes + TX option-order alignment + google env-stubs + `dpdk_net_shutdown` FFI + crash-safety corpus) | **Complete** ✓ | `2026-04-23-a8.5-test-coverage-expansion.md` |
+| A9 | Property + bespoke fuzzing + smoltcp FaultInjector | **Complete** ✓ | `phase-a9-complete` |
+| A10 | Benchmark harness (micro + e2e + stress) | **Complete** ✓[^a10notes] | `phase-a10-deferred-fixed` |
+| A10.5 | Layer H correctness under WAN-condition fault injection (netem matrix) | Not started | — |
 | A11 | Stage 1 ship gate verification | Not started | — |
 | A12 | Documentation (user + maintainer + future-work) + Stage 1 release tag | Not started | — |
 | A13 | HTTP/1.1 + TLS client integration + bench (via `contek-io/cpp_common`) | Not started | — |
@@ -641,6 +643,45 @@ Group 3 — audit artifacts:
 
 ---
 
+## A10.5 — Layer H correctness under WAN-condition fault injection
+
+**Numbering note:** Inserted after A10 as a focused correctness pack. Uses the decimal "A10.5" tag (per the A5.5 / A6.5 precedent) because the scope is correctness-assertion follow-on that reuses A10's netem plumbing without changing public API. Runs serially between A10 and A11.
+
+**Goal:** Promote spec §10.10's informal "end-to-end smoke under `tc netem` loss/delay" to a named Layer H test phase: formal netem matrix with liveness + invariant assertions, not performance measurement. A10 measures *how fast* the stack runs under adversity; A10.5 asserts *that the stack stays correct* under the same adversity.
+
+**Spec refs:** §10.8 (Layer H — Stage 1 subset only; PMTU-blackholing deferred to Stage 2), §10.10 (formalizes the Stage 1 netem ship-gate smoke).
+
+**Deliverables:**
+- `tools/layer-h-correctness/` — netem matrix runner producing pass/fail per scenario, not p50/p99/p999. Reuses A10's `bench-stress` netem scaffolding (driver, precondition checker, scenario harness) as a library; only the assertion layer is new.
+- Netem matrix (Stage 1 subset of §10.8):
+  - Delay: +20 ms, +50 ms, +200 ms (each with and without jitter)
+  - Loss: 0.1%, 1%, 5% random; 1% correlated bursts
+  - Duplication: 0.5%, 2%
+  - Reordering: depth 3
+  - Corruption: 0.01% (checksum-fail drops are expected behaviour; asserted via `rx_drop_cksum_bad` signal)
+- Composable with A9's `FaultInjector` env-var side channel so RX-side and WAN-side adversity can be stacked for the most demanding scenarios.
+- Assertion table (per scenario):
+  - Connection stays in ESTABLISHED for the configured duration — no unexpected transition to CLOSED or ERROR
+  - `tcp.tx_retrans` bounded by per-conn `max_retrans_count` knob; no unbounded retransmit storms
+  - FSM state ∈ legal set per §6.1 throughout the run (sampled via `dpdk_net_conn_stats`)
+  - `obs.events_dropped == 0` at steady load
+  - Per-scenario expected counter-signals table (e.g. 1% loss → nonzero `tcp.tx_retrans`; correlated-burst loss → nonzero `tcp.tx_rack_loss`; reorder-3 → nonzero `rx_dup_ack` without crossing 3-dup-ACK fast-retransmit unless the active preset permits it)
+- CI: Layer-H smoke (one representative bucket per netem dimension) per merge; full matrix per stage cut, report to `docs/superpowers/reports/layer-h-<date>.md`.
+- End-of-phase mTCP + RFC review gates (same pattern as every A3-onward phase).
+
+**Does NOT include:**
+- PMTU-blackholing scenario (drop ICMP frag-needed) — requires PLPMTUD (RFC 8899), Stage 2 (§10.8 explicit).
+- Performance / latency metrics under netem — owned by A10's `bench-stress`. Any perf regressions surfaced here are filed back as A10 follow-ups, not fixed in A10.5.
+- Layer G WAN A/B vs Linux — Stage 2 (S2-A), needs HW tap + real exchange testnet + tap-jitter calibration.
+- New counters or events — Layer H asserts against the existing observability surface. If a scenario reveals a gap, it's filed for a later phase, not smuggled into A10.5.
+- Fuzzing or proptest coverage — A9 territory.
+
+**Dependencies:** A10 (netem harness + `bench-stress` scaffolding), A9 (FaultInjector for composed RX + WAN adversity). Blocks A11.
+
+**Rough scale:** ~6–8 tasks (netem matrix runner reusing A10 scaffolding, assertion-table framework, ~5 scenario implementations plus composed RX+WAN cases, CI smoke + per-stage-cut wiring, end-of-phase review reports).
+
+---
+
 ## A11 — Stage 1 ship gate verification
 
 **Goal:** Run every Stage 1 gate from spec §10.10 and §11.9. Publish the results as the Stage 1 ship artifact.
@@ -648,12 +689,12 @@ Group 3 — audit artifacts:
 **Spec refs:** §10.10, §11.9.
 
 **Deliverables:**
-- Documented pass matrix: Layer A unit tests (100%), Layer B packetdrill runnable subset (100%), Layer C tcpreq MUST rules (100%), observability smoke, e2e smoke against chosen test peer (§13 nice-to-have resolved), §11 microbench targets met, §11.3 e2e p999 within documented bound of HW RTT, §11.4 stress matrix all green.
+- Documented pass matrix: Layer A unit tests (100%), Layer B packetdrill runnable subset (100%), Layer C tcpreq MUST rules (100%), Layer H netem correctness matrix (100% of Stage 1 scenarios from A10.5), observability smoke, e2e smoke against chosen test peer (§13 nice-to-have resolved), §11 microbench targets met, §11.3 e2e p999 within documented bound of HW RTT, §11.4 stress matrix all green.
 - `docs/superpowers/reports/stage1-ship-report.md` — signed off with commit SHAs and host/NIC/DPDK versions.
 
 **Does NOT include:** the `stage-1-ship` git tag — that moves to A12 after documentation lands.
 
-**Dependencies:** A1–A10 all complete.
+**Dependencies:** A1–A10.5 all complete.
 
 **Rough scale:** ~5 tasks (mostly verification + reporting).
 

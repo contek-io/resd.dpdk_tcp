@@ -1,0 +1,38 @@
+# Knob-coverage informational whitelist.
+#
+# A11 (the full cross-phase knob-coverage audit) enumerates every
+# behavioral field on `dpdk_net_engine_config_t` / `dpdk_net_connect_opts_t`
+# and requires a test scenario per field. Some "knobs" are purely
+# informational (build-system flags, sizing values with no branching
+# logic, identity fields) and do not admit a behavioral test of the
+# shape "non-default value changes observable wire behavior" — they are
+# listed here with a short justification so A11's coverage checker
+# doesn't flag them as orphaned.
+#
+# Format: one entry per line, `<name>  # <reason>`.
+
+test-server  # A7: cargo build-system flag, no runtime behavioral effect; covered by tests/corpus_ligurio.rs and tests/shim_*.
+
+# --- A8 T17 (M3): EngineConfig informational fields ------------------------
+# Identity / sizing / timing values that feed DPDK queue setup or wire
+# identity directly; no behavioral branching in the stack.
+lcore_id                   # DPDK lcore identity; fed to mempool naming + thread affinity, no branching.
+port_id                    # DPDK port identity; opaque NIC handle.
+rx_queue_id                # DPDK RX queue index; pure identity for rte_eth_rx_queue_setup.
+tx_queue_id                # DPDK TX queue index; pure identity for rte_eth_tx_queue_setup.
+rx_ring_size               # DPDK RX descriptor ring depth; sizing only, no runtime branch.
+tx_ring_size               # DPDK TX descriptor ring depth; sizing only.
+mbuf_data_room             # Per-mbuf data-area size; sizing fed to mempool creation.
+local_ip                   # Primary local IPv4 identity; no branching beyond select_source_ip (covered).
+secondary_local_ips        # Secondary IP list; validation via engine::select_source_ip unit tests.
+gateway_ip                 # L3 gateway identity; ARP-resolution input, not a branching knob.
+gateway_mac                # Pinned gateway MAC; alternative to ARP resolution, pure identity.
+garp_interval_sec          # GARP cadence; timing-only, no behavioral branch.
+max_connections            # Slot table capacity; sizing only.
+recv_buffer_bytes          # Per-conn receive buffer sizing; feeds window calc + mempool formula.
+send_buffer_bytes          # Per-conn send buffer sizing; pure sizing.
+tcp_mss                    # Advertised MSS; wire identity / sizing, no branching on the value.
+tcp_msl_ms                 # 2*MSL TIME_WAIT timing; timing-only parameter.
+
+# --- A8 T17 (M3): ConnectOpts informational fields -------------------------
+local_addr                 # Per-connection source IP; validation via engine::select_source_ip unit tests (covered by non-knob-coverage tests).

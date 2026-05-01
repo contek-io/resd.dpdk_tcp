@@ -117,6 +117,20 @@ impl ReorderQueue {
         &self.segments
     }
 
+    /// A8 T7: release all queued segments' mbuf refcounts and empty the
+    /// queue without going through Drop. Used by the test-server teardown
+    /// helper (`Engine::test_clear_pinned_rx_mbufs`) so a conn holding
+    /// OOO-pinned mbuf refs at teardown doesn't UAF its mempool (Drop
+    /// order: `Engine._rx_mempool` frees before `Engine.flow_table` runs
+    /// conn drops). No-op when empty.
+    pub fn clear(&mut self) {
+        for seg in &self.segments {
+            Self::drop_segment_mbuf_ref(seg);
+        }
+        self.segments.clear();
+        self.total_bytes = 0;
+    }
+
     /// A6.5 Task 4b: insert a range of payload bytes as `OooSegment`
     /// entries, referencing the supplied mbuf with offset/length.
     /// Caller MUST have bumped the mbuf refcount by 1 before calling;

@@ -2,12 +2,21 @@
 //! MSS (RFC 6691), Window Scale + Timestamps (RFC 7323),
 //! SACK-permitted + SACK blocks (RFC 2018).
 //!
-//! Encoder (this file's first half) emits options in a fixed canonical
-//! order with explicit NOP padding for 4-byte word alignment. Decoder
-//! (Task 4) parses bytes back into the same `TcpOpts` representation.
-//! Malformed input (runaway len, wrong-length known options) is rejected
-//! at parse time and bumps `tcp.rx_bad_option`; see `parse_options`'s
-//! return type `Result<TcpOpts, OptionParseError>`.
+//! Encoder emits `<MSS, NOP+WScale, SACKP, TS, NOPs+SACK blocks>` to
+//! match the shivansh + ligurio packetdrill corpus SYN-ACK wire shape
+//! byte-for-byte. Per `AD-A8.5-tx-wscale-position` (spec §6.4), this
+//! places WSCALE second (right after MSS) rather than last. Modern
+//! Linux `net/ipv4/tcp_output.c::tcp_options_write`, Google packetdrill
+//! upstream, and mTCP all emit WSCALE LAST in `<MSS, SACKP, TS, NOP+WSCALE>`
+//! order — we deliberately chose the corpus-compatible order because
+//! shivansh + ligurio are our Layer-B unlock path. RFC 9293 §3.2 is
+//! receiver-order-agnostic, so both orderings are RFC-compliant. NOPs
+//! are embedded where needed to land each group on a 4-byte word
+//! boundary. Decoder (Task 4) parses bytes back into the same `TcpOpts`
+//! representation and remains order-agnostic. Malformed input (runaway
+//! len, wrong-length known options) is rejected at parse time and bumps
+//! `tcp.rx_bad_option`; see `parse_options`'s return type
+//! `Result<TcpOpts, OptionParseError>`.
 
 // TCP option kinds per IANA.
 pub const OPT_END: u8 = 0;
@@ -91,37 +100,51 @@ impl TcpOpts {
         true
     }
 
-    /// Byte length of the encoded option sequence, rounded up to the
-    /// next 4-byte word via NOP padding.
+    /// Byte length of the encoded option sequence, matching the Linux
+    /// canonical emission order in `encode` below. Each "group" lands on
+    /// a 4-byte word boundary without extra trailing NOP padding.
     pub fn encoded_len(&self) -> usize {
         let mut n = 0usize;
         if self.mss.is_some() {
-            n += LEN_MSS as usize;
-        }
-        if self.sack_permitted {
-            n += LEN_SACK_PERMITTED as usize;
-        }
-        if self.timestamps.is_some() {
-            n += LEN_TIMESTAMP as usize;
+            n += LEN_MSS as usize; // 4
         }
         if self.wscale.is_some() {
-            n += LEN_WSCALE as usize;
+            // NOP + WScale(3) = 4 bytes.
+            n += 1 + LEN_WSCALE as usize;
+        }
+        match (self.sack_permitted, self.timestamps.is_some()) {
+            (true, true) => {
+                // SACKP(2) + TS(10) = 12 bytes, aligned.
+                n += LEN_SACK_PERMITTED as usize + LEN_TIMESTAMP as usize;
+            }
+            (true, false) => {
+                // NOP + NOP + SACKP(2) = 4 bytes.
+                n += 2 + LEN_SACK_PERMITTED as usize;
+            }
+            (false, true) => {
+                // NOP + NOP + TS(10) = 12 bytes.
+                n += 2 + LEN_TIMESTAMP as usize;
+            }
+            (false, false) => {}
         }
         if self.sack_block_count > 0 {
-            n += 2 + 8 * (self.sack_block_count as usize);
+            // NOP + NOP + SACK hdr(2) + N*8. Always 4-byte aligned for N>=1.
+            n += 2 + 2 + 8 * (self.sack_block_count as usize);
         }
-        // Word-align.
-        let rem = n % 4;
-        if rem != 0 {
-            n += 4 - rem;
-        }
+        // By construction every group above lands on a 4-byte boundary.
+        debug_assert!(n % 4 == 0, "encoded_len must be 4-byte word aligned: {n}");
         n
     }
 
-    /// Write the options to `out[..N]` in canonical order
-    /// (MSS, SACK-permitted, Timestamps, WS, SACK-blocks), padding with
-    /// NOPs (kind=1) to reach a 4-byte word boundary. Returns the number
-    /// of bytes written, or `None` if `out` is too short.
+    /// Write the options to `out[..N]` in Linux canonical emission order:
+    ///     MSS [NOP WScale] [SACKP | NOPs+SACKP | NOPs+TS | SACKP+TS]
+    ///         [NOPs + SACK-blocks]
+    /// Linux's kernel default encoding (per
+    /// `net/ipv4/tcp_output.c::tcp_options_write`) is what packetdrill
+    /// hand-crafted `tcp.opt(...)` assertions expect; RFC 9293 §3.2 is
+    /// otherwise order-agnostic, so this is corpus-compatibility
+    /// alignment, not a semantic change. Returns the number of bytes
+    /// written, or `None` if `out` is too short.
     pub fn encode(&self, out: &mut [u8]) -> Option<usize> {
         let need = self.encoded_len();
         if out.len() < need {
@@ -129,47 +152,79 @@ impl TcpOpts {
         }
 
         let mut i = 0usize;
+        // 1. MSS first (4 bytes, aligned).
         if let Some(mss) = self.mss {
             out[i] = OPT_MSS;
             out[i + 1] = LEN_MSS;
             out[i + 2..i + 4].copy_from_slice(&mss.to_be_bytes());
             i += LEN_MSS as usize;
         }
-        if self.sack_permitted {
-            out[i] = OPT_SACK_PERMITTED;
-            out[i + 1] = LEN_SACK_PERMITTED;
-            i += LEN_SACK_PERMITTED as usize;
-        }
-        if let Some((tsval, tsecr)) = self.timestamps {
-            out[i] = OPT_TIMESTAMP;
-            out[i + 1] = LEN_TIMESTAMP;
-            out[i + 2..i + 6].copy_from_slice(&tsval.to_be_bytes());
-            out[i + 6..i + 10].copy_from_slice(&tsecr.to_be_bytes());
-            i += LEN_TIMESTAMP as usize;
-        }
+        // 2. NOP + WScale (4 bytes, aligned). NOP prefix is Linux's
+        //    convention for packing the 3-byte WScale into a 4-byte word.
         if let Some(ws) = self.wscale {
-            out[i] = OPT_WSCALE;
-            out[i + 1] = LEN_WSCALE;
-            out[i + 2] = ws;
-            i += LEN_WSCALE as usize;
+            out[i] = OPT_NOP;
+            out[i + 1] = OPT_WSCALE;
+            out[i + 2] = LEN_WSCALE;
+            out[i + 3] = ws;
+            i += 1 + LEN_WSCALE as usize;
         }
+        // 3. SACK-permitted + Timestamps block. Linux packs these together
+        //    differently depending on presence to keep 4-byte alignment:
+        //      - both:  SACKP(2) + TS(10)                 = 12 bytes
+        //      - SACKP-only: NOP + NOP + SACKP(2)          = 4 bytes
+        //      - TS-only:    NOP + NOP + TS(10)            = 12 bytes
+        //    Order inside the block matches Linux's
+        //    `tcp_options_write` so packetdrill scripts see the expected
+        //    `<... sackOK, TS val X ecr Y>` sequence.
+        match (self.sack_permitted, self.timestamps) {
+            (true, Some((tsval, tsecr))) => {
+                out[i] = OPT_SACK_PERMITTED;
+                out[i + 1] = LEN_SACK_PERMITTED;
+                i += LEN_SACK_PERMITTED as usize;
+                out[i] = OPT_TIMESTAMP;
+                out[i + 1] = LEN_TIMESTAMP;
+                out[i + 2..i + 6].copy_from_slice(&tsval.to_be_bytes());
+                out[i + 6..i + 10].copy_from_slice(&tsecr.to_be_bytes());
+                i += LEN_TIMESTAMP as usize;
+            }
+            (true, None) => {
+                out[i] = OPT_NOP;
+                out[i + 1] = OPT_NOP;
+                out[i + 2] = OPT_SACK_PERMITTED;
+                out[i + 3] = LEN_SACK_PERMITTED;
+                i += 2 + LEN_SACK_PERMITTED as usize;
+            }
+            (false, Some((tsval, tsecr))) => {
+                out[i] = OPT_NOP;
+                out[i + 1] = OPT_NOP;
+                i += 2;
+                out[i] = OPT_TIMESTAMP;
+                out[i + 1] = LEN_TIMESTAMP;
+                out[i + 2..i + 6].copy_from_slice(&tsval.to_be_bytes());
+                out[i + 6..i + 10].copy_from_slice(&tsecr.to_be_bytes());
+                i += LEN_TIMESTAMP as usize;
+            }
+            (false, None) => {}
+        }
+        // 4. SACK blocks (DSACK / selective-ACK, variable length). Linux
+        //    emits with a leading 2-NOP prefix so the option header lands
+        //    on a 4-byte boundary; blocks are always 8-byte multiples so
+        //    the total group is 4 + 8*N — always aligned.
         if self.sack_block_count > 0 {
             let n = self.sack_block_count as usize;
-            out[i] = OPT_SACK;
-            out[i + 1] = (2 + 8 * n) as u8;
-            i += 2;
+            out[i] = OPT_NOP;
+            out[i + 1] = OPT_NOP;
+            out[i + 2] = OPT_SACK;
+            out[i + 3] = (2 + 8 * n) as u8;
+            i += 4;
             for block in &self.sack_blocks[..n] {
                 out[i..i + 4].copy_from_slice(&block.left.to_be_bytes());
                 out[i + 4..i + 8].copy_from_slice(&block.right.to_be_bytes());
                 i += 8;
             }
         }
-        // NOP-pad to the next word boundary.
-        while i < need {
-            out[i] = OPT_NOP;
-            i += 1;
-        }
-        Some(need)
+        debug_assert_eq!(i, need, "emitted byte count must match encoded_len");
+        Some(i)
     }
 }
 
@@ -316,21 +371,19 @@ mod tests {
         opts.wscale = Some(7);
         let mut buf = [0u8; 40];
         let n = opts.encode(&mut buf).unwrap();
-        // 4 MSS + 2 SACK-perm + 10 TS + 3 WS = 19, padded to 20.
+        // Linux canonical: MSS(4) + NOP+WS(4) + SACKP(2) + TS(10) = 20 bytes.
         assert_eq!(n, 20);
-        // MSS
+        // MSS.
         assert_eq!(&buf[..4], &[OPT_MSS, LEN_MSS, 0x05, 0xb4]);
-        // SACK-permitted
-        assert_eq!(&buf[4..6], &[OPT_SACK_PERMITTED, LEN_SACK_PERMITTED]);
-        // Timestamps
-        assert_eq!(buf[6], OPT_TIMESTAMP);
-        assert_eq!(buf[7], LEN_TIMESTAMP);
-        assert_eq!(&buf[8..12], &0xdeadbeefu32.to_be_bytes());
-        assert_eq!(&buf[12..16], &0u32.to_be_bytes());
-        // Window Scale
-        assert_eq!(&buf[16..19], &[OPT_WSCALE, LEN_WSCALE, 7]);
-        // NOP pad
-        assert_eq!(buf[19], OPT_NOP);
+        // NOP + Window Scale.
+        assert_eq!(&buf[4..8], &[OPT_NOP, OPT_WSCALE, LEN_WSCALE, 7]);
+        // SACK-permitted.
+        assert_eq!(&buf[8..10], &[OPT_SACK_PERMITTED, LEN_SACK_PERMITTED]);
+        // Timestamps.
+        assert_eq!(buf[10], OPT_TIMESTAMP);
+        assert_eq!(buf[11], LEN_TIMESTAMP);
+        assert_eq!(&buf[12..16], &0xdeadbeefu32.to_be_bytes());
+        assert_eq!(&buf[16..20], &0u32.to_be_bytes());
     }
 
     #[test]
@@ -347,14 +400,23 @@ mod tests {
         });
         let mut buf = [0u8; 40];
         let n = opts.encode(&mut buf).unwrap();
-        // 10 TS + 2 SACK-hdr + 16 SACK-blocks = 28, already word-aligned.
-        assert_eq!(n, 28);
-        assert_eq!(buf[10], OPT_SACK);
-        assert_eq!(buf[11], 2 + 16); // len = hdr + 2×(8)
-        assert_eq!(&buf[12..16], &1000u32.to_be_bytes());
-        assert_eq!(&buf[16..20], &2000u32.to_be_bytes());
-        assert_eq!(&buf[20..24], &3000u32.to_be_bytes());
-        assert_eq!(&buf[24..28], &4000u32.to_be_bytes());
+        // Linux canonical layout for ACK with TS + 2 SACK blocks:
+        //   NOP+NOP+TS(12) + NOP+NOP+SACK hdr+16 = 12 + 4 + 16 = 32 bytes.
+        assert_eq!(n, 32);
+        // TS block: 2 leading NOPs, then TS kind/len/tsval/tsecr.
+        assert_eq!(&buf[0..2], &[OPT_NOP, OPT_NOP]);
+        assert_eq!(buf[2], OPT_TIMESTAMP);
+        assert_eq!(buf[3], LEN_TIMESTAMP);
+        assert_eq!(&buf[4..8], &100u32.to_be_bytes());
+        assert_eq!(&buf[8..12], &200u32.to_be_bytes());
+        // SACK block: 2 leading NOPs, then SACK kind/len + N*(left,right).
+        assert_eq!(&buf[12..14], &[OPT_NOP, OPT_NOP]);
+        assert_eq!(buf[14], OPT_SACK);
+        assert_eq!(buf[15], 2 + 16); // len = hdr + 2×(8)
+        assert_eq!(&buf[16..20], &1000u32.to_be_bytes());
+        assert_eq!(&buf[20..24], &2000u32.to_be_bytes());
+        assert_eq!(&buf[24..28], &3000u32.to_be_bytes());
+        assert_eq!(&buf[28..32], &4000u32.to_be_bytes());
     }
 
     #[test]

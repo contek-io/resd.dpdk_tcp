@@ -96,8 +96,11 @@ pub fn read(counters: &Counters, name: &str) -> Option<u64> {
         "tcp.tx_tlp_spurious" => Some(counters.tcp.tx_tlp_spurious.load(Ordering::Relaxed)),
         "tcp.rx_dup_ack" => Some(counters.tcp.rx_dup_ack.load(Ordering::Relaxed)),
         "tcp.rx_dsack" => Some(counters.tcp.rx_dsack.load(Ordering::Relaxed)),
-        "tcp.rx_out_of_order" => Some(counters.tcp.rx_out_of_order.load(Ordering::Relaxed)),
-        "tcp.rx_reassembly_queued" => {
+        // `tcp.rx_out_of_order` was renamed to `tcp.rx_reassembly_queued`
+        // in a8 work — old name kept here as a fallback that resolves
+        // to the same counter, so scenarios that referenced the legacy
+        // name keep working without scenario-matrix churn.
+        "tcp.rx_out_of_order" | "tcp.rx_reassembly_queued" => {
             Some(counters.tcp.rx_reassembly_queued.load(Ordering::Relaxed))
         }
         "tcp.tx_rack_loss" => Some(counters.tcp.tx_rack_loss.load(Ordering::Relaxed)),

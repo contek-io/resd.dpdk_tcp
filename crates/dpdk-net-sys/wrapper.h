@@ -60,6 +60,13 @@ uint16_t shim_rte_mbuf_refcnt_read(struct rte_mbuf *m);
  * MbufHandle. */
 void shim_rte_pktmbuf_free_seg(struct rte_mbuf *m);
 uint16_t shim_rte_pktmbuf_nb_segs(const struct rte_mbuf *m);
+/* A7 Task 4 fixup: total chain length accessor for multi-seg TX intercept.
+ * Returns m->pkt_len (sum of data_len across the chain, as maintained by
+ * rte_pktmbuf_chain + the DPDK RX path). Used by the test-server TX
+ * intercept to pre-size the `Vec<u8>` that concatenates every segment's
+ * bytes into one intercepted frame. Opaque rte_mbuf prevents direct
+ * field access from Rust, hence the shim. */
+uint32_t shim_rte_pktmbuf_pkt_len(const struct rte_mbuf *m);
 /* A6.6 Task 5: next-segment accessor for multi-seg RX ingest chain walk.
  * Returns m->next or NULL if `m` is the last/only segment. */
 struct rte_mbuf *shim_rte_pktmbuf_next(struct rte_mbuf *m);

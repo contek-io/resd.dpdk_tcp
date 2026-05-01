@@ -24,6 +24,9 @@ fault-injector = ["dpdk-net-core/fault-injector"]
 # observability emission sites (G1-G4) for zero-observability baseline
 # measurements. Additive; default builds are unchanged.
 obs-none = ["dpdk-net-core/obs-none"]
+# A7: enables the test-only FFI surface (src/test_ffi.rs) and pass-through
+# to dpdk-net-core's test-server feature.
+test-server = ["dpdk-net-core/test-server"]
 
 [dependencies]
 dpdk-net-core = { path = "../dpdk-net-core" }

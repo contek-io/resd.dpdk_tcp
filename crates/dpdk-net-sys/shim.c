@@ -135,6 +135,16 @@ uint16_t shim_rte_pktmbuf_nb_segs(const struct rte_mbuf *m) {
     return m->nb_segs;
 }
 
+/* A7 Task 4 fixup: total chain length field accessor for the test-server
+ * multi-seg TX intercept. Mirrors the nb_segs shim — the packed anonymous
+ * unions in struct rte_mbuf are opaque to bindgen, so the Rust side reads
+ * pkt_len through this extern. Only the data-segment TX intercept site
+ * (drain_tx_pending_data under cfg(feature="test-server")) calls this;
+ * the three control-frame sites assert nb_segs==1 via the existing shim. */
+uint32_t shim_rte_pktmbuf_pkt_len(const struct rte_mbuf *m) {
+    return m->pkt_len;
+}
+
 /* A6.6 Task 5: next-segment accessor for RX ingest chain walk. Returns
  * the next rte_mbuf in a scattered-packet chain, or NULL when `m` is
  * the last (or only) segment. ENA does not advertise RX_OFFLOAD_SCATTER

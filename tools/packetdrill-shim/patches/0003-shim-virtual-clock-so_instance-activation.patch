@@ -1,0 +1,156 @@
+From 74842fc90cff0e62de86a4e06665d1e96a526327 Mon Sep 17 00:00:00 2001
+From: A7 Shim <a7-shim@local>
+Date: Tue, 21 Apr 2026 16:27:39 +0000
+Subject: [PATCH 3/5] shim: virtual clock + so_instance activation
+
+Routes now_usecs/wait_for_event/schedule_start_time_usecs through the
+shim's virtual clock when the shim is active, so scripted time is
+deterministic under the dpdk-net engine. Skips SCHED_RR and mlockall
+(both need privileges the runner won't have).
+
+Critically: populates state->so_instance for the no-so_filename path
+so every syscall in run_system_call.c dispatches through the shim's
+ifc vtable. Without this, only packet I/O was redirected -- syscalls
+would still hit the real kernel. The dlclose in so_instance_free is
+guarded by instance->handle being NULL, so there's no dl-level
+interaction on teardown.
+
+main() in packetdrill.c calls dpdk_net_shim_global_init() once before
+the script loop to bring the engine up. The call is idempotent and
+wires atexit so the engine shuts down cleanly on process exit.
+---
+ gtests/net/packetdrill/packetdrill.c | 14 +++++++++
+ gtests/net/packetdrill/run.c         | 43 ++++++++++++++++++++++++++++
+ 2 files changed, 57 insertions(+)
+
+diff --git a/gtests/net/packetdrill/packetdrill.c b/gtests/net/packetdrill/packetdrill.c
+index aefde2d..900d21e 100644
+--- a/gtests/net/packetdrill/packetdrill.c
++++ b/gtests/net/packetdrill/packetdrill.c
+@@ -31,6 +31,7 @@
+ #include <unistd.h>
+ #include "assert.h"
+ #include "config.h"
++#include "dpdk_net_shim.h"
+ #include "parse.h"
+ #include "run.h"
+ #include "script.h"
+@@ -81,6 +82,19 @@ int main(int argc, char *argv[])
+ 	char **arg = parse_command_line_options(argc, argv, &config);
+ 	set_pid_env();
+ 
++	/* A7 shim: always bring up the DPDK-net engine in test-server mode.
++	 * This must happen before run_script() so netdev.c / run_system_call.c
++	 * can observe dpdk_net_shim_is_active() == 1 and redirect their
++	 * syscalls / frame I/O into the engine. The init is idempotent and
++	 * registers its own atexit handler for teardown. */
++	if (!config.is_wire_server && !config.dry_run) {
++		if (dpdk_net_shim_global_init() != 0) {
++			fprintf(stderr,
++				"error: dpdk_net_shim_global_init failed\n");
++			exit(EXIT_FAILURE);
++		}
++	}
++
+ 	/* If we're running as a server, just listen for connections forever. */
+ 	if (config.is_wire_server) {
+ 		if (*arg != NULL) {
+diff --git a/gtests/net/packetdrill/run.c b/gtests/net/packetdrill/run.c
+index e87956a..6c86d04 100644
+--- a/gtests/net/packetdrill/run.c
++++ b/gtests/net/packetdrill/run.c
+@@ -35,6 +35,7 @@
+ #include <sys/socket.h>
+ #include <sys/times.h>
+ #include <unistd.h>
++#include "dpdk_net_shim.h"
+ #include "ip.h"
+ #include "logging.h"
+ #include "netdev.h"
+@@ -153,6 +154,17 @@ void state_free(struct state *state)
+ s64 now_usecs(struct state *state)
+ {
+ 	struct timeval tv;
++	/* A7 shim: route through the virtual clock exposed by the shim.
++	 * Takes precedence over so_instance.ifc so the shim owns time
++	 * ordering even for plain SYSCALL events. */
++	if (dpdk_net_shim_is_active()) {
++		/* Reuse the shim's ifc.gettimeofday implementation via a
++		 * one-shot local struct. Keeps the state public-API narrow. */
++		extern int dpdk_net_shim_gettimeofday_helper(struct timeval *);
++		if (dpdk_net_shim_gettimeofday_helper(&tv) < 0)
++			die_perror("dpdk_net_shim_gettimeofday");
++		return timeval_to_usecs(&tv);
++	}
+ 	if (state->so_instance) {
+ 		if (state->so_instance->ifc.gettimeofday(
+ 			state->so_instance->ifc.userdata, &tv, NULL) < 0)
+@@ -354,6 +366,15 @@ void wait_for_event(struct state *state)
+ 		if (wait_usecs <= 0)
+ 			break;
+ 
++		/* A7 shim: virtual time never elapses on its own; just
++		 * advance g_virt_ns via usleep() and continue. This is
++		 * deterministic by construction. */
++		if (dpdk_net_shim_is_active()) {
++			extern int dpdk_net_shim_advance_usecs(long long);
++			dpdk_net_shim_advance_usecs(wait_usecs);
++			continue;
++		}
++
+ 		/* If we're waiting a long time, and we are on an OS
+ 		 * that we know has a fine-grained usleep(), then
+ 		 * usleep() instead of spinning on the CPU.
+@@ -452,6 +473,9 @@ static void run_local_packet_event(struct state *state, struct event *event,
+  */
+ void set_scheduling_priority(void)
+ {
++	/* A7 shim: SCHED_RR requires privileges; skip under the shim. */
++	if (dpdk_net_shim_is_active())
++		return;
+ 	/* Get the CPU count and skip this if we only have 1 CPU. */
+ 	int num_cpus = sysconf(_SC_NPROCESSORS_ONLN);
+ 	if (num_cpus < 0)
+@@ -486,6 +510,10 @@ void set_scheduling_priority(void)
+  */
+ void lock_memory(void)
+ {
++	/* A7 shim: mlockall requires CAP_IPC_LOCK; skip under the shim
++	 * so we don't fail in unprivileged test runners. */
++	if (dpdk_net_shim_is_active())
++		return;
+ 	if (mlockall(MCL_CURRENT | MCL_FUTURE))
+ 		die_perror("lockall(MCL_CURRENT | MCL_FUTURE)");
+ }
+@@ -511,6 +539,10 @@ void lock_memory(void)
+  */
+ static s64 schedule_start_time_usecs(struct state *state)
+ {
++	/* A7 shim: virtual clock starts at 0; no jiffy-tick calibration
++	 * is meaningful under a synthetic time source. */
++	if (dpdk_net_shim_is_active())
++		return now_usecs(state);
+ #ifdef linux
+ 	s64 start_usecs = 0;
+ 	clock_t last_jiffies = times(NULL);
+@@ -590,6 +622,17 @@ void run_script(struct config *config, struct script *script)
+ 	if (config->so_filename) {
+ 		state->so_instance = so_instance_new();
+ 		so_instance_init(state->so_instance, config, script, state);
++	} else if (dpdk_net_shim_is_active()) {
++		/* A7 shim: populate state->so_instance so every syscall
++		 * dispatch in run_system_call.c routes through the shim
++		 * ifc (which delegates to dpdk_net_test_*). No dlopen
++		 * happens; instance->handle stays NULL and
++		 * so_instance_free's dlclose is guarded. The netdev stays
++		 * the local flavor, which already short-circuits
++		 * send/receive to the shim's inject/drain helpers. */
++		state->so_instance = so_instance_new();
++		dpdk_net_shim_fill_interface(&state->so_instance->ifc);
++		dpdk_net_shim_reset_per_script();
+ 	}
+ 
+ 	init_cmd_exed = false;
+-- 
+2.34.1
+

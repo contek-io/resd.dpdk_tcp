@@ -16,7 +16,9 @@ members = [
     "tools/bench-stress",
     "tools/bench-vs-linux",
     "tools/bench-vs-mtcp",
+    "tools/packetdrill-shim-runner",
     "tools/scapy-fuzz-runner",
+    "tools/tcpreq-runner",
 ]
 # fuzz/ is a sibling sub-Cargo-project pinned to nightly; kept out of the
 # stable main workspace. See crates/dpdk-net-core/fuzz/rust-toolchain.toml.

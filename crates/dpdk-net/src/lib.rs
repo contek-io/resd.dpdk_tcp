@@ -5,6 +5,9 @@ pub mod api;
 #[cfg(feature = "test-panic-entry")]
 pub mod test_only;
 
+#[cfg(feature = "test-server")]
+pub mod test_ffi;
+
 use api::*;
 use dpdk_net_core::clock;
 use dpdk_net_core::counters::Counters;
@@ -57,6 +60,54 @@ unsafe fn engine_from_raw<'a>(p: *mut dpdk_net_engine) -> Option<&'a Engine> {
         return None;
     }
     Some(&(&*(p as *const OpaqueEngine)).0)
+}
+
+/// A7 Task 8: `&mut Engine` accessor for the test-FFI helpers (which
+/// need to hand through `engine.inject_rx_frame`, `engine.listen`,
+/// `engine.accept_next`, etc.). Lives under `test-server` only; the
+/// production build keeps the immutable `engine_from_raw` as the sole
+/// accessor.
+#[cfg(feature = "test-server")]
+unsafe fn engine_from_raw_mut<'a>(p: *mut dpdk_net_engine) -> Option<&'a mut Engine> {
+    if p.is_null() {
+        return None;
+    }
+    Some(&mut (&mut *(p as *mut OpaqueEngine)).0)
+}
+
+/// A7 Task 8: run the engine's per-conn TX flush + timer wheel advance
+/// in a loop until neither makes progress. Every test-FFI entry except
+/// `set_time_ns` and `accept_next` invokes this before returning so
+/// packetdrill script steps observe a quiescent stack at each boundary.
+///
+/// The 10 000-iteration cap guards against a pathological loop where
+/// the TX-intercept queue never drains (would require a bug in the
+/// test rig). At production-realistic tick rates we expect ≤ a handful
+/// of iterations per call.
+#[cfg(feature = "test-server")]
+fn pump_until_quiescent(eng: &mut Engine) {
+    const MAX: u32 = 10_000;
+    let mut i: u32 = 0;
+    loop {
+        let tx_progress = eng.pump_tx_drain();
+        let fired = eng.pump_timers(clock::now_ns());
+        if !tx_progress && fired == 0 {
+            return;
+        }
+        i += 1;
+        assert!(i < MAX, "pump_until_quiescent exceeded {MAX} iterations");
+    }
+}
+
+/// A7 Task 8: raw-pointer-shaped wrapper around `pump_until_quiescent`,
+/// used by the test-FFI shims that already have a `*mut dpdk_net_engine`
+/// (e.g. the wrappers that re-enter `dpdk_net_connect`/`_send`/`_close`
+/// which take the pointer, not the `&mut Engine`).
+#[cfg(feature = "test-server")]
+unsafe fn pump_until_quiescent_raw(p: *mut dpdk_net_engine) {
+    if let Some(eng) = engine_from_raw_mut(p) {
+        pump_until_quiescent(eng);
+    }
 }
 
 /// Initialize DPDK EAL. Must be called before dpdk_net_engine_create.
@@ -992,6 +1043,39 @@ pub unsafe extern "C" fn dpdk_net_close(
         Ok(()) => 0,
         Err(dpdk_net_core::Error::InvalidConnHandle(_)) => -libc::ENOTCONN,
         Err(_) => -libc::EIO,
+    }
+}
+
+/// A8.5 T7 (spec §4 + §6.4 `AD-A8.5-shutdown-no-half-close`): POSIX
+/// `shutdown(2)` subset — full-close only.
+///
+/// `how` values:
+/// * `DPDK_NET_SHUT_RDWR` (2) — full close; dispatches to
+///   `dpdk_net_close(engine, conn, 0)` and returns its result. Use the
+///   `dpdk_net_close` path directly when callers need
+///   `DPDK_NET_CLOSE_FORCE_TW_SKIP` (`dpdk_net_shutdown` always passes
+///   `flags=0`).
+/// * `DPDK_NET_SHUT_RD` (0) and `DPDK_NET_SHUT_WR` (1) — return
+///   `-EOPNOTSUPP` without touching the connection. Half-close is not
+///   implemented: the RX-side deliver-after-SHUT_RD semantics and the
+///   TX-side retransmit-after-half-closed-write timing carry TCB edge
+///   cases that Stage 1's byte-stream REST/WS client workload never
+///   needs. See spec §6.4 row `AD-A8.5-shutdown-no-half-close` for the
+///   full promotion gate (HTTP/1.1 pipelining in Stage 3 and WebSocket
+///   close-frame handling in Stage 5 reopen this row).
+/// * Any other `how` — return `-EINVAL`.
+///
+/// Returns 0 on successful close initiation, or a negative errno.
+#[no_mangle]
+pub unsafe extern "C" fn dpdk_net_shutdown(
+    p: *mut dpdk_net_engine,
+    conn: dpdk_net_conn_t,
+    how: i32,
+) -> i32 {
+    match how {
+        DPDK_NET_SHUT_RDWR => dpdk_net_close(p, conn, 0),
+        DPDK_NET_SHUT_RD | DPDK_NET_SHUT_WR => -libc::EOPNOTSUPP,
+        _ => -libc::EINVAL,
     }
 }
 

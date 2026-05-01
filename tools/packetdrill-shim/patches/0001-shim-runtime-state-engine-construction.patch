@@ -1,0 +1,742 @@
+From e42eae18c27ad56ab440fc2dd7698f6a127178da Mon Sep 17 00:00:00 2001
+From: A7 Shim <a7-shim@local>
+Date: Tue, 21 Apr 2026 16:27:18 +0000
+Subject: [PATCH 1/5] shim: runtime + state + engine construction
+
+Introduces the in-process shim that backs packetdrill's syscall /
+netdev layer with the dpdk-net engine's test-only FFI
+(dpdk_net_test_*). Creates a single engine instance at main() via
+dpdk_net_shim_global_init() and tears it down via atexit.
+
+The shim allocates synthetic fds above SHIM_FD_BASE=1000 so they don't
+collide with real file descriptors, and maintains an fd-table mapping
+each fd to a listen_handle / conn_handle on the engine side. All
+syscall vtable entries dispatch through dpdk_net_test_* and advance
+the shim's virtual clock (g_virt_ns) so packetdrill's scheduler sees
+deterministic time.
+
+No wire-up yet -- this commit just drops the file in place. Activation
+happens in the later patches via local_netdev_new, run_script, and
+main().
+---
+ gtests/net/packetdrill/dpdk_net_shim.c | 626 +++++++++++++++++++++++++
+ gtests/net/packetdrill/dpdk_net_shim.h |  74 +++
+ 2 files changed, 700 insertions(+)
+ create mode 100644 gtests/net/packetdrill/dpdk_net_shim.c
+ create mode 100644 gtests/net/packetdrill/dpdk_net_shim.h
+
+diff --git a/gtests/net/packetdrill/dpdk_net_shim.c b/gtests/net/packetdrill/dpdk_net_shim.c
+new file mode 100644
+index 0000000..fdaa7eb
+--- /dev/null
++++ b/gtests/net/packetdrill/dpdk_net_shim.c
+@@ -0,0 +1,626 @@
++/*
++ * A7 task 10: in-process shim backing the packetdrill_interface with
++ * the resd/dpdk-net engine's test-only FFI. See dpdk_net_shim.h for
++ * the activation contract.
++ *
++ * Design notes:
++ * - A single engine instance (g_engine) backs every script run. The
++ *   engine holds all TCP state; our fd-table is a thin (script_fd →
++ *   dpdk_net_conn_t / listen_handle) map rooted in g_fdtab.
++ * - Time is virtual: g_virt_ns advances monotonically driven by
++ *   packetdrill's own event scheduler via shim_gettimeofday(). This
++ *   mirrors the contract in include/dpdk_net_test.h.
++ * - The TX frame queue is polled from the engine on demand whenever
++ *   packetdrill reads a frame; packetdrill reads via
++ *   ifc.netdev_receive which returns a single frame at a time.
++ */
++
++#include "dpdk_net_shim.h"
++
++#include <errno.h>
++#include <fcntl.h>
++#include <poll.h>
++#include <stdarg.h>
++#include <stdint.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <sys/socket.h>
++#include <sys/time.h>
++#include <sys/types.h>
++#include <sys/uio.h>
++#include <unistd.h>
++
++#include "dpdk_net.h"
++#include "dpdk_net_test.h"
++#include "logging.h"
++
++/* ----- engine state ---------------------------------------------------- */
++
++static struct dpdk_net_engine *g_engine = NULL;
++static int g_active = 0;
++
++/* Virtual clock in ns. packetdrill's wait_for_event() uses usleep()
++ * against real time; under the shim we short-circuit that via
++ * shim_usleep() which simply advances g_virt_ns so the scheduler
++ * believes time has elapsed. */
++static uint64_t g_virt_ns = 0;
++
++/* Synthetic starting fd. Above the typical real-fd range so we don't
++ * collide with stdin/stdout/stderr or any accidental real open(). */
++#define SHIM_FD_BASE 1000
++#define SHIM_FD_MAX  4095
++static int g_next_fd = SHIM_FD_BASE;
++
++enum shim_fd_kind {
++    SHIM_FD_FREE = 0,
++    SHIM_FD_SOCKET,    /* pre-listen/connect socket */
++    SHIM_FD_LISTEN,    /* post-listen, has listen_handle */
++    SHIM_FD_CONN,      /* connected (active or accepted), has conn_handle */
++};
++
++struct shim_fd {
++    enum shim_fd_kind kind;
++    int domain;
++    int type;
++    int protocol;
++    uint16_t local_port;     /* for LISTEN */
++    uint32_t listen_handle;  /* for LISTEN */
++    uint64_t conn_handle;    /* for CONN */
++};
++
++static struct shim_fd g_fdtab[SHIM_FD_MAX - SHIM_FD_BASE + 1];
++
++static struct shim_fd *fd_slot(int fd) {
++    if (fd < SHIM_FD_BASE || fd > SHIM_FD_MAX) return NULL;
++    return &g_fdtab[fd - SHIM_FD_BASE];
++}
++
++static int shim_alloc_fd(void) {
++    if (g_next_fd > SHIM_FD_MAX) return -EMFILE;
++    int fd = g_next_fd++;
++    memset(&g_fdtab[fd - SHIM_FD_BASE], 0, sizeof(g_fdtab[0]));
++    return fd;
++}
++
++/* ----- one-time engine init ------------------------------------------- */
++
++int dpdk_net_shim_is_active(void) { return g_active; }
++
++static int build_eal_argv(int *argc_out, const char ***argv_out) {
++    /* Defaults matching tests/common/mod.rs::test_eal_args(). */
++    static const char *argv[] = {
++        "dpdk-net-packetdrill-shim",
++        "--in-memory",
++        "--no-pci",
++        "-l", "0-1",
++        "--log-level=3",
++        NULL,
++    };
++    *argc_out = 6;
++    *argv_out = argv;
++    return 0;
++}
++
++int dpdk_net_shim_global_init(void) {
++    if (g_active) return 0;
++
++    int argc;
++    const char **argv;
++    if (build_eal_argv(&argc, &argv) != 0) return -EINVAL;
++
++    int rc = dpdk_net_eal_init(argc, argv);
++    if (rc != 0) {
++        fprintf(stderr, "dpdk_net_shim: eal_init failed rc=%d\n", rc);
++        return rc;
++    }
++
++    /* EngineConfig defaults mirror tests/common/mod.rs::test_server_config().
++     * Critical fields:
++     *   port_id = u16::MAX -> test-server bypass path (T5)
++     *   local_ip  = 10.99.2.2 (host order)
++     *   gateway_ip = 10.99.2.1 (host order)
++     *   max_connections = 8, tcp_mss = 1460, tcp_msl_ms = 100
++     * All other fields stay zero so the Rust defaults apply.
++     */
++    struct dpdk_net_engine_config_t cfg;
++    memset(&cfg, 0, sizeof(cfg));
++    cfg.port_id = 0xFFFFu;  /* sentinel for test-server bypass */
++    cfg.local_ip = 0x0a630202u;   /* 10.99.2.2 host order */
++    cfg.gateway_ip = 0x0a630201u; /* 10.99.2.1 host order */
++    cfg.gateway_mac[0] = 0x02;
++    cfg.gateway_mac[5] = 0x02;
++    cfg.max_connections = 8;
++    cfg.tcp_mss = 1460;
++    cfg.tcp_msl_ms = 100;
++    cfg.event_queue_soft_cap = 4096;  /* matches EngineConfig::default() */
++    /* Engine::new fills zero-sentinel fields with defaults. */
++
++    g_engine = dpdk_net_engine_create(0, &cfg);
++    if (!g_engine) {
++        fprintf(stderr, "dpdk_net_shim: engine_create failed\n");
++        return -ENOMEM;
++    }
++
++    dpdk_net_test_set_time_ns(g_virt_ns);
++    g_active = 1;
++    atexit(dpdk_net_shim_global_fini);
++    return 0;
++}
++
++void dpdk_net_shim_global_fini(void) {
++    if (!g_active) return;
++    dpdk_net_engine_destroy(g_engine);
++    g_engine = NULL;
++    g_active = 0;
++}
++
++/* ----- ifc vtable delegates ------------------------------------------- */
++
++static int shim_socket(void *ud, int domain, int type, int protocol) {
++    (void)ud;
++    int fd = shim_alloc_fd();
++    if (fd < 0) { errno = -fd; return -1; }
++    struct shim_fd *s = fd_slot(fd);
++    s->kind = SHIM_FD_SOCKET;
++    s->domain = domain;
++    s->type = type;
++    s->protocol = protocol;
++    return fd;
++}
++
++static int shim_bind(void *ud, int sockfd, const struct sockaddr *addr,
++                     socklen_t addrlen) {
++    (void)ud; (void)addrlen;
++    struct shim_fd *s = fd_slot(sockfd);
++    if (!s || s->kind != SHIM_FD_SOCKET) { errno = EBADF; return -1; }
++    /* Extract port; engine ignores bound-IP selection in test-server
++     * mode (always uses the configured local_ip). */
++    if (addr && addr->sa_family == AF_INET) {
++        const struct sockaddr_in *sin = (const struct sockaddr_in *)addr;
++        s->local_port = ntohs(sin->sin_port);
++    }
++    return 0;
++}
++
++static int shim_listen(void *ud, int sockfd, int backlog) {
++    (void)ud; (void)backlog;
++    struct shim_fd *s = fd_slot(sockfd);
++    if (!s || s->kind != SHIM_FD_SOCKET) { errno = EBADF; return -1; }
++    uint32_t lh = dpdk_net_test_listen(g_engine, s->local_port);
++    if (lh == 0) { errno = EADDRINUSE; return -1; }
++    s->kind = SHIM_FD_LISTEN;
++    s->listen_handle = lh;
++    return 0;
++}
++
++/* Bounded spin-pump: accept_next doesn't pump, so we inject-pump-accept
++ * loops are coordinated by the scheduler. We give the engine
++ * MAX_ACCEPT_PUMP slices of "no-op time advance" to drain a queued
++ * handshake before EAGAIN. */
++#define MAX_ACCEPT_PUMP 8
++
++static int shim_accept(void *ud, int sockfd, struct sockaddr *addr,
++                       socklen_t *addrlen) {
++    (void)ud;
++    struct shim_fd *s = fd_slot(sockfd);
++    if (!s || s->kind != SHIM_FD_LISTEN) { errno = EBADF; return -1; }
++    uint64_t ch = UINT64_MAX;
++    for (int i = 0; i < MAX_ACCEPT_PUMP; ++i) {
++        ch = dpdk_net_test_accept_next(g_engine, s->listen_handle);
++        if (ch != UINT64_MAX) break;
++        /* Not queued yet; advance virtual time 1us and try again. */
++        g_virt_ns += 1000;
++        dpdk_net_test_set_time_ns(g_virt_ns);
++    }
++    if (ch == UINT64_MAX) { errno = EAGAIN; return -1; }
++
++    int fd = shim_alloc_fd();
++    if (fd < 0) { errno = -fd; return -1; }
++    struct shim_fd *c = fd_slot(fd);
++    c->kind = SHIM_FD_CONN;
++    c->conn_handle = ch;
++
++    /* Fill caller's sockaddr with the gateway (peer) IP. Engine doesn't
++     * expose per-conn peer addr at this API level; scripts that care
++     * can inspect socket.live.remote in the regular packetdrill path.
++     * We lie minimally: addr=0, port=0. Scripts typically ignore it. */
++    if (addr && addrlen && *addrlen >= (socklen_t)sizeof(struct sockaddr_in)) {
++        struct sockaddr_in sin;
++        memset(&sin, 0, sizeof(sin));
++        sin.sin_family = AF_INET;
++        memcpy(addr, &sin, sizeof(sin));
++        *addrlen = sizeof(sin);
++    }
++    return fd;
++}
++
++static int shim_connect(void *ud, int sockfd, const struct sockaddr *addr,
++                        socklen_t addrlen) {
++    (void)ud; (void)addrlen;
++    struct shim_fd *s = fd_slot(sockfd);
++    if (!s || s->kind != SHIM_FD_SOCKET) { errno = EBADF; return -1; }
++    if (!addr || addr->sa_family != AF_INET) { errno = EAFNOSUPPORT; return -1; }
++    const struct sockaddr_in *sin = (const struct sockaddr_in *)addr;
++    uint32_t dst_ip_host = ntohl(sin->sin_addr.s_addr);
++    uint16_t dst_port = ntohs(sin->sin_port);
++
++    struct dpdk_net_connect_opts_t opts;
++    memset(&opts, 0, sizeof(opts));
++    /* dpdk_net_test_connect fills peer_addr/peer_port internally. */
++
++    uint64_t ch = dpdk_net_test_connect(g_engine, dst_ip_host, dst_port, &opts);
++    if (ch == UINT64_MAX) { errno = EINVAL; return -1; }
++    s->kind = SHIM_FD_CONN;
++    s->conn_handle = ch;
++    return 0;
++}
++
++static ssize_t shim_read(void *ud, int fd, void *buf, size_t count) {
++    (void)ud;
++    struct shim_fd *s = fd_slot(fd);
++    if (!s || s->kind != SHIM_FD_CONN) { errno = EBADF; return -1; }
++    intptr_t n = dpdk_net_test_recv(g_engine, s->conn_handle,
++                                    (uint8_t *)buf, count);
++    if (n < 0) { errno = -(int)n; return -1; }
++    if (n == 0) { errno = EAGAIN; return -1; }
++    return (ssize_t)n;
++}
++
++static ssize_t shim_readv(void *ud, int fd, const struct iovec *iov,
++                          int iovcnt) {
++    (void)ud;
++    struct shim_fd *s = fd_slot(fd);
++    if (!s || s->kind != SHIM_FD_CONN) { errno = EBADF; return -1; }
++    /* Coalesce into a temporary, then split. Scripts rarely use readv
++     * in a way that requires zero-copy semantics. */
++    size_t total = 0;
++    for (int i = 0; i < iovcnt; ++i) total += iov[i].iov_len;
++    if (total == 0) return 0;
++    uint8_t *tmp = (uint8_t *)malloc(total);
++    if (!tmp) { errno = ENOMEM; return -1; }
++    intptr_t n = dpdk_net_test_recv(g_engine, s->conn_handle, tmp, total);
++    if (n < 0) { free(tmp); errno = -(int)n; return -1; }
++    if (n == 0) { free(tmp); errno = EAGAIN; return -1; }
++    size_t rem = (size_t)n;
++    size_t off = 0;
++    for (int i = 0; i < iovcnt && rem > 0; ++i) {
++        size_t take = rem < iov[i].iov_len ? rem : iov[i].iov_len;
++        memcpy(iov[i].iov_base, tmp + off, take);
++        off += take; rem -= take;
++    }
++    free(tmp);
++    return (ssize_t)n;
++}
++
++static ssize_t shim_write(void *ud, int fd, const void *buf, size_t count) {
++    (void)ud;
++    struct shim_fd *s = fd_slot(fd);
++    if (!s || s->kind != SHIM_FD_CONN) { errno = EBADF; return -1; }
++    intptr_t n = dpdk_net_test_send(g_engine, s->conn_handle,
++                                    (const uint8_t *)buf, count);
++    if (n < 0) { errno = -(int)n; return -1; }
++    return (ssize_t)n;
++}
++
++static ssize_t shim_writev(void *ud, int fd, const struct iovec *iov,
++                           int iovcnt) {
++    (void)ud;
++    struct shim_fd *s = fd_slot(fd);
++    if (!s || s->kind != SHIM_FD_CONN) { errno = EBADF; return -1; }
++    size_t total = 0;
++    for (int i = 0; i < iovcnt; ++i) total += iov[i].iov_len;
++    if (total == 0) return 0;
++    uint8_t *tmp = (uint8_t *)malloc(total);
++    if (!tmp) { errno = ENOMEM; return -1; }
++    size_t off = 0;
++    for (int i = 0; i < iovcnt; ++i) {
++        memcpy(tmp + off, iov[i].iov_base, iov[i].iov_len);
++        off += iov[i].iov_len;
++    }
++    intptr_t n = dpdk_net_test_send(g_engine, s->conn_handle, tmp, total);
++    free(tmp);
++    if (n < 0) { errno = -(int)n; return -1; }
++    return (ssize_t)n;
++}
++
++static ssize_t shim_recv(void *ud, int fd, void *buf, size_t len, int flags) {
++    (void)flags;
++    return shim_read(ud, fd, buf, len);
++}
++
++static ssize_t shim_recvfrom(void *ud, int fd, void *buf, size_t len,
++                             int flags, struct sockaddr *src_addr,
++                             socklen_t *addrlen) {
++    (void)src_addr; (void)addrlen;
++    return shim_recv(ud, fd, buf, len, flags);
++}
++
++static ssize_t shim_recvmsg(void *ud, int fd, struct msghdr *msg, int flags) {
++    (void)flags;
++    if (!msg || msg->msg_iovlen == 0) { errno = EINVAL; return -1; }
++    return shim_readv(ud, fd, msg->msg_iov, msg->msg_iovlen);
++}
++
++static ssize_t shim_send(void *ud, int fd, const void *buf, size_t len,
++                         int flags) {
++    (void)flags;
++    return shim_write(ud, fd, buf, len);
++}
++
++static ssize_t shim_sendto(void *ud, int fd, const void *buf, size_t len,
++                           int flags, const struct sockaddr *dst,
++                           socklen_t dlen) {
++    (void)dst; (void)dlen;
++    return shim_send(ud, fd, buf, len, flags);
++}
++
++static ssize_t shim_sendmsg(void *ud, int fd, const struct msghdr *msg,
++                            int flags) {
++    (void)flags;
++    if (!msg || msg->msg_iovlen == 0) { errno = EINVAL; return -1; }
++    return shim_writev(ud, fd, msg->msg_iov, msg->msg_iovlen);
++}
++
++static int shim_fcntl(void *ud, int fd, int cmd, ...) {
++    (void)ud; (void)fd;
++    /* Scripts commonly use F_SETFL O_NONBLOCK; accept silently. */
++    if (cmd == F_GETFL) return O_RDWR | O_NONBLOCK;
++    if (cmd == F_SETFL) return 0;
++    errno = EINVAL;
++    return -1;
++}
++
++static int shim_ioctl(void *ud, int fd, unsigned long request, ...) {
++    (void)ud; (void)fd; (void)request;
++    errno = ENOTTY;
++    return -1;
++}
++
++static int shim_close(void *ud, int fd) {
++    (void)ud;
++    struct shim_fd *s = fd_slot(fd);
++    if (!s || s->kind == SHIM_FD_FREE) { errno = EBADF; return -1; }
++    if (s->kind == SHIM_FD_CONN) {
++        dpdk_net_test_close(g_engine, s->conn_handle, 0);
++    }
++    s->kind = SHIM_FD_FREE;
++    return 0;
++}
++
++static int shim_shutdown(void *ud, int fd, int how) {
++    (void)how;
++    return shim_close(ud, fd);
++}
++
++static int shim_getsockopt(void *ud, int fd, int level, int optname,
++                           void *optval, socklen_t *optlen) {
++    (void)ud; (void)fd; (void)level; (void)optname;
++    if (optval && optlen) {
++        /* Zero-fill; scripts that care can be marked unsupported later. */
++        memset(optval, 0, *optlen);
++    }
++    return 0;
++}
++
++static int shim_setsockopt(void *ud, int fd, int level, int optname,
++                           const void *optval, socklen_t optlen) {
++    (void)ud; (void)fd; (void)optval; (void)optlen;
++    /* Whitelist what we accept silently; everything else returns
++     * EOPNOTSUPP so the script fails loudly. */
++    if (level == IPPROTO_TCP) {
++        /* TCP_NODELAY, TCP_CORK — accepted (stack has default). */
++        return 0;
++    }
++    if (level == SOL_SOCKET) {
++        /* SO_RCVTIMEO, SO_SNDTIMEO, SO_REUSEADDR, SO_REUSEPORT,
++         * SO_RCVBUF, SO_SNDBUF — accepted silently. */
++        return 0;
++    }
++    errno = EOPNOTSUPP;
++    return -1;
++}
++
++static int shim_poll(void *ud, struct pollfd *fds, nfds_t nfds,
++                     int timeout) {
++    (void)ud; (void)timeout;
++    int n_ready = 0;
++    for (nfds_t i = 0; i < nfds; ++i) {
++        fds[i].revents = 0;
++        struct shim_fd *s = fd_slot(fds[i].fd);
++        if (!s || s->kind == SHIM_FD_FREE) continue;
++        /* Conservative: always signal writable; signal readable only
++         * after a best-effort peek. */
++        if (fds[i].events & POLLOUT) fds[i].revents |= POLLOUT;
++        if ((fds[i].events & POLLIN) && s->kind == SHIM_FD_CONN) {
++            /* We can't peek without consuming in this FFI; report
++             * readable so packetdrill will try to read. */
++            fds[i].revents |= POLLIN;
++        }
++        if (fds[i].revents) n_ready++;
++    }
++    return n_ready;
++}
++
++/* TX-frame queue: drain from engine into this local ring so sequential
++ * netdev_receive calls can pop one-at-a-time without re-draining. */
++#define TXQ_CAP 256
++static struct {
++    uint8_t *buf;
++    size_t   len;
++} g_txq[TXQ_CAP];
++static int g_txq_head = 0;
++static int g_txq_tail = 0;
++
++static void shim_pull_tx_from_engine(void) {
++    struct dpdk_net_test_frame_t frames[TXQ_CAP];
++    size_t n = dpdk_net_test_drain_tx_frames(g_engine, frames, TXQ_CAP);
++    for (size_t i = 0; i < n; ++i) {
++        if (((g_txq_tail + 1) % TXQ_CAP) == g_txq_head) break;  /* full */
++        /* Copy: buf pointers become invalid on next drain. */
++        uint8_t *copy = (uint8_t *)malloc(frames[i].len);
++        if (!copy) break;
++        memcpy(copy, frames[i].buf, frames[i].len);
++        g_txq[g_txq_tail].buf = copy;
++        g_txq[g_txq_tail].len = frames[i].len;
++        g_txq_tail = (g_txq_tail + 1) % TXQ_CAP;
++    }
++}
++
++static int shim_netdev_send(void *ud, const void *buf, size_t count) {
++    (void)ud;
++    return dpdk_net_shim_inject_packet(buf, count);
++}
++
++static int shim_netdev_receive(void *ud, void *buf, size_t *count,
++                               long long *time_usecs) {
++    (void)ud;
++    return dpdk_net_shim_drain_next(buf, count, time_usecs);
++}
++
++int dpdk_net_shim_inject_packet(const void *ip_bytes, size_t count) {
++    if (!g_active || !g_engine) return -1;
++    if (count > 65535) return -1;
++    uint8_t l2_buf[14 + 65535];
++    memcpy(l2_buf, "\x02\x00\x00\x00\x00\x01"   /* dst: engine local MAC (our_mac) */
++                   "\x02\x00\x00\x00\x00\x02"   /* src: gateway MAC (peer) */
++                   "\x08\x00",                  /* EtherType IPv4 */
++           14);
++    memcpy(l2_buf + 14, ip_bytes, count);
++    int rc = dpdk_net_test_inject_frame(g_engine, l2_buf, 14 + count);
++    return rc == 0 ? 0 : -1;
++}
++
++int dpdk_net_shim_drain_next(void *out, size_t *count,
++                             long long *time_usecs_out) {
++    if (!g_active || !g_engine) {
++        if (count) *count = 0;
++        return -1;
++    }
++    if (g_txq_head == g_txq_tail) shim_pull_tx_from_engine();
++    if (g_txq_head == g_txq_tail) {
++        *count = 0;
++        return -1;
++    }
++    /* Strip L2 so packetdrill's parser (PACKET_LAYER_3_IP) gets
++     * IP-and-above. Engine-emitted frames start with a 14-byte L2. */
++    uint8_t *src = g_txq[g_txq_head].buf;
++    size_t src_len = g_txq[g_txq_head].len;
++    size_t skip = (src_len > 14) ? 14 : 0;
++    size_t copy_len = src_len - skip;
++    if (copy_len > *count) copy_len = *count;
++    memcpy(out, src + skip, copy_len);
++    *count = copy_len;
++    if (time_usecs_out) *time_usecs_out = (long long)(g_virt_ns / 1000);
++    free(g_txq[g_txq_head].buf);
++    g_txq[g_txq_head].buf = NULL;
++    g_txq_head = (g_txq_head + 1) % TXQ_CAP;
++    return 0;
++}
++
++static int shim_usleep(void *ud, useconds_t usec) {
++    (void)ud;
++    /* Advance virtual clock; run engine timers via a zero-length
++     * time-set on the FFI boundary (next FFI call pumps). */
++    g_virt_ns += (uint64_t)usec * 1000;
++    dpdk_net_test_set_time_ns(g_virt_ns);
++    return 0;
++}
++
++static int shim_gettimeofday(void *ud, struct timeval *tv,
++                             struct timezone *tz) {
++    (void)ud; (void)tz;
++    if (!tv) { errno = EFAULT; return -1; }
++    tv->tv_sec = g_virt_ns / 1000000000ULL;
++    tv->tv_usec = (g_virt_ns / 1000) % 1000000ULL;
++    return 0;
++}
++
++/* epoll / pipe / splice: scripts using these are out of scope for
++ * phase A7; return EOPNOTSUPP loudly. */
++static int shim_epoll_create(void *ud, int size) {
++    (void)ud; (void)size;
++    errno = EOPNOTSUPP; return -1;
++}
++static int shim_epoll_ctl(void *ud, int epfd, int op, int fd,
++                          struct epoll_event *event) {
++    (void)ud; (void)epfd; (void)op; (void)fd; (void)event;
++    errno = EOPNOTSUPP; return -1;
++}
++static int shim_epoll_wait(void *ud, int epfd, struct epoll_event *events,
++                           int maxevents, int timeout) {
++    (void)ud; (void)epfd; (void)events; (void)maxevents; (void)timeout;
++    errno = EOPNOTSUPP; return -1;
++}
++static int shim_pipe(void *ud, int pipefd[2]) {
++    (void)ud; (void)pipefd;
++    errno = EOPNOTSUPP; return -1;
++}
++static int shim_splice(void *ud, int fd_in, loff_t *off_in, int fd_out,
++                       loff_t *off_out, size_t len, unsigned int flags) {
++    (void)ud; (void)fd_in; (void)off_in; (void)fd_out;
++    (void)off_out; (void)len; (void)flags;
++    errno = EOPNOTSUPP; return -1;
++}
++
++static void shim_free(void *ud) { (void)ud; }
++
++void dpdk_net_shim_fill_interface(struct packetdrill_interface *ifc) {
++    memset(ifc, 0, sizeof(*ifc));
++    ifc->userdata       = NULL;
++    ifc->free           = shim_free;
++    ifc->socket         = shim_socket;
++    ifc->bind           = shim_bind;
++    ifc->listen         = shim_listen;
++    ifc->accept         = shim_accept;
++    ifc->connect        = shim_connect;
++    ifc->read           = shim_read;
++    ifc->readv          = shim_readv;
++    ifc->recv           = shim_recv;
++    ifc->recvfrom       = shim_recvfrom;
++    ifc->recvmsg        = shim_recvmsg;
++    ifc->write          = shim_write;
++    ifc->writev         = shim_writev;
++    ifc->send           = shim_send;
++    ifc->sendto         = shim_sendto;
++    ifc->sendmsg        = shim_sendmsg;
++    ifc->fcntl          = shim_fcntl;
++    ifc->ioctl          = shim_ioctl;
++    ifc->close          = shim_close;
++    ifc->shutdown       = shim_shutdown;
++    ifc->getsockopt     = shim_getsockopt;
++    ifc->setsockopt     = shim_setsockopt;
++    ifc->poll           = shim_poll;
++    ifc->netdev_send    = shim_netdev_send;
++    ifc->netdev_receive = shim_netdev_receive;
++    ifc->usleep         = shim_usleep;
++    ifc->gettimeofday   = shim_gettimeofday;
++    ifc->epoll_create   = shim_epoll_create;
++    ifc->epoll_ctl      = shim_epoll_ctl;
++    ifc->epoll_wait     = shim_epoll_wait;
++    ifc->pipe           = shim_pipe;
++    ifc->splice         = shim_splice;
++}
++
++void dpdk_net_shim_reset_per_script(void) {
++    while (g_txq_head != g_txq_tail) {
++        free(g_txq[g_txq_head].buf);
++        g_txq[g_txq_head].buf = NULL;
++        g_txq_head = (g_txq_head + 1) % TXQ_CAP;
++    }
++    g_virt_ns = 0;
++    g_next_fd = SHIM_FD_BASE;
++    memset(g_fdtab, 0, sizeof(g_fdtab));
++    if (g_active) dpdk_net_test_set_time_ns(0);
++}
++
++int dpdk_net_shim_gettimeofday_helper(struct timeval *tv) {
++    return shim_gettimeofday(NULL, tv, NULL);
++}
++
++int dpdk_net_shim_advance_usecs(long long usecs) {
++    if (usecs <= 0) return 0;
++    g_virt_ns += (uint64_t)usecs * 1000;
++    if (g_active) dpdk_net_test_set_time_ns(g_virt_ns);
++    return 0;
++}
+diff --git a/gtests/net/packetdrill/dpdk_net_shim.h b/gtests/net/packetdrill/dpdk_net_shim.h
+new file mode 100644
+index 0000000..422217b
+--- /dev/null
++++ b/gtests/net/packetdrill/dpdk_net_shim.h
+@@ -0,0 +1,74 @@
++/*
++ * A7 task 10: in-process shim bridging packetdrill's syscall + netdev
++ * layer to the resd/dpdk-net engine's test-only FFI (dpdk_net_test_*).
++ *
++ * The shim does NOT open /dev/net/tun or issue real socket() calls.
++ * Instead it drives the engine in-memory via libdpdk_net.a built with
++ * the test-server feature, and exposes itself to packetdrill through
++ * the existing packetdrill_interface vtable (so_testing.c).
++ *
++ * Activation: main() calls dpdk_net_shim_global_init() once, which
++ * constructs the engine. run_script() then calls
++ * dpdk_net_shim_attach_to_state() to plant a packetdrill_interface
++ * whose function pointers delegate to dpdk_net_test_*.
++ */
++
++#ifndef __DPDK_NET_SHIM_H__
++#define __DPDK_NET_SHIM_H__
++
++#include "packetdrill.h"
++
++struct state;
++struct config;
++
++/* One-time global init: parse EAL args, create the engine. Called from
++ * main() before the script parser runs. Idempotent; the first call
++ * wins. Returns 0 on success, negative errno on failure (die()s on
++ * unrecoverable errors to mirror packetdrill's error style).
++ */
++int dpdk_net_shim_global_init(void);
++
++/* Tear down the engine at process exit. Matching atexit hook registered
++ * by dpdk_net_shim_global_init(). Safe to call twice.
++ */
++void dpdk_net_shim_global_fini(void);
++
++/* Plant a packetdrill_interface into `ifc` that delegates every syscall
++ * to the engine's test FFI. Called from run.c after so_netdev_new() so
++ * the so_testing path activates without a real .so file. The shim takes
++ * userdata = NULL (global state lives in dpdk_net_shim.c).
++ */
++void dpdk_net_shim_fill_interface(struct packetdrill_interface *ifc);
++
++/* Called by run.c::state_free to flush any queued TX frames that
++ * haven't been drained by packetdrill, so an unexpected-frame assertion
++ * at script end is fatal not silent. */
++void dpdk_net_shim_reset_per_script(void);
++
++/* True once dpdk_net_shim_global_init has succeeded; lets run.c pick
++ * the so_netdev path even when config->so_filename was not given. */
++int dpdk_net_shim_is_active(void);
++
++/* Inject a packetdrill-owned frame (IP+TCP/UDP bytes, no L2) into the
++ * engine's RX pipeline. Prepends a cosmetic 14-byte Ethernet header
++ * so the engine's RX path can advance through L2. Returns 0 on
++ * success, non-zero on error. */
++int dpdk_net_shim_inject_packet(const void *ip_bytes, size_t len);
++
++/* Drain the next TX frame the engine has emitted, stripping the L2
++ * header so the caller sees IP+TCP. Returns 0 on success (fills
++ * `*count` with the number of bytes written, `*time_usecs_out` with
++ * the virtual-clock receive timestamp). Returns non-zero and sets
++ * `*count = 0` when no frame is available. */
++int dpdk_net_shim_drain_next(void *out, size_t *count,
++                             long long *time_usecs_out);
++
++/* Fill `tv` with the current virtual clock. Returns 0 on success. */
++int dpdk_net_shim_gettimeofday_helper(struct timeval *tv);
++
++/* Advance the virtual clock by `usecs` microseconds; pumps engine
++ * timers at the new time. Used by run.c::wait_for_event under the
++ * shim so scripted time delays are deterministic. */
++int dpdk_net_shim_advance_usecs(long long usecs);
++
++#endif /* __DPDK_NET_SHIM_H__ */
+-- 
+2.34.1
+

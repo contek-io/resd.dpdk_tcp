@@ -279,16 +279,25 @@ impl FaultInjector {
         out.push(mbuf);
 
         // 3. Duplicate — emit the same mbuf twice, bumping refcount on
-        //    the second emission so downstream `rte_pktmbuf_free` calls
-        //    balance. `shim_rte_mbuf_refcnt_update(m, +1)` wraps DPDK's
-        //    `rte_mbuf_refcnt_update` (same primitive reassembly /
-        //    tcp_output use for held-by-reassembly mbufs).
+        //    EVERY segment in the chain so the two downstream
+        //    `rte_pktmbuf_free(head)` walks balance per-segment, not just
+        //    on the head. DPDK's `prefree_seg` only zeros `m->next` on
+        //    the branch where the segment is actually freed, so a
+        //    head-only bump leaves the head's `next` pointing at
+        //    already-recycled tail-segment memory; the second free then
+        //    walks into the mempool free-list (UAF read of `m->next`,
+        //    double-put on a recycled slot).
         if self.cfg.dup_rate > 0.0 && self.rng.gen::<f32>() < self.cfg.dup_rate {
-            // SAFETY: `mbuf` is still a live mbuf we own. The refcount
-            // bump is a lock-xadd on the mbuf's refcnt field; the shim
-            // dereffs the opaque struct internally.
+            // SAFETY: `mbuf` is a live owned chain; reading `m->next` is
+            // well-defined while every segment's refcount is ≥1, and the
+            // refcount bump is a lock-xadd on each segment. Walk
+            // terminates at the natural NULL tail.
             unsafe {
-                sys::shim_rte_mbuf_refcnt_update(mbuf.as_ptr(), 1);
+                let mut seg = mbuf.as_ptr();
+                while !seg.is_null() {
+                    sys::shim_rte_mbuf_refcnt_update(seg, 1);
+                    seg = sys::shim_rte_pktmbuf_next(seg);
+                }
             }
             out.push(mbuf);
             counters.dups.fetch_add(1, Ordering::Relaxed);

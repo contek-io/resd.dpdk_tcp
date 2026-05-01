@@ -35,6 +35,23 @@
  */
 #define DPDK_NET_CLOSE_FORCE_TW_SKIP (1 << 0)
 
+/**
+ * POSIX `shutdown(2)` `how` constants. Values match `<sys/socket.h>`
+ * exactly so a C caller can pass `SHUT_RD` / `SHUT_WR` / `SHUT_RDWR`
+ * from the system header without remapping. Only `DPDK_NET_SHUT_RDWR`
+ * is functionally supported — half-close returns `-EOPNOTSUPP`. See
+ * spec §4 + §6.4 row `AD-A8.5-shutdown-no-half-close` for the
+ * rationale (Stage 1 byte-stream API has no half-close consumer; the
+ * untested RX-drop-after-SHUT_RD / TX-retransmit-after-SHUT_WR edge
+ * cases are net regression risk without a scenario that exercises
+ * them).
+ */
+#define DPDK_NET_SHUT_RD 0
+
+#define DPDK_NET_SHUT_WR 1
+
+#define DPDK_NET_SHUT_RDWR 2
+
 enum dpdk_net_event_kind_t
 #ifdef __cplusplus
   : uint32_t
@@ -219,7 +236,9 @@ struct dpdk_net_event_t {
  * Cross-platform atomic-load contract: C/C++ readers MUST use the
  * helper in `dpdk_net_counters_load.h`:
  *
- *     uint64_t rx = dpdk_net_load_u64(&counters->eth.rx_pkts);
+ * ```text
+ * uint64_t rx = dpdk_net_load_u64(&counters->eth.rx_pkts);
+ * ```
  *
  * Plain dereference is only atomic on x86_64 with aligned uint64_t.
  * On ARM32 a plain read may tear; ARM64 has weaker ordering semantics
@@ -289,7 +308,6 @@ struct DPDK_NET_ALIGNED(64) dpdk_net_tcp_counters_t {
   uint64_t rx_data;
   uint64_t rx_ack;
   uint64_t rx_rst;
-  uint64_t rx_out_of_order;
   uint64_t tx_retrans;
   uint64_t tx_rto;
   uint64_t tx_tlp;
@@ -728,6 +746,30 @@ int32_t dpdk_net_send(struct dpdk_net_engine *p,
  *   -EIO  internal error (TX path or flow-table)
  */
 int32_t dpdk_net_close(struct dpdk_net_engine *p, dpdk_net_conn_t conn, uint32_t flags);
+
+/**
+ * A8.5 T7 (spec §4 + §6.4 `AD-A8.5-shutdown-no-half-close`): POSIX
+ * `shutdown(2)` subset — full-close only.
+ *
+ * `how` values:
+ * * `DPDK_NET_SHUT_RDWR` (2) — full close; dispatches to
+ *   `dpdk_net_close(engine, conn, 0)` and returns its result. Use the
+ *   `dpdk_net_close` path directly when callers need
+ *   `DPDK_NET_CLOSE_FORCE_TW_SKIP` (`dpdk_net_shutdown` always passes
+ *   `flags=0`).
+ * * `DPDK_NET_SHUT_RD` (0) and `DPDK_NET_SHUT_WR` (1) — return
+ *   `-EOPNOTSUPP` without touching the connection. Half-close is not
+ *   implemented: the RX-side deliver-after-SHUT_RD semantics and the
+ *   TX-side retransmit-after-half-closed-write timing carry TCB edge
+ *   cases that Stage 1's byte-stream REST/WS client workload never
+ *   needs. See spec §6.4 row `AD-A8.5-shutdown-no-half-close` for the
+ *   full promotion gate (HTTP/1.1 pipelining in Stage 3 and WebSocket
+ *   close-frame handling in Stage 5 reopen this row).
+ * * Any other `how` — return `-EINVAL`.
+ *
+ * Returns 0 on successful close initiation, or a negative errno.
+ */
+int32_t dpdk_net_shutdown(struct dpdk_net_engine *p, dpdk_net_conn_t conn, int32_t how);
 
 /**
  * A6 (spec §5.3): schedule a one-shot timer. `deadline_ns` is in the

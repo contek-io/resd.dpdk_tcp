@@ -8,6 +8,38 @@ use std::collections::VecDeque;
 use crate::flow_table::FourTuple;
 use crate::tcp_state::TcpState;
 
+/// A8 T17 (spec §5.2): static drift detector for the M3 knob-coverage audit.
+///
+/// Every `pub` field on `engine::ConnectOpts` (which mirrors the C ABI
+/// `dpdk_net_connect_opts_t`) listed here MUST either:
+///   - appear as a scenario entry in `tests/knob-coverage.rs` (behavioral
+///     knob: a non-default value produces an observable consequence), OR
+///   - appear in `tests/knob-coverage-informational.txt` (informational-
+///     only: identity / sizing field with no branching behavior).
+///
+/// Adding a field to `ConnectOpts` without updating one of those trips
+/// `knob_coverage_enumerates_every_behavioral_field` in CI. The runtime
+/// value of this slice is never read — the literal string list is parsed
+/// by the drift-detect test. Exposed on `tcp_conn.rs` (not `engine.rs`)
+/// per the A8 T17 plan so the connect-side knob registry lives beside
+/// the per-conn state type; `ConnectOpts` itself is in `engine.rs` for
+/// historical reasons (pre-A5.5 it was an inline argument bundle).
+pub const CONNECT_OPTS_FIELD_NAMES: &[&str] = &[
+    // A5: RACK / RTO aggressiveness knobs.
+    "rack_aggressive",
+    "rto_no_backoff",
+    // A5.5 Task 10: per-connect TLP tuning set.
+    "tlp_pto_min_floor_us",
+    "tlp_pto_srtt_multiplier_x100",
+    "tlp_skip_flight_size_gate",
+    "tlp_max_consecutive_probes",
+    "tlp_skip_rtt_sample_gate",
+    // bug_010 → feature: per-connection source IP (host byte order; 0 =
+    // engine primary). Informational — validation routes through
+    // `engine::select_source_ip`, which is covered by its own unit tests.
+    "local_addr",
+];
+
 /// Per-connection send buffer. In A3 this is a raw byte ring; A4 will
 /// gain a SACK scoreboard + in-flight tracking per spec §6.2.
 pub struct SendQueue {
@@ -244,6 +276,14 @@ pub struct TcpConn {
     pub syn_retrans_count: u8,
     /// Handle of the SYN retrans timer.
     pub syn_retrans_timer_id: Option<crate::tcp_timer_wheel::TimerId>,
+    /// A8 T11: true when this conn originated from a `LISTEN + peer SYN`
+    /// (see `new_passive`), false for the client-side active-open path
+    /// (see `new_client`). The `SynRetrans` timer-wheel fire handler
+    /// dispatches on this flag to retransmit the correct handshake
+    /// shape: plain `SYN` for active-open, `SYN|ACK` for passive-open
+    /// (RFC 9293 §3.8.1 + RFC 6298 §2). Retires AD-A7-no-syn-ack-retransmit
+    /// and mTCP AD-3 from the A7 review set.
+    pub is_passive_open: bool,
     /// Per-connect opt: when true, RACK `reo_wnd` forced to 0.
     pub rack_aggressive: bool,
     /// Per-connect opt: when true, RTO does not double on retransmit.
@@ -394,6 +434,10 @@ impl TcpConn {
             tlp_timer_id: None,
             syn_retrans_count: 0,
             syn_retrans_timer_id: None,
+            // A8 T11: active-open by default. `new_passive` overrides
+            // this to `true` so the SynRetrans fire handler retransmits
+            // `SYN|ACK` instead of plain `SYN`.
+            is_passive_open: false,
             rack_aggressive: false,
             rto_no_backoff: false,
             rack: crate::tcp_rack::RackState::new(),
@@ -431,6 +475,72 @@ impl TcpConn {
             delivered_segments: smallvec::SmallVec::new(),
             readable_scratch_iovecs: Vec::new(),
         }
+    }
+
+    /// A7 Task 5: construct a server-side connection in SYN_RCVD from a
+    /// freshly-arrived inbound SYN. Delegates to `new_client` and then
+    /// overrides only the fields that differ on the passive path:
+    ///   - state is `SynReceived` (not `Closed`),
+    ///   - `rcv_nxt = iss_peer + 1` and `irs = iss_peer` (peer's SYN consumes
+    ///     one seq),
+    ///   - peer options (MSS / WS / Timestamps / SACK-permitted) are absorbed
+    ///     from the SYN's `TcpOpts` so the later ESTABLISHED transition
+    ///     doesn't need a second parse.
+    ///
+    /// `iss` is our ISS for this flow — the caller derives it via the
+    /// engine's `IssGen::next`, matching the active path's shape. Snd_nxt
+    /// is bumped past our SYN-ACK by the caller post-TX (mirroring the
+    /// active path's post-TX `snd_nxt += 1`).
+    ///
+    /// Behind `feature = "test-server"`: there is no production code path
+    /// that builds a passive-open conn today (A6.6 is client-only).
+    #[cfg(feature = "test-server")]
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_passive(
+        tuple: FourTuple,
+        iss: u32,
+        iss_peer: u32,
+        opts: crate::tcp_options::TcpOpts,
+        our_mss: u16,
+        recv_buf_bytes: u32,
+        send_buf_bytes: u32,
+        min_rto_us: u32,
+        initial_rto_us: u32,
+        max_rto_us: u32,
+    ) -> Self {
+        let mut c = Self::new_client(
+            tuple,
+            iss,
+            our_mss,
+            recv_buf_bytes,
+            send_buf_bytes,
+            min_rto_us,
+            initial_rto_us,
+            max_rto_us,
+        );
+        // Deltas from the active-open seed:
+        c.state = TcpState::SynReceived;
+        // A8 T11: flag the conn as passive-open so the SynRetrans fire
+        // handler retransmits `SYN|ACK` on this tuple (not plain `SYN`).
+        c.is_passive_open = true;
+        c.rcv_nxt = iss_peer.wrapping_add(1);
+        c.irs = iss_peer;
+        // Absorb peer options from the SYN.
+        // RFC 9293 §3.7.1 / RFC 6691 (MUST-15): if peer SYN omits the MSS
+        // option, send-MSS MUST fall back to 536 (the IPv4 default). Mirrors
+        // the active-open path in `handle_syn_sent` (tcp_input.rs ~632) which
+        // applies the same `unwrap_or(536)` on the SYN-ACK's MSS option.
+        // Before A8 T19 the passive path left `peer_mss` at the `our_mss`
+        // seed when MSS was absent, which violated MUST-15.
+        c.peer_mss = opts.mss.unwrap_or(536);
+        c.ws_shift_in = opts.wscale.unwrap_or(0).min(14);
+        c.ts_enabled = opts.timestamps.is_some();
+        if let Some((tsval, _)) = opts.timestamps {
+            c.ts_recent = tsval;
+            c.ts_recent_age = crate::clock::now_ns();
+        }
+        c.sack_enabled = opts.sack_permitted;
+        c
     }
 
     /// A5.5 Task 10: project the per-connect TLP tuning into the
