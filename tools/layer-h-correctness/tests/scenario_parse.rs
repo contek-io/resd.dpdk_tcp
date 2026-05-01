@@ -65,3 +65,65 @@ fn composed_scenarios_partition_by_fi_spec() {
     specs.sort();
     assert_eq!(specs, vec!["drop=0.005", "dup=0.005", "reorder=0.005"]);
 }
+
+use layer_h_correctness::assertions::Relation;
+use layer_h_correctness::counters_snapshot;
+use dpdk_net_core::counters::Counters;
+
+#[test]
+fn every_counter_name_resolves_via_lookup_counter() {
+    let c = Counters::new();
+    for s in MATRIX {
+        for (name, _) in s.counter_expectations {
+            assert!(
+                counters_snapshot::read(&c, name).is_some(),
+                "scenario {} counter_expectations references {name:?} not in lookup_counter",
+                s.name
+            );
+        }
+        for (group, _) in s.disjunctive_expectations {
+            for n in *group {
+                assert!(
+                    counters_snapshot::read(&c, n).is_some(),
+                    "scenario {} disjunctive_expectations references {n:?} not in lookup_counter",
+                    s.name
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn every_relation_parses() {
+    for s in MATRIX {
+        for (counter, rel_str) in s.counter_expectations {
+            Relation::parse(rel_str).unwrap_or_else(|e| {
+                panic!(
+                    "scenario {} counter {counter:?} relation {rel_str:?} parse failed: {e}",
+                    s.name
+                )
+            });
+        }
+        for (group, rel_str) in s.disjunctive_expectations {
+            Relation::parse(rel_str).unwrap_or_else(|e| {
+                panic!(
+                    "scenario {} disjunctive group {group:?} relation {rel_str:?} parse failed: {e}",
+                    s.name
+                )
+            });
+        }
+    }
+}
+
+#[test]
+fn corruption_row_has_disjunctive_cksum_counters() {
+    let row = MATRIX
+        .iter()
+        .find(|s| s.name == "corruption_001pct")
+        .expect("corruption_001pct in MATRIX");
+    assert_eq!(row.disjunctive_expectations.len(), 1);
+    let (group, relation) = row.disjunctive_expectations[0];
+    assert_eq!(relation, ">0");
+    assert!(group.contains(&"eth.rx_drop_cksum_bad"));
+    assert!(group.contains(&"ip.rx_csum_bad"));
+}
