@@ -47,6 +47,18 @@ int shim_rte_pktmbuf_chain(struct rte_mbuf *head, struct rte_mbuf *tail);
  * fresh header mbuf in front. */
 char *shim_rte_pktmbuf_adj(struct rte_mbuf *m, uint16_t len);
 void shim_rte_mbuf_refcnt_update(struct rte_mbuf *m, int16_t v);
+/* Read mbuf refcount without modifying. Used by MbufHandle::Drop's
+ * leak-detection diagnostic — observes the post-dec count to flag
+ * mbufs that should have been freed but weren't. */
+uint16_t shim_rte_mbuf_refcnt_read(struct rte_mbuf *m);
+/* Release one refcount on a SINGLE segment. When refcount reaches 0
+ * the mbuf is returned to its mempool — `rte_mbuf_refcnt_update(m,-1)`
+ * only decrements the count and leaves a refcount=0 mbuf orphaned, so
+ * MbufHandle::Drop must use this primitive instead. Unlike
+ * `rte_pktmbuf_free`, this does NOT walk `m->next`, which is correct
+ * for our model where each chain link is wrapped in its own
+ * MbufHandle. */
+void shim_rte_pktmbuf_free_seg(struct rte_mbuf *m);
 uint16_t shim_rte_pktmbuf_nb_segs(const struct rte_mbuf *m);
 /* A7 Task 4 fixup: total chain length accessor for multi-seg TX intercept.
  * Returns m->pkt_len (sum of data_len across the chain, as maintained by

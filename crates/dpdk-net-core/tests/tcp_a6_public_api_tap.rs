@@ -568,6 +568,10 @@ fn ts_recent_recent_age_does_not_spuriously_expire() {
 // Scenario #11: event-queue FIFO contract preserved across A6's new variants.
 // -------------------------------------------------------------------------
 
+// A10 D4 (G1): `EventQueue::push` is a no-op under obs-none — nothing
+// enters the queue, so FIFO drain-order assertions are vacuous. Default
+// builds still pin the A6 variant FIFO contract.
+#[cfg(not(feature = "obs-none"))]
 #[test]
 fn event_queue_preserves_api_timer_and_writable_variants_fifo() {
     // A5.5 Tasks 5 & 8 pinned FIFO / emitted_ts_ns contracts across the
@@ -643,6 +647,10 @@ fn event_queue_preserves_api_timer_and_writable_variants_fifo() {
     assert!(q.pop().is_none());
 }
 
+// A10 D4 (G1): drop-oldest contract under interleaved A6 variants
+// presumes `push` enqueues. Skipped under obs-none where `push` is a
+// no-op.
+#[cfg(not(feature = "obs-none"))]
 #[test]
 fn event_queue_overflow_still_drops_oldest_with_a6_variants_mixed_in() {
     // Pins the A5.5 Task 3 / Task 8 drop-oldest contract under a

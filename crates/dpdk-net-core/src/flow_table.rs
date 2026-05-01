@@ -204,6 +204,19 @@ impl FlowTable {
             }
         })
     }
+
+    /// Drop every connection slot. Used during `Engine::drop` to
+    /// release all mbuf-owning state (recv segments, OOO reorder ring,
+    /// snd_retrans entries) BEFORE the engine's mempool fields drop.
+    /// Without this, the natural Rust struct-field drop order would
+    /// free the mempools' memzones first and the subsequent
+    /// `MbufHandle::Drop` refcount-update calls would touch deleted
+    /// memory and segfault inside `shim_rte_mbuf_refcnt_update`.
+    /// Confirmed by gdb backtrace from bench-ab-runner run br32yx9a7.
+    pub fn clear_all(&mut self) {
+        self.slots.iter_mut().for_each(|s| *s = None);
+        self.by_tuple.clear();
+    }
 }
 
 #[cfg(test)]

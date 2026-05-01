@@ -579,16 +579,21 @@ const struct dpdk_net_counters_t *dpdk_net_counters(struct dpdk_net_engine *p);
  * `dpdk_net_engine_create` time:
  *
  *   max(4 * rx_ring_size,
- *       2 * max_connections * ceil(recv_buffer_bytes / mbuf_data_room) + 4096)
+ *       4 * max_connections * ceil(recv_buffer_bytes / mbuf_data_room) + 4096)
  *
  * where `mbuf_data_room` is the DPDK mbuf payload slot size (2048 bytes
- * on the standard-MTU default). The `2 * max_conns * per_conn` term is
- * "two full receive buffers' worth of mbufs per connection" so the RX
+ * on the standard-MTU default). The `4 * max_conns * per_conn` term is
+ * "four full receive buffers' worth of mbufs per connection" so the RX
  * path never blocks on mempool exhaustion when all connections
  * concurrently hold a receive buffer of in-flight data; the `+ 4096`
  * cushion covers LRO chains, retransmit backlog, and SYN/ACK spikes.
  * The `4 * rx_ring_size` floor guarantees at least 4× the RX descriptor
  * count to keep `rte_eth_rx_burst` fully refilled.
+ *
+ * (Per-conn coefficient bumped from 2 to 4 in A10 deferred-fix —
+ * see `docs/superpowers/specs/2026-04-29-a10-deferred-fixes-design.md`
+ * "Defense in depth" — to extend the cliff window from ~7050 to
+ * ~14000+ iterations regardless of whether the leak audit lands.)
  *
  * Returns `UINT32_MAX` if `p` is null. Slow-path (reads a single `u32`
  * field, no locks).

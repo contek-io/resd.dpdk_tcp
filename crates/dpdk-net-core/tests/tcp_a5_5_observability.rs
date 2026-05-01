@@ -72,6 +72,11 @@ fn emitted_ts_ns_of(ev: &InternalEvent) -> u64 {
     }
 }
 
+// A10 D4 (G1): under `obs-none` `EventQueue::push` is a no-op, so
+// overflow/drop/counter semantics are not exercised. Skip this test in
+// that feature config — default builds (the ones that ship to consumers)
+// still pin the drop-oldest contract.
+#[cfg(not(feature = "obs-none"))]
 #[test]
 fn event_queue_overflow_drops_oldest_preserves_newest() {
     use dpdk_net_core::counters::Counters;
@@ -141,6 +146,11 @@ fn flow_table_get_stats_returns_none_for_invalid_handle() {
 // between push and pop. That rules out any drain-time clock re-sampling
 // in the queue itself. Together with Task 2's test, this pins the
 // emission-time contract end-to-end for the Tasks 1-3 machinery.
+// A10 D4 (G1): push is no-op under `obs-none` — emitted_ts_ns preservation
+// across the queue is irrelevant when nothing ever enters the queue. Skip
+// in that feature config; default builds still exercise the FIFO-span
+// preservation contract.
+#[cfg(not(feature = "obs-none"))]
 #[test]
 fn integration_event_queue_preserves_emitted_ts_ns_across_fifo_span() {
     use dpdk_net_core::counters::Counters;
@@ -247,6 +257,11 @@ fn integration_event_queue_preserves_emitted_ts_ns_across_fifo_span() {
 // (forensic signal: "queue saturated, many events lost"), and pins the
 // `emitted_ts_ns` ordering of the drained survivors against the
 // most-recent 64 by construction.
+// A10 D4 (G1): sustained-overflow drop-count contract depends on `push`
+// enqueueing events. Under `obs-none` every push is a no-op (zero
+// allocations, zero counter bumps) so the assertion set here is vacuous.
+// Skip in that feature config.
+#[cfg(not(feature = "obs-none"))]
 #[test]
 fn integration_queue_overflow_many_events_preserves_newest_and_counts() {
     use dpdk_net_core::counters::Counters;

@@ -1,0 +1,63 @@
+[package]
+name = "bench-vs-mtcp"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+# A10 Plan B Task 12: burst-grid comparison vs. mTCP (spec §11.1). Task 13
+# adds the `maxtp` grid (spec §11.2) on the same binary.
+#
+# Two sub-workloads per spec §11:
+#
+#   - `burst` (T12, this landing): K × G = 20 buckets.
+#     K ∈ {64 KiB, 256 KiB, 1 MiB, 4 MiB, 16 MiB}
+#     G ∈ {0 ms (back-to-back), 1 ms, 10 ms, 100 ms}
+#     One persistent connection per lcore, established once, reused for
+#     the whole run. Each burst is K bytes in MSS-sized segments.
+#
+#   - `maxtp` (T13, follow-up): W × C = 28 buckets.
+#
+# Peer: kernel-side TCP sink (receives + ACKs, no echo), same binary
+# bench-vs-linux uses at `/opt/bench-peer-linux/bench-peer`. On the mTCP
+# comparison side the peer-side driver is pre-built into the AMI at
+# `/opt/mtcp-peer/bench-peer`. Because the AMI is not yet baked, T12
+# ships the mTCP side as an `Unimplemented` stub (same MVP scope flex as
+# T8's AF_PACKET path); the dpdk_net side is fully wired.
+#
+# Measurement contract (spec §11.1):
+#   - t0 = inline TSC pre-first-send
+#   - t1 = NIC HW TX timestamp on last segment of burst; on ENA (no TX-TS
+#     dynfield) fall back to TSC-at-`rte_eth_tx_burst` return
+#   - throughput_per_burst = K / (t1 - t0)
+#   - Secondary decomposition: t_first_wire from segment 1 →
+#     initiation = t_first_wire - t0, steady = K / (t1 - t_first_wire)
+#
+# Preset: trading-latency (cc_mode=off explicit on the EngineConfig).
+#
+# See docs/superpowers/specs/2026-04-21-stage1-phase-a10-benchmark-
+# harness-design.md §11.1 + §11.2.
+
+[lib]
+name = "bench_vs_mtcp"
+path = "src/lib.rs"
+
+[[bin]]
+name = "bench-vs-mtcp"
+path = "src/main.rs"
+
+[dependencies]
+bench-common = { path = "../bench-common" }
+# T12 reuses open_connection / drain_and_accumulate_readable for the
+# dpdk_net-side burst driver's connect-once pattern. The request-response
+# RTT helpers are NOT used — burst workload is one-shot send, drain ACKs.
+bench-e2e = { path = "../bench-e2e" }
+dpdk-net-core = { path = "../../crates/dpdk-net-core" }
+dpdk-net-sys = { path = "../../crates/dpdk-net-sys" }
+clap = { version = "4", features = ["derive"] }
+anyhow = "1"
+csv = "1.3"
+serde_json = "1"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+hostname = "0.4"
+uuid = { version = "1", features = ["v4"] }
+thiserror = { workspace = true }

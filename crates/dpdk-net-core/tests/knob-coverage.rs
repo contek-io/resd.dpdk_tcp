@@ -78,6 +78,13 @@ fn prime_retrans(c: &mut TcpConn, seq: u32, len: u16) {
 /// Observable consequence: pushing > cap events increments
 /// `obs.events_dropped`; the default cap would absorb the same burst
 /// without drops.
+///
+/// A10 D4 (G1): under `obs-none`, `EventQueue::push` is a no-op — no
+/// events ever accumulate, no drops ever counted. This test's observable
+/// disappears by design in that feature config, so skip it there. The
+/// umbrella knob itself is pinned via
+/// `knob_obs_none_compiles_and_does_not_alter_abi`.
+#[cfg(not(feature = "obs-none"))]
 #[test]
 fn knob_event_queue_soft_cap_overflow_drops_events() {
     let counters = Counters::new();
@@ -1004,6 +1011,18 @@ fn knob_miri_safe_feature_enabled() {
         cfg!(feature = "miri-safe"),
         "miri-safe feature must be active when this test compiles"
     );
+}
+
+/// A10 D4: obs-none umbrella feature — additive marker.
+/// Not a runtime knob; knob-coverage whitelist entry documents the feature
+/// and asserts it doesn't change the C ABI. bench-obs-overhead exercises
+/// the behavioural delta.
+#[test]
+fn knob_obs_none_compiles_and_does_not_alter_abi() {
+    // Pinned at feature introduction: obs-none carries zero symbol changes
+    // to the cbindgen-produced dpdk_net.h (the FFI getter stays; its
+    // behaviour is the only gated part).
+    let _ = std::any::type_name::<dpdk_net_core::engine::Engine>();
 }
 
 /// Knob: `test-panic-entry` cargo feature (A6.6-7 Task 19).

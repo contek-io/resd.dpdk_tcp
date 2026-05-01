@@ -1,0 +1,36 @@
+[package]
+name = "bench-e2e"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+# Plan B Task 6: end-to-end request/response RTT micro-benchmark with
+# attribution buckets + A-HW Task 18 offload-counter assertions.
+#
+# Single-binary workload: one EAL init per process, one TCP connection
+# to a C echo-server peer, a 128 B request / 128 B response inner loop,
+# raw-sample capture + CSV emit via `bench-common::csv_row`. See the
+# spec (docs/superpowers/specs/2026-04-21-stage1-phase-a10-benchmark-
+# harness-design.md §6) for the attribution + sum-identity contract and
+# parent spec §11.3 for the attribution-bucket definitions.
+
+[lib]
+name = "bench_e2e"
+path = "src/lib.rs"
+
+[[bin]]
+name = "bench-e2e"
+path = "src/main.rs"
+
+[dependencies]
+bench-common = { path = "../bench-common" }
+dpdk-net-core = { path = "../../crates/dpdk-net-core" }
+dpdk-net-sys = { path = "../../crates/dpdk-net-sys" }
+dpdk-net = { path = "../../crates/dpdk-net" }
+clap = { version = "4", features = ["derive"] }
+anyhow = "1"
+csv = "1.3"
+serde_json = "1"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+hostname = "0.4"
+uuid = { version = "1", features = ["v4"] }

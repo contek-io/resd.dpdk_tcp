@@ -1,0 +1,48 @@
+[package]
+name = "bench-obs-overhead"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+# A10 Plan B Task 11: feature-matrix A/B driver over `obs-*` cargo flags.
+#
+# Mirrors `bench-offload-ab` (spec §9) but swaps the matrix for the five
+# observability configs in spec §10:
+#
+#   obs-none, poll-saturation-only, byte-counters-only, obs-all-no-none,
+#   default
+#
+# Every other piece of the pipeline — rebuild loop, subprocess spawn,
+# stdout drain + timeout, CSV accumulation, decision rule, Markdown
+# render — is consumed as a library dependency from `bench-offload-ab`.
+# Only the matrix and the sanity-invariant function differ.
+#
+# See docs/superpowers/specs/2026-04-21-stage1-phase-a10-benchmark-
+# harness-design.md §10.
+
+[[bin]]
+name = "bench-obs-overhead"
+path = "src/main.rs"
+
+[lib]
+name = "bench_obs_overhead"
+path = "src/lib.rs"
+
+[dependencies]
+# Reusable A/B driver surface (matrix/Config, DecisionRule, classify,
+# report types, render helpers). The obs-specific invariant lives in
+# bench-offload-ab::decision::check_observability_invariant — a
+# symmetric sibling of `check_sanity_invariant`.
+bench-offload-ab = { path = "../bench-offload-ab" }
+bench-common = { path = "../bench-common" }
+clap = { version = "4", features = ["derive"] }
+anyhow = "1"
+csv = "1.3"
+serde_json = "1"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+uuid = { version = "1", features = ["v4"] }
+# Inherited from bench-offload-ab's subprocess handling — gives us a
+# portable `Child::wait_timeout(Duration)` so a stalled bench-ab-runner
+# doesn't wedge the sweep. See bench-offload-ab/Cargo.toml for the
+# rationale.
+wait-timeout = "0.2"

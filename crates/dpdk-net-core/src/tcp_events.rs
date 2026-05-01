@@ -3,6 +3,7 @@
 //! `events_out[]` array.
 
 use std::collections::VecDeque;
+#[cfg(not(feature = "obs-none"))]
 use std::sync::atomic::Ordering;
 
 use crate::counters::Counters;
@@ -117,6 +118,10 @@ pub enum InternalEvent {
 
 pub struct EventQueue {
     q: VecDeque<InternalEvent>,
+    // A10 D4 (G1): under `obs-none`, push is a no-op so soft_cap is never
+    // read. The field is retained so the struct layout + constructor
+    // signature stay identical across feature configs.
+    #[cfg_attr(feature = "obs-none", allow(dead_code))]
     soft_cap: usize,
 }
 
@@ -148,17 +153,29 @@ impl EventQueue {
     /// Push an event. If the queue is at `soft_cap`, drop the oldest entry
     /// and increment `obs.events_dropped`. Always latches `obs.events_queue_high_water`
     /// to max observed depth.
+    ///
+    /// A10 D4 (G1): under `obs-none`, this is a no-op — the ring-buffer
+    /// write + overflow accounting + high-water latch are all skipped so
+    /// the bench-obs-overhead A/B runner can measure the zero-observability
+    /// floor. Default builds carry the full body verbatim.
     pub fn push(&mut self, ev: InternalEvent, counters: &Counters) {
-        if self.q.len() >= self.soft_cap {
-            let _ = self.q.pop_front();
-            counters.obs.events_dropped.fetch_add(1, Ordering::Relaxed);
+        #[cfg(feature = "obs-none")]
+        {
+            let _ = (ev, counters);
         }
-        self.q.push_back(ev);
-        let depth = self.q.len() as u64;
-        counters
-            .obs
-            .events_queue_high_water
-            .fetch_max(depth, Ordering::Relaxed);
+        #[cfg(not(feature = "obs-none"))]
+        {
+            if self.q.len() >= self.soft_cap {
+                let _ = self.q.pop_front();
+                counters.obs.events_dropped.fetch_add(1, Ordering::Relaxed);
+            }
+            self.q.push_back(ev);
+            let depth = self.q.len() as u64;
+            counters
+                .obs
+                .events_queue_high_water
+                .fetch_max(depth, Ordering::Relaxed);
+        }
     }
 
     pub fn pop(&mut self) -> Option<InternalEvent> {
@@ -184,6 +201,11 @@ impl Default for EventQueue {
 mod tests {
     use super::*;
 
+    // A10 D4 (G1): these two tests assert that `push` lands an event in
+    // the queue. Under `obs-none`, `push` is a no-op, so skip them in
+    // that feature config. The default build (the one that ships to
+    // consumers) still exercises the full queue semantics.
+    #[cfg(not(feature = "obs-none"))]
     #[test]
     fn fifo_ordering() {
         let counters = Counters::new();
@@ -212,6 +234,7 @@ mod tests {
         assert!(q.pop().is_none());
     }
 
+    #[cfg(not(feature = "obs-none"))]
     #[test]
     fn len_tracks_outstanding() {
         let counters = Counters::new();

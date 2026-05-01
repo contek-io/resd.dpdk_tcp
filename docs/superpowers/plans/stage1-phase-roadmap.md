@@ -28,7 +28,7 @@
 | A8 | tcpreq + observability gate | **Complete** ✓ | `2026-04-22-stage1-phase-a8-tcpreq-observability-gate.md` |
 | A8.5 | Test-coverage expansion (6 new tcpreq probes + TX option-order alignment + google env-stubs + `dpdk_net_shutdown` FFI + crash-safety corpus) | **Complete** ✓ | `2026-04-23-a8.5-test-coverage-expansion.md` |
 | A9 | Property + bespoke fuzzing + smoltcp FaultInjector | **Complete** ✓ | `phase-a9-complete` |
-| A10 | Benchmark harness (micro + e2e + stress) | Not started | — |
+| A10 | Benchmark harness (micro + e2e + stress) | **Complete** ✓[^a10notes] | `phase-a10-deferred-fixed` |
 | A10.5 | Layer H correctness under WAN-condition fault injection (netem matrix) | Not started | — |
 | A11 | Stage 1 ship gate verification | Not started | — |
 | A12 | Documentation (user + maintainer + future-work) + Stage 1 release tag | Not started | — |
@@ -36,6 +36,8 @@
 | A14 | WebSocket + TLS client integration + bench (via `contek-io/cpp_common`) | Not started | — |
 
 [^a66fused]: Shares end-of-phase tag with A6.7 per fused-execution model (spec §6 / §11 in `2026-04-20-stage1-phase-a6-6-7-fused-design.md`).
+
+[^a10notes]: First-hardware nightly artefacts at `docs/superpowers/reports/{bench-baseline,offload-ab,obs-overhead}.md` (run `bm6lmn8kp`, 2026-04-28). Headline: dpdk_net p50 35.6 µs / p99 44 µs vs linux_kernel p50 37.9 µs / p99 47.4 µs on c6a.2xlarge. Three deferred items documented in `docs/superpowers/reports/README.md`: bench-stress netem-over-DUT-SSH timeout, bench-vs-mtcp grid 0-row, and the iteration-7051 retransmit-budget cliff (workaround `BENCH_ITERATIONS=5000` in place; suspected RX-mempool-handle leak per `a10-ab-driver-debug.md` §3). Phase tag `phase-a10-complete` covers the harness + the first real-data artefact set; the deferred items follow in subsequent commits without re-tagging.
 
 ---
 

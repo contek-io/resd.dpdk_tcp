@@ -1,5 +1,7 @@
 use dpdk_net_sys as sys;
-use smallvec::{smallvec, SmallVec};
+#[cfg(not(feature = "obs-none"))]
+use smallvec::smallvec;
+use smallvec::SmallVec;
 use std::cell::{Cell, RefCell};
 use std::ffi::CString;
 use std::sync::Mutex;
@@ -242,7 +244,7 @@ pub struct EngineConfig {
     /// A6.6-7 Task 10: RX mempool capacity in mbufs. `0` = compute default
     /// at `Engine::new`:
     ///   `max(4 * rx_ring_size,
-    ///        2 * max_connections * ceil(recv_buffer_bytes / mbuf_data_room) + 4096)`
+    ///        4 * max_connections * ceil(recv_buffer_bytes / mbuf_data_room) + 4096)`
     /// The per-conn term sizes the pool so every connection can fully
     /// occupy its receive buffer in DPDK-held mbufs concurrently with
     /// an RX-ring refill, and the 4096 cushion absorbs in-flight
@@ -256,6 +258,11 @@ pub struct EngineConfig {
     ///
     /// Retrievable via the `dpdk_net_rx_mempool_size()` FFI getter after
     /// `Engine::new` / `dpdk_net_engine_create`.
+    ///
+    /// (Per-conn coefficient bumped from 2 to 4 in A10 deferred-fix —
+    /// see `docs/superpowers/specs/2026-04-29-a10-deferred-fixes-design.md`
+    /// "Defense in depth" — to extend the cliff window from ~7050 to
+    /// ~14000+ iterations regardless of whether the leak audit lands.)
     pub rx_mempool_size: u32,
 
     // Phase A2 additions (host byte order for IPs; raw bytes for MAC)
@@ -356,8 +363,15 @@ impl Default for EngineConfig {
             port_id: 0,
             rx_queue_id: 0,
             tx_queue_id: 0,
-            rx_ring_size: 1024,
-            tx_ring_size: 1024,
+            // ENA (the default NIC on c6a/c6i/c6in EC2 instance families)
+            // caps rte_eth_tx_queue_setup's nb_tx_desc at 512; passing 1024
+            // trips E_INVAL during bring-up. i40e / ice / mlx5 max ≥ 4096,
+            // so 512 is a universal floor that fits every PMD the project
+            // targets. Trading-oriented workloads run sub-MTU packets and
+            // don't fill a 1024-slot ring anyway; 512 keeps latency stable
+            // with no measurable throughput loss.
+            rx_ring_size: 512,
+            tx_ring_size: 512,
             mbuf_data_room: 2048,
             // A6.6-7 Task 10: 0 = compute formula-based default in
             // `Engine::new`. Keeping it here avoids callers of
@@ -465,6 +479,11 @@ pub struct Engine {
     /// `dpdk_net_rx_mempool_size()` FFI getter so the application can
     /// report / log the actual pool size without re-deriving the formula.
     pub(crate) rx_mempool_size: u32,
+    /// A10 Stage A: TSC of the most-recent `rx_mempool_avail` sample.
+    /// `poll_once` re-samples when the current TSC has advanced ≥
+    /// `tsc_hz` cycles past this value (≈1 second of wall clock).
+    /// `Cell<u64>` because writes happen from the single engine lcore.
+    pub(crate) rx_mempool_avail_last_sample_tsc: Cell<u64>,
     tx_hdr_mempool: Mempool,
     tx_data_mempool: Mempool,
     our_mac: [u8; 6],
@@ -955,7 +974,12 @@ impl Engine {
                 .recv_buffer_bytes
                 .saturating_add(mbuf_data_room.saturating_sub(1))
                 / mbuf_data_room.max(1);
-            let computed = 2u32
+            // A10 deferred-fix (defense in depth): 4× the per-conn term
+            // (was 2×). Doubles the mempool headroom so a hypothetical
+            // leak takes twice as long to drain the pool, regardless of
+            // whether the leak audit lands a fix. ~12288 mbufs at
+            // default config (was 8192).
+            let computed = 4u32
                 .saturating_mul(cfg.max_connections)
                 .saturating_mul(per_conn)
                 .saturating_add(4096);
@@ -992,6 +1016,25 @@ impl Engine {
         // Counters exist before port config so the helper can bump any
         // offload-miss counters on unsupported requested bits.
         let counters = Box::new(Counters::new());
+
+        // A10 Stage A: bind this engine's counters to the thread so
+        // MbufHandle::Drop can route leak-detect bumps to the right
+        // engine. The set is paired with a scope guard that clears the
+        // pointer on any `?` early return below; on the success path,
+        // we `mem::forget` the guard so Engine::drop owns the eventual
+        // clear (mempool.rs's THREAD_COUNTERS_PTR docs).
+        crate::mempool::THREAD_COUNTERS_PTR.with(|cell| {
+            cell.set(&*counters as *const _);
+        });
+        struct CounterPtrClearOnError;
+        impl Drop for CounterPtrClearOnError {
+            fn drop(&mut self) {
+                crate::mempool::THREAD_COUNTERS_PTR.with(|cell| {
+                    cell.set(std::ptr::null());
+                });
+            }
+        }
+        let counter_ptr_clear_on_error = CounterPtrClearOnError;
 
         // Port-config: dev_info query, offload AND, runtime-fallback
         // latches. Extracted into a helper so later A-HW tasks can add
@@ -1151,10 +1194,16 @@ impl Engine {
         // engine_create. Scraped later per-call via `scrape_xstats`.
         let xstat_map = crate::ena_xstats::resolve_xstat_ids(cfg.port_id);
 
+        // Engine constructed successfully — the pointer set at the top
+        // of Engine::new should remain bound until Engine::drop fires.
+        // Forget the scope guard so its Drop doesn't clear prematurely.
+        std::mem::forget(counter_ptr_clear_on_error);
+
         Ok(Self {
             counters,
             _rx_mempool: rx_mempool,
             rx_mempool_size,
+            rx_mempool_avail_last_sample_tsc: Cell::new(0),
             tx_hdr_mempool,
             tx_data_mempool,
             our_mac,
@@ -1170,8 +1219,24 @@ impl Engine {
             flow_table: RefCell::new(FlowTable::new(cfg.max_connections)),
             events: RefCell::new(EventQueue::with_cap(cfg.event_queue_soft_cap as usize)),
             iss_gen: IssGen::new(),
-            // RFC 6056 ephemeral port hint range: start at 49152.
-            last_ephemeral_port: Cell::new(49151),
+            // RFC 6056 ephemeral port hint range: [49152, 65535].
+            // Per-process variable seed: a fixed seed of 49151 made every
+            // new process pick port 49152 first, colliding with peer-side
+            // TIME_WAIT on the same (local-ip, peer-ip, 49152, peer-port)
+            // 5-tuple from a recent prior run — observed in run bl16x36lb
+            // as bench-offload-ab "connection closed during handshake:
+            // err=0" right after bench-e2e wound down. TSC mix gives 14
+            // bits of variability (range size = 16 384), which is enough
+            // to deconflict back-to-back bench processes; collision odds
+            // with stale flows in this bench's own table stay negligible
+            // at the 16-conn default cap.
+            last_ephemeral_port: Cell::new({
+                let t = crate::clock::now_ns();
+                let mixed = (t ^ t.rotate_left(13) ^ t.rotate_right(7)) as u16;
+                // 49151 + offset in [0, 16383]; next_ephemeral_port pre-
+                // increments so the first emitted port lands in [49152, 65535].
+                49151u16.wrapping_add(mixed % 16384)
+            }),
             // Slot capacity hint: under sustained TX, every push that
             // arms the RTO timer (when `snd_retrans` transitions empty
             // → non-empty) and every cancel-then-rearm on the next ACK
@@ -1676,6 +1741,37 @@ impl Engine {
         self._rx_mempool.as_ptr()
     }
 
+    /// A10 deferred-fix follow-up: TX-data mempool pointer for sustained
+    /// stability tests. Production callers should not use this — the only
+    /// legitimate consumer is the `long_soak_stability` test that
+    /// snapshots all 3 mempools together to detect non-RX leaks. The
+    /// TX-data pool backs the TCP data-segment fast path
+    /// (`tx_data_frame`); a leak here would manifest as falling
+    /// `mempool_avail` despite RX-side balance.
+    pub fn tx_data_mempool_ptr(&self) -> *mut dpdk_net_sys::rte_mempool {
+        self.tx_data_mempool.as_ptr()
+    }
+
+    /// A10 deferred-fix follow-up: TX-header mempool pointer for sustained
+    /// stability tests. Production callers should not use this — the only
+    /// legitimate consumer is the `long_soak_stability` test. The TX-hdr
+    /// pool backs control frames (SYN/ACK/FIN/RST) and small TX traffic
+    /// via `tx_frame`; a leak here would manifest as falling
+    /// `mempool_avail` despite RX- and TX-data-side balance.
+    pub fn tx_hdr_mempool_ptr(&self) -> *mut dpdk_net_sys::rte_mempool {
+        self.tx_hdr_mempool.as_ptr()
+    }
+
+    /// A10 deferred-fix follow-up: timer-wheel slot count for sustained
+    /// stability tests. A leak that accumulates timer state without
+    /// recycling would surface as monotonically-growing `slots_len`.
+    /// Slots are never freed — they are recycled via the wheel's
+    /// `free_list` + `generations`-bump scheme — so this reports the
+    /// all-time peak in-flight depth across the engine's lifetime.
+    pub fn timer_wheel_slots_len(&self) -> usize {
+        self.timer_wheel.borrow().slots_len()
+    }
+
     /// Slow-path: scrape ENA-PMD xstats (ENI allowances + per-queue
     /// counters) into `EthCounters`. Application drives the cadence —
     /// recommended ≤1 Hz. On non-ENA / non-advertising PMDs this is a
@@ -2110,6 +2206,26 @@ impl Engine {
         use std::sync::atomic::Ordering;
         inc(&self.counters.poll.iters);
 
+        // A10 Stage A: at most once per second, sample the RX mempool's
+        // free-mbuf count. Cliff hypothesis: a steady drain across many
+        // iterations would surface as a monotonically-decreasing series
+        // here while the workload is otherwise healthy.
+        {
+            let now_tsc = crate::clock::rdtsc();
+            let last = self.rx_mempool_avail_last_sample_tsc.get();
+            let tsc_hz = unsafe { sys::rte_get_tsc_hz() };
+            if tsc_hz > 0 && now_tsc.wrapping_sub(last) >= tsc_hz {
+                let avail = unsafe {
+                    sys::shim_rte_mempool_avail_count(self._rx_mempool.as_ptr())
+                };
+                self.counters
+                    .tcp
+                    .rx_mempool_avail
+                    .store(avail, std::sync::atomic::Ordering::Relaxed);
+                self.rx_mempool_avail_last_sample_tsc.set(now_tsc);
+            }
+        }
+
         // A6 (spec §3.6 Site 3): snapshot RX-mempool-drop counter at top
         // of poll so `check_and_emit_rx_enomem` at each exit path can
         // edge-trigger a single Error{err=-ENOMEM} per iteration.
@@ -2272,20 +2388,27 @@ impl Engine {
     /// the `EventQueue` under sustained pressure. `conn = 0` is the
     /// engine-level sentinel (handle 0 is reserved, never a live conn).
     pub(crate) fn check_and_emit_rx_enomem(&self) {
-        use std::sync::atomic::Ordering;
-        let now = self.counters.eth.rx_drop_nomem.load(Ordering::Relaxed);
-        let prev = self.rx_drop_nomem_prev.get();
-        if now > prev {
-            let mut ev = self.events.borrow_mut();
-            ev.push(
-                InternalEvent::Error {
-                    conn: 0, // engine-level; not bound to a conn.
-                    err: -libc::ENOMEM,
-                    emitted_ts_ns: crate::clock::now_ns(),
-                },
-                &self.counters,
-            );
-            self.rx_drop_nomem_prev.set(now);
+        // A10 D4 (G1+G2): under obs-none, skip the entire edge-triggered
+        // emission machinery. The `rx_drop_nomem_prev` latch stays at its
+        // previous value; a default-build A/B pair observes identical
+        // counter state but no Error event push.
+        #[cfg(not(feature = "obs-none"))]
+        {
+            use std::sync::atomic::Ordering;
+            let now = self.counters.eth.rx_drop_nomem.load(Ordering::Relaxed);
+            let prev = self.rx_drop_nomem_prev.get();
+            if now > prev {
+                let mut ev = self.events.borrow_mut();
+                ev.push(
+                    InternalEvent::Error {
+                        conn: 0, // engine-level; not bound to a conn.
+                        err: -libc::ENOMEM,
+                        emitted_ts_ns: crate::clock::now_ns(),
+                    },
+                    &self.counters,
+                );
+                self.rx_drop_nomem_prev.set(now);
+            }
         }
     }
 
@@ -2453,15 +2576,22 @@ impl Engine {
                     self.on_syn_retrans_fire(node.owner_handle, id);
                 }
                 crate::tcp_timer_wheel::TimerKind::ApiPublic => {
-                    let mut ev = self.events.borrow_mut();
-                    ev.push(
-                        InternalEvent::ApiTimer {
-                            timer_id: id,
-                            user_data: node.user_data,
-                            emitted_ts_ns: crate::clock::now_ns(),
-                        },
-                        &self.counters,
-                    );
+                    // A10 D4 (G1+G2): emit the ApiTimer event and capture
+                    // emitted_ts_ns only when observability is not
+                    // compiled out. The counter bump stays — it's not a
+                    // G-site, it's a slow-path fire count.
+                    #[cfg(not(feature = "obs-none"))]
+                    {
+                        let mut ev = self.events.borrow_mut();
+                        ev.push(
+                            InternalEvent::ApiTimer {
+                                timer_id: id,
+                                user_data: node.user_data,
+                                emitted_ts_ns: crate::clock::now_ns(),
+                            },
+                            &self.counters,
+                        );
+                    }
                     crate::counters::inc(&self.counters.tcp.tx_api_timers_fired);
                 }
             }
@@ -2597,6 +2727,12 @@ impl Engine {
         // forensic reconstruction. Borrows stay narrowly scoped so no
         // nested RefCell overlap with the subsequent backoff / re-arm
         // phases.
+        // A10 D4 (G1+G2): under obs-none, collapse the entire per-packet
+        // RTO-fire emission block away — the snapshot collection, the
+        // emitted_ts_ns capture, and every push. The `tcp_per_packet_events`
+        // runtime gate already makes this block cold by default; obs-none
+        // removes it at compile time for the zero-observability baseline.
+        #[cfg(not(feature = "obs-none"))]
         if self.cfg.tcp_per_packet_events {
             let emitted_ts_ns = crate::clock::now_ns();
             // A6.5 Task 4: SmallVec<[_; 4]> inline — the empty-lost_indexes
@@ -2785,6 +2921,9 @@ impl Engine {
             // `tcp_per_packet_events`. Order: TcpRetrans (the probe
             // segment) then TcpLossDetected{cause: Tlp}. Read seq +
             // xmit_count from the last entry after retransmit.
+            // A10 D4 (G1+G2): obs-none compiles the whole emission block
+            // away; the TLP retransmit itself already happened above.
+            #[cfg(not(feature = "obs-none"))]
             if self.cfg.tcp_per_packet_events {
                 let (seq, rtx_count) = {
                     let ft = self.flow_table.borrow();
@@ -2973,6 +3112,54 @@ impl Engine {
     /// events; P6 mut flow_table. Each phase's borrow ends at the
     /// block's closing `}`.
     pub(crate) fn force_close_etimedout(&self, handle: ConnHandle) {
+        // A10 deferred-fix Stage B diagnostic: dump the leak-detect
+        // counter trail at the exact moment of cliff failure. The
+        // iteration-7050/11151 cliff is hypothesized to be RX mempool
+        // exhaustion via a per-iteration mbuf refcount leak; surfacing
+        // these values when ETIMEDOUT fires gives the audit a starting
+        // point. Slow path — no cost to non-cliff runs.
+        unsafe {
+            let avail = sys::shim_rte_mempool_avail_count(self._rx_mempool.as_ptr());
+            let drop_unexpected = self
+                .counters
+                .tcp
+                .mbuf_refcnt_drop_unexpected
+                .load(std::sync::atomic::Ordering::Relaxed);
+            let conn_timeout_retrans = self
+                .counters
+                .tcp
+                .conn_timeout_retrans
+                .load(std::sync::atomic::Ordering::Relaxed);
+            let tx_rto = self
+                .counters
+                .tcp
+                .tx_rto
+                .load(std::sync::atomic::Ordering::Relaxed);
+            let recv_buf_drops = self
+                .counters
+                .tcp
+                .recv_buf_drops
+                .load(std::sync::atomic::Ordering::Relaxed);
+            let rx_partial_read_splits = self
+                .counters
+                .tcp
+                .rx_partial_read_splits
+                .load(std::sync::atomic::Ordering::Relaxed);
+            eprintln!(
+                "dpdk_net: force_close_etimedout DIAGNOSTIC handle={} rx_mempool_avail={} \
+                 (capacity={}) mbuf_refcnt_drop_unexpected={} conn_timeout_retrans={} \
+                 tx_rto={} recv_buf_drops={} rx_partial_read_splits={}",
+                handle,
+                avail,
+                self.rx_mempool_size,
+                drop_unexpected,
+                conn_timeout_retrans,
+                tx_rto,
+                recv_buf_drops,
+                rx_partial_read_splits,
+            );
+        }
+
         // Phase 1: snapshot timer ids + drain snd_retrans mbufs. Note: do
         // NOT write conn.state here — transition_conn below owns that
         // transition so StateChange emission + state_trans[from][to]
@@ -3030,6 +3217,10 @@ impl Engine {
         // Ordered AFTER transition_conn so StateChange lands before
         // Error/Closed in the event queue, matching the ordering used
         // elsewhere when a transition accompanies terminal events.
+        // A10 D4 (G1+G2): compile the Error+Closed pair away under
+        // obs-none; the SYN-retrans timeout itself (flow-table mutation
+        // + flow removal below) still fires.
+        #[cfg(not(feature = "obs-none"))]
         {
             let emitted_ts_ns = crate::clock::now_ns();
             let mut ev = self.events.borrow_mut();
@@ -3110,6 +3301,10 @@ impl Engine {
                 }
             };
             self.transition_conn(h, TcpState::Closed);
+            // A10 D4 (G1+G2): skip the Closed event push + now_ns capture
+            // under obs-none. The flow-table mutation + counter bump below
+            // stay — removal + conn_close counter are not observability.
+            #[cfg(not(feature = "obs-none"))]
             self.events.borrow_mut().push(
                 InternalEvent::Closed {
                     conn: h,
@@ -3728,6 +3923,11 @@ impl Engine {
         // edge-per-refusal-cycle — a subsequent refusal restarts the
         // cycle. No payload on WRITABLE (ABI translator zeroes the
         // union); `emitted_ts_ns` sampled at push time per A5.5 §3.1.
+        // A10 D4 (G1+G2): obs-none removes the WRITABLE event emission
+        // entirely. The hysteresis bookkeeping (outcome flag, the
+        // send_refused_pending clear earlier in the pipeline) is a
+        // behavioural latch, not observability — it stays.
+        #[cfg(not(feature = "obs-none"))]
         if outcome.writable_hysteresis_fired {
             let emitted_ts_ns = crate::clock::now_ns();
             let mut ev = self.events.borrow_mut();
@@ -3761,6 +3961,10 @@ impl Engine {
             for i in &outcome.rack_lost_indexes {
                 self.retransmit(handle, *i as usize);
                 crate::counters::inc(&self.counters.tcp.tx_rack_loss);
+                // A10 D4 (G1+G2): obs-none compiles the per-packet
+                // TcpRetrans + TcpLossDetected pair away; the retransmit
+                // itself + tx_rack_loss counter remain.
+                #[cfg(not(feature = "obs-none"))]
                 if self.cfg.tcp_per_packet_events {
                     let (seq, rtx_count) = {
                         let ft = self.flow_table.borrow();
@@ -3981,6 +4185,9 @@ impl Engine {
             // this conn (the client case), the helper is a no-op.
             #[cfg(feature = "test-server")]
             self.listen_promote_to_accept_queue(handle);
+            // A10 D4 (G1+G2): obs-none skips the Connected push + now_ns
+            // capture. conn_open counter stays — it's not observability.
+            #[cfg(not(feature = "obs-none"))]
             self.events.borrow_mut().push(
                 InternalEvent::Connected {
                     conn: handle,
@@ -4059,6 +4266,10 @@ impl Engine {
         }
 
         if outcome.closed {
+            // A10 D4 (G1+G2): obs-none skips the Closed push + now_ns.
+            // conn_close / conn_rst counters + flow-table removal remain
+            // — those are behavioural, not observability.
+            #[cfg(not(feature = "obs-none"))]
             self.events.borrow_mut().push(
                 InternalEvent::Closed {
                     conn: handle,
@@ -4145,6 +4356,9 @@ impl Engine {
         }
         drop(ft);
         inc(&self.counters.tcp.state_trans[from as usize][to as usize]);
+        // A10 D4 (G1+G2): obs-none compiles the StateChange push + now_ns
+        // capture away. The state_trans[][] counter matrix is kept.
+        #[cfg(not(feature = "obs-none"))]
         self.events.borrow_mut().push(
             InternalEvent::StateChange {
                 conn: handle,
@@ -4505,38 +4719,52 @@ impl Engine {
         // `seg_idx_start` is always 0 — scratch is cleared at the top
         // of this call and we only emit one event per deliver_readable
         // invocation.
-        let mut events = self.events.borrow_mut();
-        if seg_count > 0 {
-            // A6.6-7 Task 11: slow-path per-event counters. Batched
-            // `fetch_add(n_segs, Relaxed)` for the cumulative segs
-            // total — a single RMW even when N segments were
-            // emitted. `rx_multi_seg_events` is a conditional
-            // single-increment; both only fire when we actually push
-            // a READABLE event.
-            let n_segs = seg_count as u64;
-            self.counters
-                .tcp
-                .rx_iovec_segs_total
-                .fetch_add(n_segs, Ordering::Relaxed);
-            if n_segs > 1 {
+        // A10 D4 (G1+G2): obs-none compiles the READABLE push + now_ns
+        // + per-event observability counter bumps away. The pop loop
+        // above and the `readable_scratch_iovecs` materialization stay
+        // — those are the application-visible delivery primitives,
+        // not observability. The `recv_buf_delivered` bump is kept as
+        // a slow-path counter (cumulative byte throughput, not per-
+        // event observability).
+        #[cfg(not(feature = "obs-none"))]
+        {
+            let mut events = self.events.borrow_mut();
+            if seg_count > 0 {
+                // A6.6-7 Task 11: slow-path per-event counters. Batched
+                // `fetch_add(n_segs, Relaxed)` for the cumulative segs
+                // total — a single RMW even when N segments were
+                // emitted. `rx_multi_seg_events` is a conditional
+                // single-increment; both only fire when we actually push
+                // a READABLE event.
+                let n_segs = seg_count as u64;
                 self.counters
                     .tcp
-                    .rx_multi_seg_events
-                    .fetch_add(1, Ordering::Relaxed);
+                    .rx_iovec_segs_total
+                    .fetch_add(n_segs, Ordering::Relaxed);
+                if n_segs > 1 {
+                    self.counters
+                        .tcp
+                        .rx_multi_seg_events
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+                events.push(
+                    InternalEvent::Readable {
+                        conn: handle,
+                        seg_idx_start: 0,
+                        seg_count,
+                        total_len,
+                        rx_hw_ts_ns,
+                        emitted_ts_ns: crate::clock::now_ns(),
+                    },
+                    &self.counters,
+                );
             }
-            events.push(
-                InternalEvent::Readable {
-                    conn: handle,
-                    seg_idx_start: 0,
-                    seg_count,
-                    total_len,
-                    rx_hw_ts_ns,
-                    emitted_ts_ns: crate::clock::now_ns(),
-                },
-                &self.counters,
-            );
+            drop(events);
         }
-        drop(events);
+        #[cfg(feature = "obs-none")]
+        {
+            let _ = (seg_count, total_len, rx_hw_ts_ns);
+        }
         drop(ft);
         add(&self.counters.tcp.recv_buf_delivered, total_delivered as u64);
     }
@@ -5224,16 +5452,22 @@ impl Engine {
                 ft.get(handle).map(|c| c.ts_enabled).unwrap_or(false)
             };
             if !ts_enabled {
-                let emitted_ts_ns = crate::clock::now_ns();
-                let mut ev = self.events.borrow_mut();
-                ev.push(
-                    InternalEvent::Error {
-                        conn: handle,
-                        err: -libc::EPERM,
-                        emitted_ts_ns,
-                    },
-                    &self.counters,
-                );
+                // A10 D4 (G1+G2): obs-none compiles away the EPERM event
+                // emission. The close_conn fall-through below still runs
+                // so the connection teardown semantics stay the same.
+                #[cfg(not(feature = "obs-none"))]
+                {
+                    let emitted_ts_ns = crate::clock::now_ns();
+                    let mut ev = self.events.borrow_mut();
+                    ev.push(
+                        InternalEvent::Error {
+                            conn: handle,
+                            err: -libc::EPERM,
+                            emitted_ts_ns,
+                        },
+                        &self.counters,
+                    );
+                }
             } else {
                 let mut ft = self.flow_table.borrow_mut();
                 if let Some(c) = ft.get_mut(handle) {
@@ -5377,16 +5611,22 @@ impl Engine {
             // A6 (spec §3.6 Site 2): surface retransmit ENOMEM as an
             // Error event per occurrence — callers don't see the inline
             // tx_drop_nomem bump unless they poll the counter.
-            let emitted_ts_ns = crate::clock::now_ns();
-            let mut ev = self.events.borrow_mut();
-            ev.push(
-                InternalEvent::Error {
-                    conn: conn_handle,
-                    err: -libc::ENOMEM,
-                    emitted_ts_ns,
-                },
-                &self.counters,
-            );
+            // A10 D4 (G1+G2): obs-none compiles the Error push + now_ns
+            // away; tx_drop_nomem counter still bumps so the pressure
+            // surfaces via counters per feedback_performance_first_flow_control.
+            #[cfg(not(feature = "obs-none"))]
+            {
+                let emitted_ts_ns = crate::clock::now_ns();
+                let mut ev = self.events.borrow_mut();
+                ev.push(
+                    InternalEvent::Error {
+                        conn: conn_handle,
+                        err: -libc::ENOMEM,
+                        emitted_ts_ns,
+                    },
+                    &self.counters,
+                );
+            }
             return;
         }
 
@@ -5485,16 +5725,20 @@ impl Engine {
             // A6 (spec §3.6 Site 2): Error event per occurrence on
             // retransmit ENOMEM path — header-build failure is treated
             // as no-memory for the caller-visible surface.
-            let emitted_ts_ns = crate::clock::now_ns();
-            let mut ev = self.events.borrow_mut();
-            ev.push(
-                InternalEvent::Error {
-                    conn: conn_handle,
-                    err: -libc::ENOMEM,
-                    emitted_ts_ns,
-                },
-                &self.counters,
-            );
+            // A10 D4 (G1+G2): obs-none skips the Error push.
+            #[cfg(not(feature = "obs-none"))]
+            {
+                let emitted_ts_ns = crate::clock::now_ns();
+                let mut ev = self.events.borrow_mut();
+                ev.push(
+                    InternalEvent::Error {
+                        conn: conn_handle,
+                        err: -libc::ENOMEM,
+                        emitted_ts_ns,
+                    },
+                    &self.counters,
+                );
+            }
             return;
         };
         let dst = unsafe { sys::shim_rte_pktmbuf_append(hdr_mbuf, hdr_n as u16) };
@@ -5503,16 +5747,20 @@ impl Engine {
             inc(&self.counters.eth.tx_drop_nomem);
             // A6 (spec §3.6 Site 2): Error event per occurrence on
             // retransmit ENOMEM path — append-null means no data-room.
-            let emitted_ts_ns = crate::clock::now_ns();
-            let mut ev = self.events.borrow_mut();
-            ev.push(
-                InternalEvent::Error {
-                    conn: conn_handle,
-                    err: -libc::ENOMEM,
-                    emitted_ts_ns,
-                },
-                &self.counters,
-            );
+            // A10 D4 (G1+G2): obs-none skips the Error push.
+            #[cfg(not(feature = "obs-none"))]
+            {
+                let emitted_ts_ns = crate::clock::now_ns();
+                let mut ev = self.events.borrow_mut();
+                ev.push(
+                    InternalEvent::Error {
+                        conn: conn_handle,
+                        err: -libc::ENOMEM,
+                        emitted_ts_ns,
+                    },
+                    &self.counters,
+                );
+            }
             return;
         }
         // Safety: `dst` points to `hdr_n` writable bytes inside hdr_mbuf.
@@ -5592,16 +5840,20 @@ impl Engine {
             // A6 (spec §3.6 Site 2): Error event per occurrence on
             // retransmit ENOMEM path — chain-fail surfaces as ENOMEM
             // to the caller alongside the tx_drop_nomem bump.
-            let emitted_ts_ns = crate::clock::now_ns();
-            let mut ev = self.events.borrow_mut();
-            ev.push(
-                InternalEvent::Error {
-                    conn: conn_handle,
-                    err: -libc::ENOMEM,
-                    emitted_ts_ns,
-                },
-                &self.counters,
-            );
+            // A10 D4 (G1+G2): obs-none skips the Error push.
+            #[cfg(not(feature = "obs-none"))]
+            {
+                let emitted_ts_ns = crate::clock::now_ns();
+                let mut ev = self.events.borrow_mut();
+                ev.push(
+                    InternalEvent::Error {
+                        conn: conn_handle,
+                        err: -libc::ENOMEM,
+                        emitted_ts_ns,
+                    },
+                    &self.counters,
+                );
+            }
             return;
         }
 
@@ -5701,6 +5953,18 @@ impl Engine {
             )
             .expect("test-inject mempool create failed (check hugepages + EAL init)")
         })
+    }
+
+    /// A10 follow-up: raw pointer to the lazily-constructed test-inject
+    /// mempool for chain-walk pool-drift regression tests
+    /// (`tests/multi_seg_chain_pool_drift.rs`). Triggers pool creation on
+    /// first call so callers can `shim_rte_mempool_avail_count` immediately
+    /// after to capture a stable baseline. Parallel to `rx_mempool_ptr`;
+    /// stays `pub` (rather than `#[cfg(test)]`) because integration tests
+    /// compile outside the crate's own `cfg(test)`.
+    #[cfg(feature = "test-inject")]
+    pub fn test_inject_pool_ptr(&self) -> *mut dpdk_net_sys::rte_mempool {
+        self.test_inject_pool().as_ptr()
     }
 
     /// Inject a synthetic Ethernet frame as if it came from PMD RX.
@@ -5951,29 +6215,66 @@ impl Engine {
 
 impl Drop for Engine {
     fn drop(&mut self) {
-        // Drain the FaultInjector first so reorder-ring mbufs are
-        // returned to their mempools while the pools are still alive.
-        // Rust drops fields in declaration order; `fault_injector` is
-        // declared AFTER every mempool field, so the implicit sequence
-        // would free the pools first and `FaultInjector::Drop`'s
-        // `shim_rte_pktmbuf_free` walk would then deref chain heads
-        // whose backing pool is gone (UAF on `m->pool`, double-put on
-        // the recycled free-list). The take MUST precede the
-        // `port_id == u16::MAX` early return — test-server engines
-        // also carry the same mempool fields. `try_borrow_mut` so a
-        // panic-during-unwind path that already holds the RefCell
-        // does not double-panic abort the process.
+        // CRITICAL ORDERING: every Rust-side mbuf owner must be released
+        // BEFORE the mempool fields drop. Mempools are declared early
+        // in the Engine struct (engine.rs:415-422), so Rust's
+        // struct-field forward drop order would free their memzones
+        // first; the subsequent `MbufHandle::Drop` refcount-update
+        // calls fired by flow_table / tx_pending_data / fault_injector
+        // teardown would then touch deleted memory and segfault inside
+        // `shim_rte_mbuf_refcnt_update`. Confirmed by gdb backtrace
+        // from bench-ab-runner run br32yx9a7 (2026-04-28): the crash
+        // walked exactly the chain MbufHandle → InOrderSegment →
+        // SmallVec → TcpConn → FlowTable → Engine, dereffing an mbuf
+        // address inside a memzone marked `(deleted)` in /proc/maps.
+        //
+        // Step 1: clear FlowTable. Drops every TcpConn, which drops
+        // recv-segment + reorder + snd_retrans + delivered_segments
+        // mbufs back into still-alive mempools.
+        self.flow_table.get_mut().clear_all();
+
+        // Step 2: free any mbufs queued in the engine-scope TX batch
+        // ring. We don't try to send them (the port is about to close);
+        // just return them to the mempool.
+        {
+            let mut ring = self.tx_pending_data.borrow_mut();
+            for ptr in ring.drain(..) {
+                // Safety: the ring is populated by `send_bytes` from
+                // mbuf pointers we own. Each ptr was alloc'd from
+                // `tx_data_mempool` (still alive at this point);
+                // `rte_pktmbuf_free` decs refcount and returns the
+                // mbuf to its pool.
+                unsafe { sys::shim_rte_pktmbuf_free(ptr.as_ptr()) };
+            }
+        }
+
+        // Step 3: take the optional FaultInjector so its own Drop runs
+        // here (releasing any mbufs held in its reorder ring) instead
+        // of after the mempools drop. `try_borrow_mut` so a panic-
+        // during-unwind path that already holds the RefCell does not
+        // double-panic abort the process.
         #[cfg(feature = "fault-injector")]
         {
             if let Ok(mut g) = self.fault_injector.try_borrow_mut() {
                 drop(g.take());
             }
         }
+
+        // Step 4: stop + close port. PMD queue-release callbacks fire
+        // here; queue rings are empty by now (all mbufs returned in
+        // steps 1-3) so the PMD has nothing dangling.
+        //
         // A7 Task 5: the test-server rig passes `port_id == u16::MAX`
         // and `Engine::new` bypasses the queue-setup + dev_start block.
         // Calling dev_stop / dev_close on a port that was never started
         // would log noise at best and crash bindgen shims at worst.
         if self.cfg.port_id == u16::MAX {
+            // A10 Stage A: still unbind the per-thread counters pointer
+            // so the test-server early-return path doesn't leave a
+            // dangling pointer either.
+            crate::mempool::THREAD_COUNTERS_PTR.with(|cell| {
+                cell.set(std::ptr::null());
+            });
             return;
         }
         // Safety: we previously started the port; stop and close on drop.
@@ -5981,7 +6282,17 @@ impl Drop for Engine {
             sys::rte_eth_dev_stop(self.cfg.port_id);
             sys::rte_eth_dev_close(self.cfg.port_id);
         }
-        // Mempools drop via their own Drop impl.
+
+        // Step 5: mempools drop next via Rust struct-field forward
+        // order. All refcounts already decremented; rte_mempool_free
+        // walks an empty pool and unmaps the memzone cleanly.
+
+        // A10 Stage A: unbind the per-thread counters pointer so any
+        // post-engine drop in this thread doesn't write through a
+        // freed pointer. Pairs with Engine::new's set.
+        crate::mempool::THREAD_COUNTERS_PTR.with(|cell| {
+            cell.set(std::ptr::null());
+        });
     }
 }
 
@@ -7465,5 +7776,41 @@ mod a_hw_port_config_tests {
         let applied = and_offload_with_miss_counter(0, u64::MAX, &ctr, "ignored", 0);
         assert_eq!(applied, 0);
         assert_eq!(ctr.load(Ordering::Relaxed), 0);
+    }
+}
+
+#[cfg(test)]
+mod rx_mempool_size_default_formula_tests {
+    use super::*;
+
+    /// A10 deferred-fix Stage B (defense in depth): doubled per-conn term.
+    /// Formula = max(4 * rx_ring_size,
+    ///               4 * max_connections * ceil(recv_buffer_bytes / mbuf_data_room) + 4096).
+    /// At default config, the per-conn term dominates: per_conn = 128;
+    /// computed = 4 × 16 × 128 + 4096 = 12288. Floor = 4 × 512 = 2048.
+    /// → final 12288 (raised from the prior 8192).
+    #[test]
+    fn default_formula_yields_12288() {
+        let cfg = EngineConfig::default();
+        let mbuf_data_room = cfg.mbuf_data_room as u32;
+        let per_conn = cfg
+            .recv_buffer_bytes
+            .saturating_add(mbuf_data_room.saturating_sub(1))
+            / mbuf_data_room.max(1);
+        let computed = 4u32
+            .saturating_mul(cfg.max_connections)
+            .saturating_mul(per_conn)
+            .saturating_add(4096);
+        let floor = 4u32.saturating_mul(cfg.rx_ring_size as u32);
+        assert_eq!(computed.max(floor), 12288);
+    }
+
+    #[test]
+    fn caller_override_skips_formula() {
+        // Non-zero `rx_mempool_size` is used verbatim — no formula applied.
+        // (Restated invariant; previously implicit.)
+        let mut cfg = EngineConfig::default();
+        cfg.rx_mempool_size = 1024;
+        assert_eq!(cfg.rx_mempool_size, 1024);
     }
 }

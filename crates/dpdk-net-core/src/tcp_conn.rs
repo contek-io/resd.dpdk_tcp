@@ -660,7 +660,14 @@ impl TcpConn {
         // A6 Task 15 (spec §3.8): per-conn RTT histogram update. Slow-path
         // at sample cadence (not per-segment). 15-comparison ladder
         // + one wrapping_add on cache-resident state.
+        // A10 D4 (G3): obs-none compiles the histogram bucket lookup +
+        // increment away. The RTT estimator (SRTT/RTTVAR/RTO feedback)
+        // and RACK min-rtt tracker still run — those drive retransmit
+        // timing, not forensics.
+        #[cfg(not(feature = "obs-none"))]
         self.rtt_histogram.update(rtt_us, rtt_histogram_edges);
+        #[cfg(feature = "obs-none")]
+        let _ = rtt_histogram_edges;
         true
     }
 
@@ -1303,7 +1310,12 @@ mod a5_5_syn_srtt_seed {
         assert!(c.rack.min_rtt_us > 0);
         // A6 Task 15: histogram absorbed the 50ms sample (bucket 12 per
         // default edges: 50000us > edges[11]=25000, ≤ edges[12]=50000).
+        // A10 D4 (G3): under obs-none the histogram update is compiled
+        // away — SRTT/RACK still run, but the bucket stays at zero.
+        #[cfg(not(feature = "obs-none"))]
         assert_eq!(c.rtt_histogram.buckets[12], 1);
+        #[cfg(feature = "obs-none")]
+        assert!(c.rtt_histogram.buckets.iter().all(|&b| b == 0));
     }
 
     #[cfg_attr(miri, ignore = "touches DPDK sys::*")]

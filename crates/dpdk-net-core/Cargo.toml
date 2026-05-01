@@ -95,6 +95,13 @@ test-inject = []
 # `arrayvec` (reorder ring) and `rand/small_rng` (PRNG). See fault_injector.rs
 # for the spec format and Task 6 for the process-body wiring.
 fault-injector = ["dep:arrayvec", "dep:rand"]
+# A10 D4: umbrella feature gating every "always-on" observability emission
+# site (G1 EventQueue::push, G2 emitted_ts_ns capture, G3 rtt_histogram.update,
+# G4 ConnStats FFI getter). Additive — default builds carry zero
+# cfg(feature = "obs-none") guards evaluated as true. Consumed only by
+# tools/bench-obs-overhead A/B runner to measure the zero-observability
+# floor. See docs/superpowers/specs/2026-04-21-stage1-phase-a10-benchmark-harness-design.md D4.
+obs-none = []
 
 [dev-dependencies]
 proptest = "1"

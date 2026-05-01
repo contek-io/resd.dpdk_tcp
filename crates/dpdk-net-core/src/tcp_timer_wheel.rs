@@ -186,6 +186,19 @@ impl TimerWheel {
         fired
     }
 
+    /// A10 deferred-fix follow-up: number of slot entries the wheel has
+    /// allocated to date. Slots are never deallocated — they're recycled
+    /// via `free_list` and `generations`-bumped on reuse. This therefore
+    /// reports the all-time peak in-flight timer depth. A leak that
+    /// accumulates timer state without recycling would surface as
+    /// monotonically-growing `slots_len`. Used by the long-soak stability
+    /// test to assert the wheel does not balloon under sustained
+    /// arm/cancel cycles. Not a production API — production callers
+    /// should use the per-engine slow-path counters instead.
+    pub fn slots_len(&self) -> usize {
+        self.slots.len()
+    }
+
     /// Tombstone-cancel a scheduled timer by TimerId. Returns true if a
     /// live, matching timer was found and marked cancelled; false if the
     /// slot is empty, the generation is stale (slot was reused), or the

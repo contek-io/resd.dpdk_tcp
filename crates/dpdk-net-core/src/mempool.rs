@@ -1,8 +1,38 @@
 use dpdk_net_sys as sys;
+use std::cell::Cell;
 use std::ffi::CString;
 use std::ptr::NonNull;
 
 use crate::Error;
+
+// Per-thread pointer to the active engine's counters. Set by
+// `Engine::new` (start of construction) and cleared by `Engine::drop`
+// (very end of teardown). `MbufHandle::Drop` reads this on its hot
+// path to bump `mbuf_refcnt_drop_unexpected` when the post-dec
+// refcount is suspiciously high. Pointer is null iff no engine is
+// bound on this thread; in that case the diagnostic is silently
+// skipped.
+//
+// SAFETY: callers must store a pointer to a `Counters` whose
+// lifetime outlives every `MbufHandle::Drop` on the same thread.
+// `Engine` owns its `Counters` in a `Box`; setting / clearing in
+// pair with engine construction / destruction satisfies the
+// invariant.
+thread_local! {
+    pub(crate) static THREAD_COUNTERS_PTR: Cell<*const crate::counters::Counters> =
+        const { Cell::new(std::ptr::null()) };
+}
+
+/// Threshold above which a post-dec refcount in `MbufHandle::Drop`
+/// surfaces as `mbuf_refcnt_drop_unexpected`. No production path
+/// holds more than 8 handles to one mbuf concurrently — the maximum
+/// observed in code review of `delivered_segments` / `recv.bytes` /
+/// `OooSegment` / `snd_retrans` overlap is ~4. The 8-handle threshold
+/// gives 2× headroom over reality so a slow monotonic refcount climb
+/// (rate < 1 per leak event but cumulative) surfaces faster than the
+/// prior 32-handle ceiling. False positives on the legitimate path
+/// remain zero.
+pub(crate) const MBUF_DROP_UNEXPECTED_THRESHOLD: u16 = 8;
 
 /// RAII wrapper around an `rte_mempool*`.
 /// Dropped pool calls `rte_mempool_free` on the inner pointer.
@@ -231,11 +261,53 @@ impl MbufHandle {
 impl Drop for MbufHandle {
     fn drop(&mut self) {
         // SAFETY: `ptr` was validated at construction and the handle
-        // owns exactly one refcount. The decrement may take the count
-        // to zero and return the mbuf to its mempool, which is the
-        // intended end-of-life behaviour.
+        // owns exactly one refcount.
+        //
+        // We read the refcount BEFORE decrementing so we can deterministically
+        // compute the post-dec value as `pre - 1` without re-reading after the
+        // dec. Reading after the dec would be UAF when pre==1: the dec returns
+        // the mbuf to its mempool, and the pool may have recycled the slot
+        // before our read lands. Computing post-dec from the pre-dec read is
+        // sound because the engine serializes mbuf operations on its lcore
+        // (no other thread mutates the refcount concurrently).
+        // A10 Stage B fix: use rte_pktmbuf_free_seg, NOT
+        // rte_mbuf_refcnt_update(-1). The refcnt_update primitive only
+        // decrements the atomic; it does NOT return the mbuf to its
+        // mempool when the count reaches 0. The pktmbuf_free_seg
+        // primitive checks the refcount and properly returns to pool
+        // on last-ref drop. The leak surfaced as a 1-mbuf-per-iteration
+        // RX-mempool drain in bench-e2e/bench-stress; the cliff hit at
+        // iteration ~11151 (capacity=12288) when the pool exhausted.
+        let pre = unsafe { sys::shim_rte_mbuf_refcnt_read(self.ptr.as_ptr()) };
         unsafe {
-            sys::shim_rte_mbuf_refcnt_update(self.ptr.as_ptr(), -1);
+            sys::shim_rte_pktmbuf_free_seg(self.ptr.as_ptr());
+        }
+        let post = pre.saturating_sub(1);
+        // Diagnostic fires on:
+        // - High refcount leak: post > MBUF_DROP_UNEXPECTED_THRESHOLD
+        //   (currently 8 — see the constant for the rationale; more
+        //   handles outstanding than any legitimate path holds
+        //   simultaneously).
+        // - Double-dec / saturating-underflow: pre == 0 (a Drop
+        //   ran on a handle whose mbuf was already freed by another
+        //   path — symmetric leak signal, same forensic value).
+        if pre == 0 || post > MBUF_DROP_UNEXPECTED_THRESHOLD {
+            // Diagnostic: post-dec count above legitimate-handle ceiling
+            // = unbalanced refcount. Bump only when an engine is bound
+            // on this thread (THREAD_COUNTERS_PTR is set in
+            // Engine::new / cleared in Engine::drop).
+            THREAD_COUNTERS_PTR.with(|cell| {
+                let p = cell.get();
+                if !p.is_null() {
+                    // SAFETY: pointer set by Engine::new and not yet
+                    // cleared (Engine::drop hasn't fired) → still valid.
+                    unsafe {
+                        (*p).tcp
+                            .mbuf_refcnt_drop_unexpected
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                }
+            });
         }
     }
 }

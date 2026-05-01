@@ -1,0 +1,44 @@
+[package]
+name = "bench-report"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+# A10 Plan B Task 14: CSV → JSON + HTML + Markdown reporter.
+#
+# Walks `target/bench-results/**/*.csv`, deserialises every row via
+# `bench_common::csv_row::CsvRow`, applies a strict/lenient/all precondition
+# filter, then emits:
+#   - JSON: full long-form data (archival)
+#   - HTML: single-page static dashboard (inline CSS, no external CDN)
+#   - Markdown: per-tool summary tables suitable for committing under
+#     `docs/superpowers/reports/`
+#
+# See docs/superpowers/specs/2026-04-21-stage1-phase-a10-benchmark-
+# harness-design.md §12 + §14.
+
+[lib]
+name = "bench_report"
+path = "src/lib.rs"
+
+[[bin]]
+name = "bench-report"
+path = "src/main.rs"
+
+[dependencies]
+bench-common = { path = "../bench-common" }
+clap = { version = "4", features = ["derive"] }
+anyhow = "1"
+csv = "1.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Recursive CSV discovery under `target/bench-results/**/*.csv`. walkdir is
+# the standard library pattern for this; std::fs::read_dir alone requires
+# hand-rolled recursion.
+walkdir = "2.5"
+
+[dev-dependencies]
+# Tests build CsvRow fixtures (which contain a `uuid::Uuid` run_id field) and
+# use `Uuid::new_v4()` to generate unique scratch-directory suffixes. Matches
+# the version bench-common already pulls in.
+uuid = { version = "1", features = ["v4"] }

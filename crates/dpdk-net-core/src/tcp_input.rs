@@ -719,6 +719,11 @@ pub(crate) fn is_dsack(
 fn handle_established(
     conn: &mut TcpConn,
     seg: &ParsedSegment,
+    // A10 D4 (G3): unused under `obs-none` — both internal call sites
+    // (rtt_histogram.update for ts-sample + Karn's fallback) compile
+    // away. Signature pinned so the dispatch-site call in `dispatch`
+    // stays one-shape across feature configs.
+    #[cfg_attr(feature = "obs-none", allow(unused_variables))]
     rtt_histogram_edges: &[u32; 15],
     send_buffer_bytes: u32,
     mbuf_ctx: Option<MbufInsertCtx>,
@@ -931,6 +936,8 @@ fn handle_established(
             // A6 Task 15 (spec §3.8): per-conn RTT histogram update. Slow-path
             // at sample cadence (not per-segment). 15-comparison ladder
             // + one wrapping_add on cache-resident state.
+            // A10 D4 (G3): obs-none compiles the histogram update away.
+            #[cfg(not(feature = "obs-none"))]
             conn.rtt_histogram.update(rtt, rtt_histogram_edges);
         } else if let Some(front) = conn.snd_retrans.front() {
             let front_end = front.seq.wrapping_add(front.len as u32);
@@ -944,6 +951,8 @@ fn handle_established(
                     conn.on_rtt_sample_tlp_hook();
                     // A6 Task 15 (spec §3.8): per-conn RTT histogram update.
                     // Same cost + rationale as the timestamp-path branch above.
+                    // A10 D4 (G3): obs-none compiles the histogram update away.
+                    #[cfg(not(feature = "obs-none"))]
                     conn.rtt_histogram.update(rtt, rtt_histogram_edges);
                 }
             }
