@@ -1,0 +1,32 @@
+[package]
+name = "layer-h-correctness"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+# Stage 1 Phase A10.5: Layer H correctness gate. 17-scenario netem matrix
+# (14 base + 3 composed netem×FaultInjector) with liveness + invariant
+# assertions. See docs/superpowers/specs/2026-05-01-stage1-phase-a10-5-
+# layer-h-correctness-design.md for the design.
+
+[lib]
+name = "layer_h_correctness"
+path = "src/lib.rs"
+
+[[bin]]
+name = "layer-h-correctness"
+path = "src/main.rs"
+
+[dependencies]
+bench-common = { path = "../bench-common" }
+bench-e2e = { path = "../bench-e2e" }
+bench-stress = { path = "../bench-stress" }
+dpdk-net-core = { path = "../../crates/dpdk-net-core", features = ["fault-injector"] }
+dpdk-net-sys = { path = "../../crates/dpdk-net-sys" }
+clap = { version = "4", features = ["derive"] }
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+hostname = "0.4"
+uuid = { version = "1", features = ["v4"] }

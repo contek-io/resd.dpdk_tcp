@@ -16,6 +16,7 @@ members = [
     "tools/bench-stress",
     "tools/bench-vs-linux",
     "tools/bench-vs-mtcp",
+    "tools/layer-h-correctness",
     "tools/packetdrill-shim-runner",
     "tools/scapy-fuzz-runner",
     "tools/tcpreq-runner",
