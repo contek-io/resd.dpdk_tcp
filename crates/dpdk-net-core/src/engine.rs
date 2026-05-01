@@ -5955,6 +5955,18 @@ impl Engine {
         })
     }
 
+    /// A10 follow-up: raw pointer to the lazily-constructed test-inject
+    /// mempool for chain-walk pool-drift regression tests
+    /// (`tests/multi_seg_chain_pool_drift.rs`). Triggers pool creation on
+    /// first call so callers can `shim_rte_mempool_avail_count` immediately
+    /// after to capture a stable baseline. Parallel to `rx_mempool_ptr`;
+    /// stays `pub` (rather than `#[cfg(test)]`) because integration tests
+    /// compile outside the crate's own `cfg(test)`.
+    #[cfg(feature = "test-inject")]
+    pub fn test_inject_pool_ptr(&self) -> *mut dpdk_net_sys::rte_mempool {
+        self.test_inject_pool().as_ptr()
+    }
+
     /// Inject a synthetic Ethernet frame as if it came from PMD RX.
     /// The frame is copied into an mbuf from a lazily-created test-inject
     /// mempool; the same internal RX dispatch the poll loop uses runs end
