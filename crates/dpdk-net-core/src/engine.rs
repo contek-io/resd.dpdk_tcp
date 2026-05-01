@@ -1632,6 +1632,37 @@ impl Engine {
         self._rx_mempool.as_ptr()
     }
 
+    /// A10 deferred-fix follow-up: TX-data mempool pointer for sustained
+    /// stability tests. Production callers should not use this — the only
+    /// legitimate consumer is the `long_soak_stability` test that
+    /// snapshots all 3 mempools together to detect non-RX leaks. The
+    /// TX-data pool backs the TCP data-segment fast path
+    /// (`tx_data_frame`); a leak here would manifest as falling
+    /// `mempool_avail` despite RX-side balance.
+    pub fn tx_data_mempool_ptr(&self) -> *mut dpdk_net_sys::rte_mempool {
+        self.tx_data_mempool.as_ptr()
+    }
+
+    /// A10 deferred-fix follow-up: TX-header mempool pointer for sustained
+    /// stability tests. Production callers should not use this — the only
+    /// legitimate consumer is the `long_soak_stability` test. The TX-hdr
+    /// pool backs control frames (SYN/ACK/FIN/RST) and small TX traffic
+    /// via `tx_frame`; a leak here would manifest as falling
+    /// `mempool_avail` despite RX- and TX-data-side balance.
+    pub fn tx_hdr_mempool_ptr(&self) -> *mut dpdk_net_sys::rte_mempool {
+        self.tx_hdr_mempool.as_ptr()
+    }
+
+    /// A10 deferred-fix follow-up: timer-wheel slot count for sustained
+    /// stability tests. A leak that accumulates timer state without
+    /// recycling would surface as monotonically-growing `slots_len`.
+    /// Slots are never freed — they are recycled via the wheel's
+    /// `free_list` + `generations`-bump scheme — so this reports the
+    /// all-time peak in-flight depth across the engine's lifetime.
+    pub fn timer_wheel_slots_len(&self) -> usize {
+        self.timer_wheel.borrow().slots_len()
+    }
+
     /// Slow-path: scrape ENA-PMD xstats (ENI allowances + per-queue
     /// counters) into `EthCounters`. Application drives the cadence —
     /// recommended ≤1 Hz. On non-ENA / non-advertising PMDs this is a
