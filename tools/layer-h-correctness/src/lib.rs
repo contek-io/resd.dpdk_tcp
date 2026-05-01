@@ -9,4 +9,5 @@
 
 pub mod assertions;
 pub mod counters_snapshot;
+pub mod observation;
 pub mod scenarios;
