@@ -8,4 +8,5 @@
 //! without going through the binary.
 
 pub mod assertions;
+pub mod counters_snapshot;
 pub mod scenarios;
