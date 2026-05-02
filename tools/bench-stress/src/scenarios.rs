@@ -69,7 +69,12 @@ pub const MATRIX: &[Scenario] = &[
     },
     Scenario {
         name: "reorder_depth_3",
-        netem: Some("reorder 50% gap 3"),
+        // `man tc-netem`: "to use reordering, a delay option must be
+        // specified". A bare `reorder ... gap N` is silently accepted by
+        // tc but produces no reordering — exercises a no-op qdisc. The
+        // 5 ms base delay is large enough for reorder to fire without
+        // distorting the rest of the assertion.
+        netem: Some("delay 5ms reorder 50% gap 3"),
         fault_injector: None,
         p999_ceiling_ratio: None,
         counter_expectations: &[("tcp.tx_retrans", "==0")],

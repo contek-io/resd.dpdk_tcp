@@ -51,7 +51,7 @@ fn validate_iface(iface: &str) -> anyhow::Result<()> {
 }
 
 /// Allowlist validator for the scenario's netem spec string. The current
-/// matrix uses values like `loss 0.1% delay 10ms`, `reorder 50% gap 3`,
+/// matrix uses values like `loss 0.1% delay 10ms`, `delay 5ms reorder 50% gap 3`,
 /// `duplicate 100%`, `loss 1% 25%` — letters, digits, `.`, `%`, `:`,
 /// space, `-`, `_`. Anything else (`;`, `&&`, `|`, backtick, `$(...)`,
 /// newline) is rejected to keep the SSH shell interpolation safe.
@@ -224,7 +224,7 @@ mod tests {
         // Every netem spec that appears in `scenarios::MATRIX` today.
         assert!(validate_spec("loss 0.1% delay 10ms").is_ok());
         assert!(validate_spec("loss 1% 25%").is_ok());
-        assert!(validate_spec("reorder 50% gap 3").is_ok());
+        assert!(validate_spec("delay 5ms reorder 50% gap 3").is_ok());
         assert!(validate_spec("duplicate 100%").is_ok());
     }
 

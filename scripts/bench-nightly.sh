@@ -485,7 +485,7 @@ log "[8/12] bench-stress (operator-side netem orchestration)"
 declare -A NETEM_SPECS=(
   [random_loss_01pct_10ms]="loss 0.1% delay 10ms"
   [correlated_burst_loss_1pct]="loss 1% 25%"
-  [reorder_depth_3]="reorder 50% gap 3"
+  [reorder_depth_3]="delay 5ms reorder 50% gap 3"
   [duplication_2x]="duplicate 100%"
 )
 

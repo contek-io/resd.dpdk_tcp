@@ -379,7 +379,7 @@ Path: `<bundle-dir>/<scenario>.json`, default `<bundle-dir>` = `target/layer-h-b
     }
   ],
   "event_window": [
-    { "ord": 0, "kind": "StateChange", "from": "Established", "to": "Established", "now_ns": 12345 },
+    { "ord": 0, "kind": "StateChange", "from": "Established", "to": "Established", "emitted_ts_ns": 12345 },
     "..."
   ],
   "event_window_truncated": false
