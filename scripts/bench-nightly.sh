@@ -793,12 +793,17 @@ run_dut_bench bench-vs-mtcp bench-vs-mtcp-burst \
     --nic-max-bps "$NIC_MAX_BPS" \
     || log "  [11/12] bench-vs-mtcp burst exited non-zero — continuing"
 
-log "[11b/12] bench-vs-mtcp maxtp grid"
+log "[11b/12] bench-vs-mtcp maxtp grid (dpdk + linux comparator)"
+# 2026-05-03: Linux kernel-TCP arm landed in bench-vs-mtcp (mTCP arm
+# stays stubbed while AMI rebuild is blocked on libmtcp / gcc 13).
+# Both stacks talk to the existing echo-server on port 10001; linux
+# maxtp doesn't care that the peer echoes — it only sends and counts
+# accepted bytes.
 run_dut_bench bench-vs-mtcp bench-vs-mtcp-maxtp \
     "${DPDK_COMMON[@]}" \
     --workload maxtp \
     --peer-port 10001 \
-    --stacks dpdk \
+    --stacks dpdk,linux \
     --tool bench-vs-mtcp \
     --feature-set trading-latency \
     --nic-max-bps "$NIC_MAX_BPS" \
