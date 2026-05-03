@@ -776,9 +776,21 @@ fn run_maxtp_grid_dpdk<W: std::io::Write>(
             payload,
             tx_ts_mode,
         };
-        let run = dpdk_maxtp::run_bucket(&cfg).with_context(|| {
+        // Per-bucket soft-fail: a single bucket erroring (e.g. SendBufferFull
+        // at high C) should NOT abort the entire grid. Log and continue so
+        // every other bucket — and every other stack — gets to produce data.
+        let run = match dpdk_maxtp::run_bucket(&cfg).with_context(|| {
             format!("dpdk_maxtp::run_bucket for {}", bucket.label())
-        })?;
+        }) {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!(
+                    "bench-vs-mtcp: dpdk_maxtp bucket {} failed: {e:#}",
+                    bucket.label()
+                );
+                continue;
+            }
+        };
 
         // Sanity invariant (spec §11.2): ACKed bytes during window ==
         // `tx_payload_bytes` delta, minus in-flight bound. The
@@ -927,9 +939,20 @@ fn run_maxtp_grid_linux<W: std::io::Write>(
             peer_port,
             payload: vec![0u8; bucket.write_bytes as usize],
         };
-        let run = linux_maxtp::run_bucket(&cfg, &mut conns).with_context(|| {
+        // Per-bucket soft-fail (mirror dpdk_maxtp grid): a single bucket
+        // erroring should not abort the grid.
+        let run = match linux_maxtp::run_bucket(&cfg, &mut conns).with_context(|| {
             format!("linux_maxtp::run_bucket for {}", bucket.label())
-        })?;
+        }) {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!(
+                    "bench-vs-mtcp: linux_maxtp bucket {} failed: {e:#}",
+                    bucket.label()
+                );
+                continue;
+            }
+        };
 
         // Post-run NIC-saturation check (mirror dpdk path) — same 70%
         // ceiling using the same mean throughput in bps.

@@ -239,7 +239,7 @@ fn send_one_burst_and_drain_acks(
     // with `drive_burst_remainder_to_completion`): we only fail on
     // genuine wedge ("no byte accepted in 60s"), not on slow-but-
     // steady big bursts that legitimately exceed a flat 60s budget.
-    const STALL_TIMEOUT: Duration = Duration::from_secs(60);
+    const STALL_TIMEOUT: Duration = Duration::from_secs(180);
     let mut sent: usize = 0;
     let mut last_progress = std::time::Instant::now();
     while sent < payload.len() {
@@ -296,7 +296,7 @@ fn send_first_segment_and_capture_wire_time(
     // (parity with `drive_burst_remainder_to_completion`'s
     // STALL_TIMEOUT). On a healthy peer this fires sub-millisecond;
     // the deadline is for the wedged-peer surface only.
-    const STALL_TIMEOUT: Duration = Duration::from_secs(60);
+    const STALL_TIMEOUT: Duration = Duration::from_secs(180);
     let start = std::time::Instant::now();
     loop {
         match engine.send_bytes(conn, payload) {
@@ -364,7 +364,7 @@ fn drive_burst_remainder_to_completion(
     /// burst in <100µs); the deadline is here for the wedged-peer
     /// case where the operator wants a visible failure instead of an
     /// indefinite hang.
-    const STALL_TIMEOUT: Duration = Duration::from_secs(60);
+    const STALL_TIMEOUT: Duration = Duration::from_secs(180);
 
     let mut sent = already_sent;
     let mut last_progress = std::time::Instant::now();
