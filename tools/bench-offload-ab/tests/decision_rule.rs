@@ -36,14 +36,15 @@ fn no_signal_when_delta_under_three_noise() {
 
 #[test]
 fn sanity_invariant_full_le_best_individual() {
-    // full=94, best_individual=92 → violation (full > best).
-    let result = check_sanity_invariant(94.0, 92.0);
+    // full=110, best_individual=92 → violation (full > best by 19.6%
+    // — well outside the 5% COMPOSE_NOISE_FRAC band).
+    let result = check_sanity_invariant(110.0, 92.0);
     assert!(
         result.is_err(),
-        "full=94 > best individual=92 must trigger violation"
+        "full=110 vs best individual=92 (19.6% over) must trigger violation"
     );
     let msg = result.unwrap_err();
-    assert!(msg.contains("94"), "err should mention full p99: {msg}");
+    assert!(msg.contains("110"), "err should mention full p99: {msg}");
     assert!(msg.contains("92"), "err should mention best individual: {msg}");
 }
 
@@ -52,6 +53,18 @@ fn sanity_invariant_full_le_best_individual_ok() {
     // full=90, best_individual=92 → ok (full < best).
     let result = check_sanity_invariant(90.0, 92.0);
     assert!(result.is_ok(), "full=90 <= best individual=92 → ok");
+}
+
+#[test]
+fn sanity_invariant_within_noise_band_does_not_flag() {
+    // 1.2% overshoot (37 880 ns / 37 440 ns) — the exact 2026-05-03
+    // bench-pair shape on c6a.12xlarge. Inside the 5% noise band → ok.
+    let result = check_sanity_invariant(37_880.0, 37_440.0);
+    assert!(
+        result.is_ok(),
+        "1.2% overshoot must be inside the 5% noise band: {:?}",
+        result
+    );
 }
 
 #[test]
