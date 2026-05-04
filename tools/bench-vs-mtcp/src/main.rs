@@ -65,9 +65,19 @@ struct Args {
     #[arg(long)]
     peer_ip: String,
 
-    /// Peer TCP port.
+    /// Peer TCP port for the dpdk_net stack (echo-server expected).
     #[arg(long, default_value_t = 10_001)]
     peer_port: u16,
+
+    /// Peer TCP port for the Linux kernel-TCP stack. Distinct from
+    /// `peer_port` because Linux maxtp needs a peer that DISCARDS
+    /// incoming bytes (linux-tcp-sink); pointing at echo-server
+    /// causes the kernel TCP recv-buffer to fill, backpressuring the
+    /// sender to ~0 throughput at all but the smallest bucket sizes.
+    /// Default 10002 matches the bench-vs-linux mode A wiring where
+    /// linux-tcp-sink is started on the peer.
+    #[arg(long, default_value_t = 10_002)]
+    linux_peer_port: u16,
 
     /// Workload selector: `burst` (T12) or `maxtp` (T13).
     #[arg(long, default_value = "burst")]
@@ -339,9 +349,15 @@ fn main() -> anyhow::Result<()> {
                         run_maxtp_grid_mtcp_stub(&args, &grid, &metadata, mode, &mut writer)?;
                     }
                     Stack::Linux => {
+                        // Use linux_peer_port (default 10002, linux-tcp-sink)
+                        // not peer_port (echo-server). echo-server's
+                        // echo-back fills the recv buffer + backpressures
+                        // the kernel TCP sender to ~0 Gbps. linux-tcp-sink
+                        // discards reads, which is what kernel TCP
+                        // throughput measurement needs.
                         run_maxtp_grid_linux(
                             peer_ip,
-                            args.peer_port,
+                            args.linux_peer_port,
                             &grid,
                             &args,
                             &metadata,

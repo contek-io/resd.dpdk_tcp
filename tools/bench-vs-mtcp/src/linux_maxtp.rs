@@ -41,7 +41,7 @@
 //! inner hot loop. Each connection is a separate kernel socket so the
 //! kernel handles per-conn TX-side fan-out itself.
 
-use std::io::{ErrorKind, Write};
+use std::io::{ErrorKind, Read, Write};
 use std::net::{Ipv4Addr, SocketAddrV4, TcpStream};
 use std::time::{Duration, Instant};
 
@@ -185,6 +185,14 @@ fn pump_round_robin(
         anyhow::bail!("linux_maxtp: pump_round_robin: conns is empty");
     }
     let mut total: u64 = 0;
+    // Per-conn discard buffer for draining echo bytes. The peer
+    // (echo-server / linux-tcp-sink — currently both echo) writes
+    // bytes back; without draining, the kernel TCP recv buffer fills
+    // and the peer's `read()` blocks because its send buffer fills
+    // too, which transitively backpressures our `write()` to ~0
+    // throughput. Draining here on every round keeps the recv
+    // buffer empty so the peer can keep accepting our writes.
+    let mut discard = vec![0u8; 65536];
     // Mirror dpdk_maxtp's M1 micro-optimisation: only do the
     // between-conn deadline check on the C=1 path (otherwise the
     // outer-loop check fires often enough).
@@ -194,6 +202,28 @@ fn pump_round_robin(
             return Ok(total);
         }
         for stream in conns.iter_mut() {
+            // Drain inbound (non-blocking) before writing — each
+            // pass drains whatever the peer has echoed back since
+            // the previous round. WouldBlock = nothing pending,
+            // continue to write. EOF / hard error from read =
+            // log + treat as no-op (the write below will catch
+            // a genuine connection problem with a clearer error).
+            let mut drained = 0;
+            while drained < discard.len() * 4 {
+                match stream.read(&mut discard) {
+                    Ok(0) => break, // EOF — peer closed
+                    Ok(n) => {
+                        drained += n;
+                        if n < discard.len() {
+                            break;
+                        }
+                    }
+                    Err(e) if e.kind() == ErrorKind::WouldBlock => break,
+                    Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+                    Err(_) => break, // surface via subsequent write
+                }
+            }
+            // Write payload.
             match stream.write(payload) {
                 Ok(n) => {
                     total = total.saturating_add(n as u64);
