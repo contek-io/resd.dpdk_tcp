@@ -759,13 +759,24 @@ fn run_maxtp_grid_dpdk<W: std::io::Write>(
             continue;
         }
 
-        // Open C persistent connections.
-        let conns = dpdk_maxtp::open_persistent_connections(
+        // Open C persistent connections. Soft-fail per-bucket (e.g.
+        // TooManyConns / InvalidConnHandle from prior bucket leaks)
+        // so the grid loop continues and Linux comparator gets to run.
+        let conns = match dpdk_maxtp::open_persistent_connections(
             engine,
             peer_ip,
             peer_port,
             bucket.conn_count,
-        )?;
+        ) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!(
+                    "bench-vs-mtcp: dpdk_maxtp bucket {} open_persistent_connections failed: {e:#}",
+                    bucket.label()
+                );
+                continue;
+            }
+        };
 
         let cfg = DpdkMaxtpCfg {
             engine,
@@ -918,8 +929,10 @@ fn run_maxtp_grid_linux<W: std::io::Write>(
             continue;
         }
 
-        // Open C kernel-TCP connections.
-        let mut conns = linux_maxtp::open_persistent_connections(
+        // Open C kernel-TCP connections. Soft-fail per-bucket so a
+        // single bucket's open-failure (e.g. peer not listening) doesn't
+        // abort the grid.
+        let mut conns = match linux_maxtp::open_persistent_connections(
             peer_ip,
             peer_port,
             bucket.conn_count,
@@ -929,7 +942,16 @@ fn run_maxtp_grid_linux<W: std::io::Write>(
                 "linux_maxtp open_persistent_connections (C={})",
                 bucket.conn_count
             )
-        })?;
+        }) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!(
+                    "bench-vs-mtcp: linux_maxtp bucket {} open_persistent_connections failed: {e:#}",
+                    bucket.label()
+                );
+                continue;
+            }
+        };
 
         let cfg = LinuxMaxtpCfg {
             bucket: *bucket,
