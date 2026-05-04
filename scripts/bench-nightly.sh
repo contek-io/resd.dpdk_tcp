@@ -629,12 +629,18 @@ else
 
   # Backgrounded tcpdump on DUT and peer. </dev/null + nohup to detach
   # from ssh's stdin (same OpenSSH gotcha as the peer-services stanza).
-  ssh "${SSH_OPTS[@]}" "ubuntu@$DUT_SSH" \
+  # Soft-fail with retry: a transient kex_exchange_identification race
+  # here shouldn't abort the entire nightly. mode B is diagnostic.
+  retry_remote "ssh tcpdump-DUT" "$DUT_INSTANCE_ID" \
+    ssh "${SSH_OPTS[@]}" "ubuntu@$DUT_SSH" \
       "sudo nohup tcpdump -i ens6 -U -s 0 -w /tmp/mode-b-local.pcap \
-       '$TCPDUMP_FILTER' >/tmp/tcpdump-dut.log 2>&1 </dev/null &"
-  ssh "${SSH_OPTS[@]}" "ubuntu@$PEER_SSH" \
+       '$TCPDUMP_FILTER' >/tmp/tcpdump-dut.log 2>&1 </dev/null &" \
+    || log "        WARN tcpdump DUT start failed; pcap may be empty"
+  retry_remote "ssh tcpdump-peer" "$PEER_INSTANCE_ID" \
+    ssh "${SSH_OPTS[@]}" "ubuntu@$PEER_SSH" \
       "sudo nohup tcpdump -i ens6 -U -s 0 -w /tmp/mode-b-peer.pcap \
-       '$TCPDUMP_FILTER' >/tmp/tcpdump-peer.log 2>&1 </dev/null &"
+       '$TCPDUMP_FILTER' >/tmp/tcpdump-peer.log 2>&1 </dev/null &" \
+    || log "        WARN tcpdump peer start failed; pcap may be empty"
 
   # Give tcpdump a beat to bind its pcap ring before we start driving
   # traffic. Skipping this can drop the first few handshake packets,
